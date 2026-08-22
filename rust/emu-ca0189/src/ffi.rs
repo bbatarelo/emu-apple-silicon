@@ -368,3 +368,105 @@ pub extern "C" fn emu_frames_in_packet(bytes: u32, bytes_per_frame: u32) -> u32 
 pub extern "C" fn emu_output_packet_bytes(frames: u32, output_bytes_per_frame: u32) -> u32 {
     output_packet_bytes(SampleFrames(frames), output_bytes_per_frame).0
 }
+
+// ---------------------------------------------------------------------------
+// MIDI: USB-MIDI 1.0 event packet codec.
+//
+// The encoder is stateful (running status, SysEx spanning calls), so it uses
+// the same caller-provided-storage pattern as EmuFeedback. The decoder is a
+// pure function of one packet.
+// ---------------------------------------------------------------------------
+
+use crate::midi::{decode_packet, packet_cable, PacketEncoder};
+
+/// Opaque to C. Caller provides the storage, so nothing here allocates.
+#[repr(C)]
+pub struct EmuMidiEncoder {
+    magic: u32,
+    encoder: PacketEncoder,
+}
+
+const EMU_MIDI_MAGIC: u32 = 0x4d49_4449; // "MIDI"
+
+#[no_mangle]
+pub extern "C" fn emu_midi_encoder_size() -> u32 {
+    core::mem::size_of::<EmuMidiEncoder>() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn emu_midi_encoder_align() -> u32 {
+    core::mem::align_of::<EmuMidiEncoder>() as u32
+}
+
+/// Initializes caller-provided storage in place. `cable` is the virtual cable
+/// number stamped on every packet this encoder emits.
+///
+/// # Safety
+/// `storage` must point to at least `emu_midi_encoder_size()` writable,
+/// suitably aligned bytes.
+#[no_mangle]
+pub unsafe extern "C" fn emu_midi_encoder_init(storage: *mut u8, cable: u8) -> *mut EmuMidiEncoder {
+    if storage.is_null() || (storage as usize) % core::mem::align_of::<EmuMidiEncoder>() != 0 {
+        return core::ptr::null_mut();
+    }
+    let p = storage as *mut EmuMidiEncoder;
+    p.write(EmuMidiEncoder {
+        magic: EMU_MIDI_MAGIC,
+        encoder: PacketEncoder::new(cable),
+    });
+    p
+}
+
+/// Feeds one byte of a MIDI stream. Returns 1 and fills `out` (4 bytes) when
+/// the byte completes an event packet, 0 otherwise.
+///
+/// # Safety
+/// `enc` must come from `emu_midi_encoder_init`; `out` must point to 4
+/// writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn emu_midi_encode(
+    enc: *mut EmuMidiEncoder,
+    byte: u8,
+    out: *mut u8,
+) -> u32 {
+    let Some(enc) = enc.as_mut() else { return 0 };
+    if enc.magic != EMU_MIDI_MAGIC || out.is_null() {
+        return 0;
+    }
+    match enc.encoder.feed(byte) {
+        Some(packet) => {
+            core::ptr::copy_nonoverlapping(packet.as_ptr(), out, 4);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// The MIDI bytes inside one event packet: writes up to 3 bytes to `out` and
+/// returns how many. 0 for the reserved CINs, which carry nothing.
+///
+/// # Safety
+/// `packet` must point to 4 readable bytes, `out` to 3 writable ones.
+#[no_mangle]
+pub unsafe extern "C" fn emu_midi_decode(packet: *const u8, out: *mut u8) -> u32 {
+    if packet.is_null() || out.is_null() {
+        return 0;
+    }
+    let mut p = [0u8; 4];
+    core::ptr::copy_nonoverlapping(packet, p.as_mut_ptr(), 4);
+    let (bytes, n) = decode_packet(p);
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n as usize);
+    n as u32
+}
+
+/// Virtual cable number of one event packet.
+///
+/// # Safety
+/// `packet` must point to 4 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn emu_midi_cable(packet: *const u8) -> u8 {
+    if packet.is_null() {
+        return 0;
+    }
+    packet_cable([*packet, 0, 0, 0])
+}

@@ -16,11 +16,13 @@
 pub mod clock;
 pub mod descriptor;
 pub mod ffi;
+pub mod midi;
 pub mod protocol;
 pub mod types;
 
 pub use descriptor::{parse_configuration, AltSetting, DeviceModel, ExtensionUnit, ParseError};
 pub use clock::{frames_in_packet, output_packet_bytes, ClockEstimator, FeedbackQueue, TimestampFilter};
+pub use midi::{decode_packet, packet_cable, PacketEncoder};
 pub use protocol::{extension_code, selector, ControlSetup, RateCode};
 pub use types::{ByteCount, SampleFrames, SampleRate, UsbFrameNumber};
 

@@ -149,6 +149,25 @@ void     emu_ts_filter_rebase(EmuTsFilter* f, uint64_t expected_next);
 /* Times the filter snapped to a discontinuity instead of slewing. */
 uint32_t emu_ts_filter_resets(EmuTsFilter* f);
 
+/* --- MIDI: USB-MIDI 1.0 event packet codec ----------------------------- */
+
+/* Opaque; storage is provided by the caller so nothing allocates. The encoder
+ * is stateful: running status and SysEx transfers span calls. */
+typedef struct EmuMidiEncoder EmuMidiEncoder;
+
+uint32_t        emu_midi_encoder_size(void);
+uint32_t        emu_midi_encoder_align(void);
+EmuMidiEncoder* emu_midi_encoder_init(uint8_t* storage, uint8_t cable);
+
+/* Feeds one MIDI byte; returns 1 and fills out[4] when it completes an event
+ * packet. */
+uint32_t emu_midi_encode(EmuMidiEncoder* enc, uint8_t byte, uint8_t* out);
+
+/* MIDI bytes inside one 4-byte event packet: writes up to 3 to out, returns
+ * the count. 0 for the reserved CINs. */
+uint32_t emu_midi_decode(const uint8_t* packet, uint8_t* out);
+uint8_t  emu_midi_cable(const uint8_t* packet);
+
 #ifdef __cplusplus
 }
 #endif
