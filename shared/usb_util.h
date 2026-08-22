@@ -8,6 +8,18 @@
 #include <stdint.h>
 #include <IOKit/usb/IOUSBLib.h>
 
+#include "device.h"
+
+/* Finds an attached device this driver knows about, preferring
+ * `preferred_product_id` when more than one is plugged in. Returns its identity
+ * and, in *out_service, the matching IOKit service, which the caller owns and
+ * must release. Returns NULL when no known E-MU device is present.
+ *
+ * Every product in the table is looked for, so one build serves the whole
+ * family rather than the product ID being fixed at compile time. */
+const EmuDeviceIdentity* emu_find_device(uint16_t preferred_product_id,
+                                         io_service_t* out_service);
+
 /* Claims the interface nub with the given bInterfaceNumber. The caller owns the
  * returned interface and must Release it. */
 bool emu_find_interface(IOUSBDeviceInterface500** dev,

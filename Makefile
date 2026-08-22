@@ -80,7 +80,7 @@ install: $(BUNDLE)
 	sudo cp -R $(BUNDLE) $(INSTALL_DIR)/
 	sudo killall coreaudiod
 	@echo
-	@echo "installed. Select \"E-MU Tracker Pre\" in System Settings > Sound."
+	@echo "installed. Select the device in System Settings > Sound."
 
 uninstall:
 	sudo rm -rf $(INSTALL_DIR)/EMUTrackerPre.driver

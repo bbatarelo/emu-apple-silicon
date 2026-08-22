@@ -22,6 +22,7 @@
 
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,32 @@
 #define REQUEST_MS    8
 #define MAX_ENTRIES   (REQUEST_MS * 8)
 #define SCHEDULE_MARGIN 16
+
+/* Which device the plug-in is speaking for. Written by the engine thread when
+ * one is opened, read by Core Audio's property thread, so it is atomic even
+ * though it only ever moves from NULL to a pointer into a static table. */
+static _Atomic(const EmuDeviceIdentity*) gIdentity;
+
+const char* emu_engine_device_name(void)
+{
+    const EmuDeviceIdentity* id = atomic_load_explicit(&gIdentity, memory_order_relaxed);
+    if (!id) {
+        /* Nothing opened yet, and possibly nothing plugged in. Look, and fall
+         * back to the preferred device's name: Core Audio asks for a name long
+         * before the hardware has to be present, and that is the likeliest
+         * answer. Only a device actually found is remembered, so plugging one
+         * in later still corrects the answer. */
+        io_service_t service = IO_OBJECT_NULL;
+        id = emu_find_device(EMU_DEFAULT_PRODUCT_ID, &service);
+        if (service) IOObjectRelease(service);
+        if (id) {
+            atomic_store_explicit(&gIdentity, id, memory_order_relaxed);
+        } else {
+            id = emu_device_for_product(EMU_DEFAULT_PRODUCT_ID);
+        }
+    }
+    return id ? id->name : "E-MU USB Audio";
+}
 
 typedef struct Engine Engine;
 
@@ -365,23 +392,9 @@ static void playback_complete(void* refcon, IOReturn result, void* arg0)
 
 static bool open_device(Engine* e)
 {
-    CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBDeviceClassName);
-    if (!matching) return false;
-
-    SInt32 vid = EMU_VENDOR_ID, pid = EMU_DEFAULT_PRODUCT_ID;
-    CFNumberRef v = CFNumberCreate(NULL, kCFNumberSInt32Type, &vid);
-    CFNumberRef p = CFNumberCreate(NULL, kCFNumberSInt32Type, &pid);
-    CFDictionarySetValue(matching, CFSTR(kUSBVendorID), v);
-    CFDictionarySetValue(matching, CFSTR(kUSBProductID), p);
-    CFRelease(v); CFRelease(p);
-
-    io_iterator_t iter = IO_OBJECT_NULL;
-    if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) != KERN_SUCCESS) {
-        return false;
-    }
-    e->service = IOIteratorNext(iter);
-    IOObjectRelease(iter);
-    if (!e->service) return false;
+    const EmuDeviceIdentity* id = emu_find_device(EMU_DEFAULT_PRODUCT_ID, &e->service);
+    if (!id) return false;
+    atomic_store_explicit(&gIdentity, id, memory_order_relaxed);
 
     IOCFPlugInInterface** plugin = NULL;
     SInt32 score = 0;

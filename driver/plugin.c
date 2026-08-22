@@ -61,8 +61,11 @@ enum {
 #define VOLUME_MIN_DB  (-96.0f)
 #define VOLUME_MAX_DB  (0.0f)
 
+/* Stable across models on purpose. The UID is how applications remember which
+ * device they were told to use, and the plug-in publishes exactly one device
+ * whichever member of the family is attached. The name below is what anyone
+ * actually reads, and that does follow the hardware. */
 #define DEVICE_UID          "net.quantum-bit.EMUTrackerPre"
-#define DEVICE_NAME         "E-MU Tracker Pre"
 #define DEVICE_MANUFACTURER "E-MU Systems (revival)"
 
 #define CHANNELS            2
@@ -279,7 +282,7 @@ static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
     (void)driver;
     gHost = host;
     EMU_LOG("initialized, publishing %{public}s at %{public}.0f Hz",
-            DEVICE_NAME, gSampleRate);
+            emu_engine_device_name(), gSampleRate);
     return kAudioHardwareNoError;
 }
 
@@ -349,6 +352,20 @@ static OSStatus AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d,
 #define RETURN_CFSTR(v) do {                                      \
         if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError; \
         *(CFStringRef*)outData = CFSTR(v); *outSize = sizeof(CFStringRef); \
+        return kAudioHardwareNoError;                              \
+    } while (0)
+
+/*
+ * The device name is not a literal: it names whichever member of the family is
+ * plugged in. Core Audio takes ownership of the string it is handed, so this
+ * creates one per query rather than sharing a cached reference that the HAL
+ * would eventually release out from under us.
+ */
+#define RETURN_CFSTR_UTF8(v) do {                                 \
+        if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError; \
+        CFStringRef s = CFStringCreateWithCString(NULL, (v), kCFStringEncodingUTF8); \
+        if (!s) return kAudioHardwareUnspecifiedError;             \
+        *(CFStringRef*)outData = s; *outSize = sizeof(CFStringRef); \
         return kAudioHardwareNoError;                              \
     } while (0)
 
@@ -656,7 +673,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kAudioObjectPropertyBaseClass: RETURN_U32(kAudioObjectClassID);
             case kAudioObjectPropertyClass:     RETURN_U32(kAudioDeviceClassID);
             case kAudioObjectPropertyOwner:     RETURN_U32(kObjectID_PlugIn);
-            case kAudioObjectPropertyName:         RETURN_CFSTR(DEVICE_NAME);
+            case kAudioObjectPropertyName:         RETURN_CFSTR_UTF8(emu_engine_device_name());
             case kAudioObjectPropertyManufacturer: RETURN_CFSTR(DEVICE_MANUFACTURER);
             case kAudioDevicePropertyDeviceUID:    RETURN_CFSTR(DEVICE_UID);
             case kAudioDevicePropertyModelUID:     RETURN_CFSTR(DEVICE_UID ".model");

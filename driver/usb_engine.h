@@ -25,6 +25,11 @@ typedef struct {
     uint32_t input_overruns;     /* grows while nothing is recording, by design */
 } EmuEngineStats;
 
+/* Name of the attached device, for Core Audio to publish. Resolved on demand,
+ * because the plug-in is asked long before anything opens the device and
+ * possibly before one is plugged in at all. */
+const char* emu_engine_device_name(void);
+
 bool     emu_engine_start(uint32_t sample_rate);
 void     emu_engine_stop(void);
 bool     emu_engine_running(void);
