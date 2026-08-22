@@ -1,0 +1,16 @@
+[package]
+name = "driverkit-rust-probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "driverkit_rust_probe"
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+lto = false
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"

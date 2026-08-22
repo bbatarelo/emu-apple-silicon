@@ -1,0 +1,104 @@
+#!/bin/bash
+
+#
+# install script for EMU Audio kernel extension
+# W.Pasman 10jul2016
+#
+
+#
+# Ask user 
+#
+clear;echo;echo;echo "EMU USB Installer by W.Pasman"
+cd "$(dirname "$0")"
+pathname= pwd -P 
+
+
+# os version returns something like 10.11.4. We need 2nd number.
+IFS="."
+read -ra values  <<< "$(sw_vers -productVersion)"
+# 10.7 = OSX7 ... 10.14=OSX14 mojave , 10.15=osx15 catalina 11.1=OSX16=big sur 
+let osversion="( ${values[0]} - 10 ) * 15 + ${values[1]}"
+echo $osversion
+# determine the driver version for this os
+if [ "$osversion" -lt "7" ] ; then
+	echo "WARNING: This driver may not work correctly on OSX 10.6 and before."
+fi
+
+# determine kext directory
+if [ "$osversion" -lt "16" ] ; then
+  kextdir="/System/Library/Extensions/"
+else
+  kextdir="/Library/Extensions/"
+fi
+
+#ensure device has been turned off
+IFS=" "
+read -ra ison  <<< "$(system_profiler SPUSBDataType | grep 'E-MU 0')";
+if [ "$ison" == "E-MU" ] ; then
+	read -p "please turn off your EMU USB device and press return" -n 1 ok
+	echo; echo;
+fi
+
+# ask user if he wants low latency or normal driver
+read -p "Use low latency setting (n/y)?: n" -n 1 lowlatency
+echo; echo;
+
+#
+# Execute the installation
+#
+# determine the right version for this system
+if [ "$osversion" -gt "10" ] ; then
+	driverversion="v11"
+else
+	driverversion="v9"
+fi
+
+
+# make copy of the correct driver and adjust latency setting
+cp -r "$driverversion/EMUUSBAudio.kext" .
+
+if [ "$lowlatency" == "y" ] ; then
+	# Adjusts the driver to use low latency.
+	echo "Adjusting driver for low latency"
+	cd "$pathname/EMUUSBAudio.kext/Contents/"
+	cat Info.plist  | sed -e 's/<integer>4200<\/integer>/<integer>1000<\/integer>/' > Info1.plist
+	mv Info1.plist Info.plist
+	cd "$pathname"
+fi
+
+echo "(Re)placing EMU kernel extension. We need the admin password for this."; echo
+
+# here the user will have to enter his password
+sudo kextunload -q "$kextdir/EMUUSBAudio.kext"
+sudo rm -r "$kextdir/EMUUSBAudio.kext"
+# Install new kernel extension
+cd "$pathname"
+sudo cp -r EMUUSBAudio.kext "$kextdir"
+
+# delete old midi plugin
+sudo rm -rf /Library/Audio/MIDI\ Drivers/EMUMIDIDriver.plugin 
+# Install new midi plugin
+sudo mkdir -p /Library/Audio/MIDI\ Drivers/
+sudo cp -R EMUMIDIDriver\ orig.plugin /Library/Audio/MIDI\ Drivers/EMUMIDIDriver.plugin
+
+#do permissions stuff
+cd /Library/Audio/MIDI\ Drivers/
+sudo chgrp -R wheel EMUMIDIDriver.plugin
+cd "$kextdir"
+sudo chgrp -R wheel EMUUSBAudio.kext
+
+#load new kext
+sudo kextload -v 0 EMUUSBAudio.kext
+
+echo "Waiting for the system to finish installation. Can take several minutes."
+if [ "$osversion" -gt "11" ] ; then
+  SCRIPT='/rebuilding/ { print "Rebuilding the kernel" } /KernelCache ID/ { print "Kernel built. Updating cache" } /Directory caches updated/ { exit } '
+  # use kextcache directly as log system keeps changing messages
+  sudo kextcache -v 1 -i / | awk "$SCRIPT"
+else
+  SCRIPT='/Rescanning kernel extensions/ { print "Rebuilding the kernel" } /locked; waiting for lock/ { print "Waiting for lock to replace the old kernel" } /Lock acquired; proceeding/ { print "Inserting the new kernel"} /no supported helper partitions|helper partitions appear up to date/ { exit } '
+  # pre-sierra, use system.log file.
+  tail -f /var/log/system.log | awk "$SCRIPT"
+fi
+echo "Driver is installed and ready for use!" 
+echo "You can close this window."

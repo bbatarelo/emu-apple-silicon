@@ -1,0 +1,21 @@
+//
+//  TrackerPreDriver.iig
+//  TrackerPreDriver
+//
+//  Created by Bruno Batarelo on 20.08.2026..
+//
+
+#ifndef TrackerPreDriver_h
+#define TrackerPreDriver_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+
+class TrackerPreDriver: public IOService
+{
+public:
+    virtual kern_return_t
+    Start(IOService * provider) override;
+};
+
+#endif /* TrackerPreDriver_h */

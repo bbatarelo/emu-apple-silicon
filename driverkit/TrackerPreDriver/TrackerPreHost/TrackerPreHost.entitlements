@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Lets this app submit OSSystemExtensionRequests for the embedded dext.
+	  Unlike the DriverKit entitlements on the driver itself, this one is
+	  available to any Developer Program team without a separate approval.
+	-->
+	<key>com.apple.developer.system-extension.install</key>
+	<true/>
+
+	<!--
+	  The host app is not sandboxed. A sandboxed app can install a system
+	  extension only from /Applications, which would make the development
+	  loop considerably more awkward.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>

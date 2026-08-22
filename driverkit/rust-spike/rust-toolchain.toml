@@ -1,0 +1,10 @@
+# The custom DriverKit target needs -Z build-std, which is nightly-only.
+# rust-src is the source of core/compiler_builtins that build-std compiles.
+#
+# Not pinned to a dated nightly yet; see the reproducibility caveat in
+# docs/rust-driverkit-target.md. The verified-good version is recorded in
+# toolchain-notes/.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+targets = ["aarch64-apple-darwin"]

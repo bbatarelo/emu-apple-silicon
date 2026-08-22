@@ -1,0 +1,21 @@
+[package]
+name = "emu-ca0189"
+version = "0.1.0"
+edition = "2021"
+
+# rlib for host unit tests, staticlib for linking into the probe tool and,
+# later, the dext. The crate is no_std except under cfg(test).
+[lib]
+name = "emu_ca0189"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# On by default so `cargo test` and the userspace probe get an ordinary
+# runtime. The dext build uses --no-default-features for a freestanding core.
+default = ["std"]
+std = []
+
+[profile.release]
+panic = "abort"
+lto = false
+codegen-units = 1

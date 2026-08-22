@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Every entitlement below is restricted and must be granted by Apple before
+	  a matching DriverKit provisioning profile can be issued. See
+	  docs/driverkit-entitlement-request.md for the request that has to be filed.
+
+	  Until approval lands, builds must use CODE_SIGNING_ALLOWED=NO
+	  (`make build`), which compiles and links but produces an unloadable dext.
+	-->
+
+	<key>com.apple.developer.driverkit</key>
+	<true/>
+
+	<!-- Required to publish IOUserAudio objects to Core Audio. -->
+	<key>com.apple.developer.driverkit.family.audio</key>
+	<true/>
+
+	<!--
+	  USB transport, scoped to the devices this driver claims.
+	  E-MU Tracker Pre: Creative VID 0x041e (1054), PID 0x3f0a (16138).
+	  Sibling CA0189 devices (0202/0204/0404) get added here if support widens.
+	-->
+	<key>com.apple.developer.driverkit.transport.usb</key>
+	<array>
+		<dict>
+			<key>idVendor</key>
+			<integer>1054</integer>
+			<key>idProduct</key>
+			<integer>16138</integer>
+		</dict>
+	</array>
+
+	<!--
+	  Lets the SwiftUI control app open a user client for diagnostics.
+	  The interface stays deliberately narrow; see guidelines section 15.
+	-->
+	<key>com.apple.developer.driverkit.userclient-access</key>
+	<array>
+		<string>net.quantum-bit.TrackerPreHost</string>
+	</array>
+</dict>
+</plist>

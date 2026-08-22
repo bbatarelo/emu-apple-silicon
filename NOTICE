@@ -1,0 +1,29 @@
+Third-party material in this repository
+=======================================
+
+The MIT licence in LICENSE covers the code in driver/, shared/, tools/, rust/,
+scripts/, docs/ and driverkit/.
+
+It does NOT cover anything under resources/, which is included for reference
+during development and is the work of others under terms this project has not
+established. Details and provenance are in docs/provenance.md.
+
+  resources/EMU-driver-master-wouter1-repo/
+      Wouter Pasman's EMU-driver, from https://github.com/Wouter1/EMU-driver
+      A macOS kernel extension, no longer maintained, which never supported
+      Apple Silicon. Consult that repository for its licence.
+
+  resources/zaudiodrivermac-code-r7-trunk-official-source/
+  resources/zaudiodriverwin-code-r5-trunk-official-source/
+      E-MU's own released CA0188/CA0189 driver source, for macOS and Windows.
+      Distribution terms are unclear and have not been verified.
+
+  resources/EMUU_MacAppDrv_US_1_50_07-last-official-driver.dmg
+      E-MU's final macOS driver binary, 2011. Redistribution rights unverified.
+
+No code from any of these was copied into this project. They were read to
+understand the hardware's protocol, and the conclusions drawn from them are
+recorded in docs/FINDINGS.md in this project's own words.
+
+If you hold rights to any of this material and would prefer it not be
+distributed here, please open an issue and it will be removed.
