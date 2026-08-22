@@ -17,6 +17,8 @@ BUILD      := build
 BIN        := $(BUILD)/bin
 BUNDLE     := $(BUILD)/EMUTrackerPre.driver
 INSTALL_DIR := /Library/Audio/Plug-Ins/HAL
+MIDI_BUNDLE := $(BUILD)/EMUMIDIDriver.plugin
+MIDI_INSTALL_DIR := /Library/Audio/MIDI Drivers
 
 CORE       := rust/emu-ca0189
 CORE_LIB   := $(CORE)/target/release/libemu_ca0189.a
@@ -25,9 +27,9 @@ CFLAGS  := -std=c17 -Wall -Wextra -O2
 FRAMEWORKS := -framework CoreFoundation -framework CoreAudio -framework IOKit
 AUDIO_FRAMEWORKS := -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 
-.PHONY: test-recovery all driver tools install uninstall check record loopback test clean help
+.PHONY: test-recovery all driver midi-driver tools install uninstall uninstall-midi check record loopback test clean help
 
-all: driver tools
+all: driver midi-driver tools
 
 help:
 	@sed -n '2,12p' Makefile | sed 's/^# \?//'
@@ -42,6 +44,8 @@ $(CORE_LIB): $(CORE)/src/*.rs $(CORE)/Cargo.toml
 
 driver: $(BUNDLE)
 
+midi-driver: $(MIDI_BUNDLE)
+
 $(BUNDLE): driver/*.c driver/*.h driver/Info.plist shared/*.c shared/*.h $(CORE_LIB)
 	@echo "building the driver"
 	@rm -rf $(BUNDLE)
@@ -53,10 +57,24 @@ $(BUNDLE): driver/*.c driver/*.h driver/Info.plist shared/*.c shared/*.h $(CORE_
 	    $(FRAMEWORKS)
 	@./scripts/sign.sh $(BUNDLE)
 
+# The MIDI half lives in a separate bundle because it loads into a different
+# process: MIDIServer, not coreaudiod. The two share the USB device by each
+# claiming only its own interface.
+$(MIDI_BUNDLE): midi-driver/*.c midi-driver/Info.plist shared/*.c shared/*.h $(CORE_LIB)
+	@echo "building the MIDI driver"
+	@rm -rf $(MIDI_BUNDLE)
+	@mkdir -p $(MIDI_BUNDLE)/Contents/MacOS
+	@cp midi-driver/Info.plist $(MIDI_BUNDLE)/Contents/Info.plist
+	@clang -bundle $(CFLAGS) -mmacosx-version-min=14.0 \
+	    -o $(MIDI_BUNDLE)/Contents/MacOS/EMUMIDIDriver \
+	    midi-driver/plugin.c shared/usb_util.c $(CORE_LIB) \
+	    -framework CoreFoundation -framework CoreMIDI -framework IOKit
+	@./scripts/sign.sh $(MIDI_BUNDLE)
+
 # --------------------------------------------------------------- the tools
 
 tools: $(BIN)/emu-probe $(BIN)/hal-check $(BIN)/hal-record $(BIN)/hal-trace \
-       $(BIN)/hal-loopback
+       $(BIN)/hal-loopback $(BIN)/midi-check
 
 $(BIN)/emu-probe: tools/emu-probe/*.c tools/emu-probe/*.h shared/*.c shared/*.h $(CORE_LIB)
 	@mkdir -p $(BIN)
@@ -64,6 +82,11 @@ $(BIN)/emu-probe: tools/emu-probe/*.c tools/emu-probe/*.h shared/*.c shared/*.h 
 	    tools/emu-probe/main.c tools/emu-probe/capture.c tools/emu-probe/duplex.c \
 	    tools/emu-probe/lltest.c tools/emu-probe/midi.c shared/usb_util.c \
 	    $(CORE_LIB) $(FRAMEWORKS)
+
+$(BIN)/midi-check: tools/midi-check/main.c
+	@mkdir -p $(BIN)
+	@clang $(CFLAGS) -Wno-deprecated-declarations -o $@ $< \
+	    -framework CoreMIDI -framework CoreFoundation
 
 $(BIN)/hal-check: tools/hal-check/main.c
 	@mkdir -p $(BIN)
@@ -89,18 +112,31 @@ $(BIN)/hal-loopback: tools/hal-loopback/*.c tools/hal-loopback/*.h
 # Restarting coreaudiod interrupts all audio on the machine for a moment. Quit
 # anything playing first.
 
-install: $(BUNDLE)
+install: $(BUNDLE) $(MIDI_BUNDLE)
 	@echo "installing to $(INSTALL_DIR) (this needs your password)"
 	sudo rm -rf $(INSTALL_DIR)/EMUTrackerPre.driver
 	sudo cp -R $(BUNDLE) $(INSTALL_DIR)/
+	sudo mkdir -p "$(MIDI_INSTALL_DIR)"
+	sudo rm -rf "$(MIDI_INSTALL_DIR)/EMUMIDIDriver.plugin"
+	sudo cp -R $(MIDI_BUNDLE) "$(MIDI_INSTALL_DIR)/"
 	sudo killall coreaudiod
+	-sudo killall MIDIServer 2>/dev/null || true
 	@echo
 	@echo "installed. Select the device in System Settings > Sound."
 
 uninstall:
 	sudo rm -rf $(INSTALL_DIR)/EMUTrackerPre.driver
+	sudo rm -rf "$(MIDI_INSTALL_DIR)/EMUMIDIDriver.plugin"
 	sudo killall coreaudiod
+	-sudo killall MIDIServer 2>/dev/null || true
 	@echo "removed."
+
+# MIDIServer holds the MIDI interface while the driver is installed, which
+# blocks emu-probe's raw midi commands. This removes just the MIDI half.
+uninstall-midi:
+	sudo rm -rf "$(MIDI_INSTALL_DIR)/EMUMIDIDriver.plugin"
+	-sudo killall MIDIServer 2>/dev/null || true
+	@echo "MIDI driver removed."
 
 # -------------------------------------------------------------- diagnostics
 

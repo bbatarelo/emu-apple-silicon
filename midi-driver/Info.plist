@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>EMUMIDIDriver</string>
+	<key>CFBundleIdentifier</key>
+	<string>net.quantum-bit.EMUMIDIDriver</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>EMUMIDIDriver</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFPlugInDynamicRegistration</key>
+	<string>NO</string>
+	<key>CFPlugInFactories</key>
+	<dict>
+		<key>33299861-73A0-4DE4-97BD-C4B74730F9F0</key>
+		<string>EMUMIDIDriverFactory</string>
+	</dict>
+	<key>CFPlugInTypes</key>
+	<dict>
+		<!-- kMIDIDriverTypeID -->
+		<key>ECDE9574-0FE4-11D4-BB1A-0050E4CEA526</key>
+		<array>
+			<string>33299861-73A0-4DE4-97BD-C4B74730F9F0</string>
+		</array>
+	</dict>
+</dict>
+</plist>
