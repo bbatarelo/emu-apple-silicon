@@ -138,6 +138,95 @@ a payload dump that was itself misaligned, so it should not be relied on.
 
 ---
 
+## The 0404 USB
+
+E-MU 0404 USB, `041e:3f04`, verified 2026-08-22. Same CA0189 protocol as the
+Tracker Pre — the clock extension unit, the rate codes, the alt-setting layout
+and the feedback model all carried over untouched. Descriptors in
+`captures/descriptors/0404-usb-*`.
+
+What it took: **one parser fix**, described below. Nothing in the transport,
+the clock code or the feedback model needed changing.
+
+Measured on the hardware:
+
+| | |
+|---|---|
+| `clock` / `clock-support` | unit ID **12**, code `0xe301`, interface 0 — identical to the Tracker Pre. Rate bitmap `0x3f`, all six rates |
+| `clock-sweep` | 6/6 rates set and verified by read-back, original restored |
+| `capture` | +0.0 ppm at 48 and 96 kHz, uniform packet sizes, no errors |
+| `play` | `STABLE` at 44.1, 48 and 96 kHz, tracking error ≤ 1.1 ppm, clean tone |
+
+### It has a MIDI interface, and that broke the parser
+
+Four interfaces, not three: control, playback, capture, and a **MIDI-streaming
+interface (subclass `0x03`)** at interface 3.
+
+The parser treated *every* non-control interface as audio streaming. MIDI's
+class-specific descriptors reuse the same subtype numbers for entirely different
+things — subtype `0x02` is `MIDI_IN_JACK`, six bytes long, where audio streaming
+has a 11-byte `FORMAT_TYPE` — so the first MIDI jack descriptor was read as a
+truncated format descriptor and the whole configuration was rejected with
+`BadDescriptorLength`.
+
+**Which subclass an interface belongs to has to be tracked, not inferred from
+"not control".** Interfaces that are neither `0x01` nor `0x02` contribute no alt
+settings and their class-specific descriptors are skipped.
+
+The Tracker Pre has MIDI ports on the box but no MIDI-streaming interface in its
+descriptors, which is why this went unnoticed.
+
+For whoever implements MIDI: one embedded jack each way, on **bulk** endpoints
+`0x05` OUT and `0x85` IN, with a standard `MS_HEADER` and the usual
+in-jack/out-jack pairs. Ordinary USB-MIDI 1.0, unlike the audio side.
+
+### Four extension units instead of one
+
+| Unit | Code | |
+|---|---|---|
+| 12 | `0xe301` | clock rate — the one the driver drives |
+| 13 | `0xe302` | clock source |
+| 14 | `0xe303` | digital I/O status |
+| 15 | `0xe304` | device options |
+
+The extra three are the route to the S/PDIF and clock-source controls. Nothing
+reads them yet. The Tracker Pre has only `0xe301`, so this is the first hardware
+on which the other codes in E-MU's header have been seen to exist.
+
+The terminals reflect the same: `0x0602` (digital audio interface) appears as
+both an input and an output terminal, alongside the analog `0x0601`, speaker
+`0x0301` and headphone `0x0302` terminals the Tracker Pre has.
+
+### Four-channel alt settings make rate alone ambiguous
+
+36 streaming alt settings against the Tracker Pre's 24. Every rate is offered in
+stereo, and 44.1 through 96 kHz are *also* offered in four channels:
+
+| | Stereo | Four-channel |
+|---|---|---|
+| 44100, 48000 | `bInterval` 3 and 4 | `bInterval` 3 and 4 |
+| 88200, 96000 | 3 and 4 | 3 only |
+| 176400, 192000 | 3 only | — |
+
+The Tracker Pre already showed that rate does not uniquely identify an alt
+setting (alt 11 duplicates alt 3). Here the duplicates are not harmless: picking
+a four-channel alt while the ring and the published format are stereo decodes
+every packet at half the correct stride. **Alt selection filters on channel
+count as well as rate**, in the driver and in `emu-probe play`. The four-channel
+modes are otherwise unused — using them means widening `EMU_RING_CHANNELS` and
+the Core Audio stream configuration.
+
+Two 16-bit alt settings also appear on the playback interface (alts 17 and 18,
+44.1 and 48 kHz). The driver ignores them; 24-bit is available at every rate.
+
+### It is self-powered
+
+`bMaxPower` reads 2 mA, against the Tracker Pre's 500 mA. The 0404 has its own
+supply. Nothing depends on this, but it is why the two descriptors differ in the
+configuration header.
+
+---
+
 ## macOS platform behaviour
 
 The device was the easy half. These cost more.
@@ -285,3 +374,6 @@ Two general lessons:
 - What alt 11 is for, given it duplicates alt 3 exactly.
 - Whether `kAudioDevicePropertyDeviceIsRunning` needs a change notification; it
   currently reads false while IO is running.
+- What the 0404's `0xe302`–`0xe304` extension units accept and report, and
+  whether they are the way to reach its S/PDIF and clock-source controls.
+- Whether the 0202 USB (`041e:3f02`) matches either shape. Still untested.

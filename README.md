@@ -1,6 +1,6 @@
 # E-MU Tracker Pre driver for Apple Silicon
 
-A working macOS driver for the E-MU Tracker Pre USB audio interface.
+A working macOS driver for the E-MU Tracker Pre and 0404 USB audio interfaces.
 
 E-MU stopped supporting macOS in 2011. The last official driver was a kernel
 extension, and kernel extensions no longer load on Apple Silicon, so the hardware
@@ -37,8 +37,9 @@ make install
 `/Library/Audio/Plug-Ins/HAL`, and restarts the audio daemon. **All audio on the
 machine stops for a second or two** — quit anything playing first.
 
-Then open **System Settings → Sound** and choose **E-MU Tracker Pre** for output,
-input, or both.
+Then open **System Settings → Sound** and choose the device — it appears under
+its own name, **E-MU Tracker Pre** or **E-MU 0404 USB** — for output, input, or
+both.
 
 That is all. It survives reboots.
 
@@ -73,14 +74,21 @@ from whether the driver works.
 
 ---
 
-## Does it work with the 0202 or 0404?
+## Which devices?
 
-Not yet, but it is the obvious next step. All three are built on the same CA0189
-chipset and should speak the same protocol.
+**Tracker Pre** (`041e:3f0a`) and **0404 USB** (`041e:3f04`), both verified on
+real hardware. One build serves either — plug one in and the driver finds it,
+and names itself after whichever it found.
 
-If you own one, `tools/emu-probe` will tell us in a few minutes whether it does.
-See **[docs/ADDING-A-DEVICE.md](docs/ADDING-A-DEVICE.md)** — no driver changes
-needed to find out, and the results are genuinely useful even if you stop there.
+The **0202 USB** is the one still untested. It is built on the same CA0189
+chipset and should speak the same protocol; the 0404 turned out to, needing a
+single parser fix. If you own one, `tools/emu-probe` will tell us in a few
+minutes. See **[docs/ADDING-A-DEVICE.md](docs/ADDING-A-DEVICE.md)** — no driver
+changes needed to find out, and the results are genuinely useful even if you
+stop there.
+
+With two known devices plugged in at once, only one is published; which one is
+`EMU_DEFAULT_PRODUCT_ID` in `shared/device.h`.
 
 ---
 
@@ -103,7 +111,7 @@ isochronous streaming, clock recovery and format conversion itself.
         |
    low-latency isochronous
         |
-   E-MU Tracker Pre
+   the device
 ```
 
 The interesting part is that the device's clock, not the computer's, decides how
@@ -121,12 +129,17 @@ correct channel mapping, clock tracking anchored to the device.
 
 Not done:
 
-- MIDI. The Tracker Pre has MIDI in and out; this driver ignores them entirely.
-- The device's own controls — pad, phantom power, direct monitoring — are not
-  exposed. Some may not be reachable; the descriptors only advertise one
-  extension unit.
+- MIDI. Both devices have MIDI ports and this driver ignores them entirely. The
+  0404 exposes a standard USB-MIDI 1.0 interface; the Tracker Pre does not
+  advertise one at all.
+- The devices' own controls — pad, phantom power, direct monitoring, and the
+  0404's S/PDIF — are not exposed. The Tracker Pre advertises only one extension
+  unit, so some may not be reachable; the 0404 has three more that nothing reads
+  yet.
 - Latency is reported as an estimate rather than a measurement.
-- Only the Tracker Pre is supported, though the 0202 and 0404 are likely close.
+- Stereo only. The 0404 also offers four-channel modes, which are ignored.
+- One device at a time, even when several are attached.
+- The 0202 USB is untested.
 
 ---
 
@@ -136,7 +149,7 @@ Not done:
 |---|---|
 | [docs/FINDINGS.md](docs/FINDINGS.md) | What the hardware does, and what macOS does. **Read this before changing anything.** |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the driver is put together |
-| [docs/ADDING-A-DEVICE.md](docs/ADDING-A-DEVICE.md) | Bringing up an 0202, 0404 or another sibling |
+| [docs/ADDING-A-DEVICE.md](docs/ADDING-A-DEVICE.md) | Bringing up an 0202 or another sibling |
 | [docs/DESIGN-GUIDELINES.md](docs/DESIGN-GUIDELINES.md) | The architectural reference the project was built against |
 | [docs/provenance.md](docs/provenance.md) | Reference material in `resources/`, and its licensing |
 | [driverkit/](driverkit/) | An unfinished DriverKit version, and why it is parked |
@@ -145,10 +158,11 @@ Not done:
 
 ## Contributing
 
-The most useful thing anyone can do is run `tools/emu-probe` against an 0202 or
-0404 and send the output. That is what decides whether this covers the family.
+The most useful thing anyone can do is run `tools/emu-probe` against an 0202 and
+send the output. It is the last member of the family nobody has checked.
 
-After that: MIDI, and the four unexplained bytes documented in FINDINGS.
+After that: MIDI, the 0404's unread extension units, and the four unexplained
+bytes documented in FINDINGS.
 
 ---
 
