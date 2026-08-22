@@ -62,7 +62,8 @@ $(BIN)/emu-probe: tools/emu-probe/*.c tools/emu-probe/*.h shared/*.c shared/*.h 
 	@mkdir -p $(BIN)
 	@clang $(CFLAGS) -Wno-deprecated-declarations -o $@ \
 	    tools/emu-probe/main.c tools/emu-probe/capture.c tools/emu-probe/duplex.c \
-	    tools/emu-probe/lltest.c shared/usb_util.c $(CORE_LIB) $(FRAMEWORKS)
+	    tools/emu-probe/lltest.c tools/emu-probe/midi.c shared/usb_util.c \
+	    $(CORE_LIB) $(FRAMEWORKS)
 
 $(BIN)/hal-check: tools/hal-check/main.c
 	@mkdir -p $(BIN)

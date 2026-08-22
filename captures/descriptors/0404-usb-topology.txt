@@ -7,6 +7,7 @@ Configuration
   max power          2 mA
   control interface  0
   status endpoint    0x83 (interrupt IN)
+  MIDI interface     3 (bulk IN 0x85 x1, bulk OUT 0x05 x1)
 
 Extension units (4)
   unit 14  code 0xe303  digital I/O status src=3 ch=4 controls=0x1f

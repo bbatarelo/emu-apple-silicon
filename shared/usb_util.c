@@ -134,6 +134,33 @@ bool emu_find_isoc_pipe(IOUSBInterfaceInterface500** intf,
     return emu_find_isoc_pipe_full(intf, direction, out_pipe, out_max_packet, NULL);
 }
 
+bool emu_find_bulk_pipe(IOUSBInterfaceInterface500** intf,
+                        uint8_t direction,
+                        uint8_t* out_pipe,
+                        uint16_t* out_max_packet)
+{
+    UInt8 num_endpoints = 0;
+    if ((*intf)->GetNumEndpoints(intf, &num_endpoints) != kIOReturnSuccess) {
+        return false;
+    }
+
+    for (UInt8 i = 1; i <= num_endpoints; i++) {
+        UInt8 pipe_direction, number, transfer_type, interval;
+        UInt16 max_packet = 0;
+        if ((*intf)->GetPipeProperties(intf, i, &pipe_direction, &number,
+                                       &transfer_type, &max_packet, &interval)
+            != kIOReturnSuccess) {
+            continue;
+        }
+        if (transfer_type == kUSBBulk && pipe_direction == direction) {
+            *out_pipe = i;
+            *out_max_packet = max_packet;
+            return true;
+        }
+    }
+    return false;
+}
+
 const char* emu_isoc_status_name(int32_t status)
 {
     switch ((uint32_t)status) {

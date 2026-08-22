@@ -29,6 +29,7 @@
 #include "capture.h"
 #include "duplex.h"
 #include "lltest.h"
+#include "midi.h"
 
 #include "../../shared/device.h"
 #include "../../shared/usb_util.h"
@@ -201,6 +202,12 @@ static void print_model(const EmuDeviceModel* m)
     printf("  control interface  %u\n", m->control_interface);
     if (m->status_endpoint) {
         printf("  status endpoint    0x%02x (interrupt IN)\n", m->status_endpoint);
+    }
+    if (m->midi_interface != 0xff) {
+        printf("  MIDI interface     %u (bulk IN 0x%02x x%u, bulk OUT 0x%02x x%u)\n",
+               m->midi_interface,
+               m->midi_in_endpoint, m->midi_in_cables,
+               m->midi_out_endpoint, m->midi_out_cables);
     }
 
     printf("\nExtension units (%u)\n", m->num_extension_units);
@@ -652,6 +659,11 @@ static void usage(void)
         "                       device's converter runs, nothing of it reaches the\n"
         "                       bus. Splits 'the traffic' from 'the ADC'.\n"
         "  lltest [hz]          diagnostic: low-latency isoc frame granularity\n"
+        "  midi-dump [ms]       print MIDI arriving at the DIN IN port  (read-only)\n"
+        "  midi-send <hex ...>  send MIDI bytes out the DIN OUT port, e.g.\n"
+        "                       midi-send 90 3c 40   (note on)\n"
+        "  midi-loopback        send and verify a test sequence; needs a DIN cable\n"
+        "                       from the device's MIDI OUT to its MIDI IN\n"
         "  clock-stress <from_hz> <to_hz> [iters] [delay_ms]\n"
         "                       repeat one transition to characterise\n"
         "                       intermittent failures               (WRITES to device)\n"
@@ -755,6 +767,37 @@ int main(int argc, char** argv)
         if (!read_model(dev, &model, NULL, NULL)) rc = 1;
         else if (prepare_clock_for_capture(dev, &model, hz) != 0) rc = 1;
         else rc = emu_lowlatency_probe(dev, &model, hz);
+    } else if (strcmp(cmd, "midi-dump") == 0) {
+        EmuDeviceModel model;
+        if (!read_model(dev, &model, NULL, NULL)) rc = 1;
+        else rc = emu_midi_dump(dev, &model,
+                 (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 10) : 10000);
+    } else if (strcmp(cmd, "midi-send") == 0) {
+        if (argc < 3) { usage(); rc = 2; }
+        else {
+            uint8_t bytes[256];
+            uint32_t len = 0;
+            rc = 0;
+            for (int i = 2; i < argc && len < sizeof bytes; i++) {
+                char* end = NULL;
+                unsigned long v = strtoul(argv[i], &end, 16);
+                if (!end || *end != '\0' || v > 0xff) {
+                    fprintf(stderr, "error: '%s' is not a hex byte\n", argv[i]);
+                    rc = 2;
+                    break;
+                }
+                bytes[len++] = (uint8_t)v;
+            }
+            if (rc == 0) {
+                EmuDeviceModel model;
+                if (!read_model(dev, &model, NULL, NULL)) rc = 1;
+                else rc = emu_midi_send(dev, &model, bytes, len);
+            }
+        }
+    } else if (strcmp(cmd, "midi-loopback") == 0) {
+        EmuDeviceModel model;
+        if (!read_model(dev, &model, NULL, NULL)) rc = 1;
+        else rc = emu_midi_loopback(dev, &model);
     } else if (strcmp(cmd, "clock-stress") == 0) {
         if (argc < 4) { usage(); rc = 2; }
         else {

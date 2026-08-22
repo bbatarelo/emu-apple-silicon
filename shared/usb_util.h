@@ -50,6 +50,12 @@ bool emu_find_isoc_pipe_full(IOUSBInterfaceInterface500** intf,
                              uint16_t* out_max_packet,
                              uint8_t* out_interval);
 
+/* Same, for the bulk pipes of the MIDI interface. */
+bool emu_find_bulk_pipe(IOUSBInterfaceInterface500** intf,
+                        uint8_t direction,
+                        uint8_t* out_pipe,
+                        uint16_t* out_max_packet);
+
 const char* emu_isoc_status_name(int32_t status);
 
 /* An isochronous frame that moved fewer bytes than requested reports underrun.
