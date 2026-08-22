@@ -28,7 +28,7 @@ Then:
 
 ```bash
 git clone <this repository>
-cd emu-tracker-pre
+cd emu-apple-silicon
 make
 make install
 ```
