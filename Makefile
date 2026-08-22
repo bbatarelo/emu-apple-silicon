@@ -32,7 +32,7 @@ help:
 
 # ---------------------------------------------------------------- the core
 
-$(CORE_LIB):
+$(CORE_LIB): $(CORE)/src/*.rs $(CORE)/Cargo.toml
 	@echo "building the CA0189 core"
 	@cd $(CORE) && cargo build --release
 
@@ -55,7 +55,7 @@ $(BUNDLE): driver/*.c driver/*.h driver/Info.plist shared/*.c shared/*.h $(CORE_
 
 tools: $(BIN)/emu-probe $(BIN)/hal-check $(BIN)/hal-record
 
-$(BIN)/emu-probe: tools/emu-probe/*.c tools/emu-probe/*.h shared/*.c $(CORE_LIB)
+$(BIN)/emu-probe: tools/emu-probe/*.c tools/emu-probe/*.h shared/*.c shared/*.h $(CORE_LIB)
 	@mkdir -p $(BIN)
 	@clang $(CFLAGS) -Wno-deprecated-declarations -o $@ \
 	    tools/emu-probe/main.c tools/emu-probe/capture.c tools/emu-probe/duplex.c \
