@@ -344,10 +344,14 @@ static bool select_alt(IOUSBInterfaceInterface500** intf,
         if (a->interface_number != interface_number) continue;
         if (a->data_endpoint == 0) continue;
         if (a->sample_rate != rate) continue;
+        /* fill_tone writes a stereo frame, so the rate alone is not enough to
+         * pick an alt setting on a device that also offers four channels at
+         * the same rate. */
+        if (a->channels != 2) continue;
         if (!chosen || a->interval > chosen->interval) chosen = a;
     }
     if (!chosen) {
-        fprintf(stderr, "error: interface %u has no alt setting for %u Hz\n",
+        fprintf(stderr, "error: interface %u has no stereo alt setting for %u Hz\n",
                 interface_number, rate);
         return false;
     }
