@@ -53,7 +53,7 @@ $(BUNDLE): driver/*.c driver/*.h driver/Info.plist shared/*.c shared/*.h $(CORE_
 
 # --------------------------------------------------------------- the tools
 
-tools: $(BIN)/emu-probe $(BIN)/hal-check $(BIN)/hal-record
+tools: $(BIN)/emu-probe $(BIN)/hal-check $(BIN)/hal-record $(BIN)/hal-trace
 
 $(BIN)/emu-probe: tools/emu-probe/*.c tools/emu-probe/*.h shared/*.c shared/*.h $(CORE_LIB)
 	@mkdir -p $(BIN)
@@ -68,6 +68,10 @@ $(BIN)/hal-check: tools/hal-check/main.c
 $(BIN)/hal-record: tools/hal-record/main.c
 	@mkdir -p $(BIN)
 	@clang $(CFLAGS) -o $@ $< $(AUDIO_FRAMEWORKS)
+
+$(BIN)/hal-trace: tools/hal-trace/main.c
+	@mkdir -p $(BIN)
+	@clang $(CFLAGS) -o $@ $< -framework CoreAudio -framework CoreFoundation
 
 # ------------------------------------------------------------------ install
 #
