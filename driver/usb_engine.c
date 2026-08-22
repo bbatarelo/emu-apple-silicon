@@ -453,6 +453,11 @@ static bool select_alt(IOUSBInterfaceInterface500** intf, const EmuDeviceModel* 
         const EmuAltSetting* a = &model->alt_settings[i];
         if (a->interface_number != interface_number || a->data_endpoint == 0) continue;
         if (a->sample_rate != rate) continue;
+        /* The ring and the published stream format are stereo, so an alt
+         * setting with any other channel count would be decoded at the wrong
+         * stride. The 0404 USB offers four-channel alts at every rate it
+         * offers stereo ones, which makes the rate alone ambiguous. */
+        if (a->channels != EMU_RING_CHANNELS) continue;
         if (!chosen || a->interval > chosen->interval) chosen = a;
     }
     if (!chosen) return false;
