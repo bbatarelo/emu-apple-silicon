@@ -21,6 +21,15 @@ fn parses_the_captured_configuration() {
 }
 
 #[test]
+fn the_tracker_pre_has_no_midi_interface() {
+    // It has MIDI ports on the box, but nothing in its descriptors. MIDI
+    // support keys off the model, so it must not claim an interface here.
+    let m = parse_configuration(CONFIG).unwrap();
+    assert_eq!(m.midi_interface, 0xff);
+    assert!(!m.has_midi());
+}
+
+#[test]
 fn finds_the_clock_rate_extension_unit() {
     let m = parse_configuration(CONFIG).unwrap();
 
@@ -280,6 +289,20 @@ fn the_0404_midi_interface_contributes_no_alt_settings() {
         m.alts().iter().all(|a| a.interface_number == 1 || a.interface_number == 2),
         "only the two audio-streaming interfaces may produce alt settings"
     );
+}
+
+#[test]
+fn the_0404_midi_interface_is_modelled() {
+    // Interface 3: ordinary USB-MIDI 1.0 on bulk endpoints, one virtual cable
+    // each way. These five values are everything the MIDI driver needs.
+    let m = parse_configuration(CONFIG_0404).unwrap();
+
+    assert!(m.has_midi());
+    assert_eq!(m.midi_interface, 3);
+    assert_eq!(m.midi_in_endpoint, 0x85);
+    assert_eq!(m.midi_out_endpoint, 0x05);
+    assert_eq!(m.midi_in_cables, 1);
+    assert_eq!(m.midi_out_cables, 1);
 }
 
 #[test]

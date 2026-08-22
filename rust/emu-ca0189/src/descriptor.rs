@@ -39,6 +39,10 @@ const AS_FORMAT_TYPE: u8 = 0x02;
 // are inside has to be tracked rather than assumed.
 const SUBCLASS_AUDIO_CONTROL: u8 = 0x01;
 const SUBCLASS_AUDIO_STREAMING: u8 = 0x02;
+const SUBCLASS_MIDI_STREAMING: u8 = 0x03;
+
+// MIDI-streaming class-specific endpoint subtype.
+const MS_GENERAL: u8 = 0x01;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
@@ -138,6 +142,18 @@ pub struct DeviceModel {
     /// Interrupt status endpoint on the control interface, 0 if absent.
     pub status_endpoint: u8,
 
+    /// MIDI-streaming interface, 0xff when the device has none. The 0404 USB
+    /// has one; the Tracker Pre has MIDI ports on the box but nothing in its
+    /// descriptors.
+    pub midi_interface: u8,
+    /// Bulk endpoints of the MIDI interface, 0 when absent.
+    pub midi_in_endpoint: u8,
+    pub midi_out_endpoint: u8,
+    /// Virtual cables multiplexed on each endpoint (embedded jack count from
+    /// the class-specific endpoint descriptor).
+    pub midi_in_cables: u8,
+    pub midi_out_cables: u8,
+
     pub num_extension_units: u8,
     pub extension_units: [ExtensionUnit; MAX_EXTENSION_UNITS],
 
@@ -156,6 +172,11 @@ impl Default for DeviceModel {
             max_power_ma: 0,
             control_interface: 0,
             status_endpoint: 0,
+            midi_interface: 0xff,
+            midi_in_endpoint: 0,
+            midi_out_endpoint: 0,
+            midi_in_cables: 0,
+            midi_out_cables: 0,
             num_extension_units: 0,
             extension_units: [ExtensionUnit::default(); MAX_EXTENSION_UNITS],
             num_terminals: 0,
@@ -176,6 +197,10 @@ impl DeviceModel {
 
     pub fn clock_rate_unit(&self) -> Option<&ExtensionUnit> {
         self.extension_unit(extension_code::CLOCK_RATE)
+    }
+
+    pub fn has_midi(&self) -> bool {
+        self.midi_interface != 0xff && self.midi_in_endpoint != 0 && self.midi_out_endpoint != 0
     }
 
     pub fn alts(&self) -> &[AltSetting] {
@@ -232,7 +257,11 @@ pub fn parse_configuration(bytes: &[u8]) -> Result<DeviceModel, ParseError> {
     // Tracks the interface whose descriptors we are currently inside, so
     // class-specific descriptors can be attributed correctly.
     let mut current_is_control = false;
+    let mut current_is_midi = false;
     let mut current_alt_index: Option<usize> = None;
+    // Last endpoint seen on the MIDI interface, so the class-specific endpoint
+    // descriptor that follows it can attribute its cable count.
+    let mut current_midi_endpoint: u8 = 0;
 
     let mut offset = bytes[0] as usize;
     if offset == 0 {
@@ -268,10 +297,13 @@ pub fn parse_configuration(bytes: &[u8]) -> Result<DeviceModel, ParseError> {
                 // its class-specific descriptors must be skipped rather than
                 // read as audio.
                 current_is_control = subclass == SUBCLASS_AUDIO_CONTROL;
+                current_is_midi = subclass == SUBCLASS_MIDI_STREAMING;
                 current_alt_index = None;
 
                 if current_is_control {
                     model.control_interface = current_interface;
+                } else if current_is_midi {
+                    model.midi_interface = current_interface;
                 } else if subclass == SUBCLASS_AUDIO_STREAMING {
                     let index = model.num_alt_settings as usize;
                     if index >= MAX_ALT_SETTINGS {
@@ -299,6 +331,17 @@ pub fn parse_configuration(bytes: &[u8]) -> Result<DeviceModel, ParseError> {
 
                 if current_is_control {
                     model.status_endpoint = address;
+                } else if current_is_midi {
+                    // Bulk data endpoints only; the jack topology behind them
+                    // is fixed on this hardware and not modelled.
+                    if attributes & 0x03 == 0x02 {
+                        if address & 0x80 != 0 {
+                            model.midi_in_endpoint = address;
+                        } else {
+                            model.midi_out_endpoint = address;
+                        }
+                        current_midi_endpoint = address;
+                    }
                 } else if let Some(index) = current_alt_index {
                     let alt = &mut model.alt_settings[index];
                     // Bits 5:4 == 01 marks a feedback endpoint. The data
@@ -420,7 +463,17 @@ pub fn parse_configuration(bytes: &[u8]) -> Result<DeviceModel, ParseError> {
                 }
             }
 
-            DT_CS_ENDPOINT => {}
+            DT_CS_ENDPOINT => {
+                // MS_GENERAL carries bNrEmbMIDIJack: how many virtual cables
+                // the endpoint it follows multiplexes.
+                if current_is_midi && length >= 4 && d[2] == MS_GENERAL {
+                    if current_midi_endpoint & 0x80 != 0 {
+                        model.midi_in_cables = d[3];
+                    } else if current_midi_endpoint != 0 {
+                        model.midi_out_cables = d[3];
+                    }
+                }
+            }
 
             _ => {}
         }

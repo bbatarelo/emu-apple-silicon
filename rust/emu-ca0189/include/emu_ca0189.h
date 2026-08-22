@@ -70,6 +70,14 @@ typedef struct {
     uint8_t  control_interface;
     uint8_t  status_endpoint;
 
+    /* MIDI-streaming interface, 0xff when the device has none. Endpoints are
+     * 0 when absent; cable counts are the embedded jack count per endpoint. */
+    uint8_t  midi_interface;
+    uint8_t  midi_in_endpoint;
+    uint8_t  midi_out_endpoint;
+    uint8_t  midi_in_cables;
+    uint8_t  midi_out_cables;
+
     uint8_t  num_extension_units;
     EmuExtensionUnit extension_units[EMU_MAX_EXTENSION_UNITS];
 
