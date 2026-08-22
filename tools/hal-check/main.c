@@ -83,7 +83,55 @@ static UInt32 channels_in_scope(AudioObjectID device, AudioObjectPropertyScope s
     return total;
 }
 
-int main(void)
+/* Reads or writes the driver's clock-source setting. Returns 0 on success. */
+static int clock_source(AudioObjectID device, const char* wanted)
+{
+    AudioObjectPropertyAddress address = {
+        'emuK', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+
+    if (wanted) {
+        CFStringRef value = CFStringCreateWithCString(NULL, wanted, kCFStringEncodingUTF8);
+        if (!value) return 1;
+        OSStatus s = AudioObjectSetPropertyData(device, &address, 0, NULL,
+                                                sizeof(value), &value);
+        CFRelease(value);
+        if (s != noErr) {
+            fprintf(stderr, "error: could not set clock source to '%s' (0x%x)\n", wanted, s);
+            fprintf(stderr, "       valid values are 'device' and 'host'\n");
+            return 1;
+        }
+    }
+
+    CFStringRef current = NULL;
+    UInt32 size = sizeof(current);
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &current) != noErr
+        || !current) {
+        fprintf(stderr, "error: could not read the clock source\n");
+        return 1;
+    }
+    char buffer[32] = {0};
+    CFStringGetCString(current, buffer, sizeof buffer, kCFStringEncodingUTF8);
+    CFRelease(current);
+
+    printf("clock source: %s\n", buffer);
+    if (strcmp(buffer, "host") == 0) {
+        printf("  smooth, but Core Audio and the device drift apart over hours\n");
+    } else {
+        printf("  correct long-term; the anchor moves in 8 ms steps\n");
+    }
+    return 0;
+}
+
+static void usage(void)
+{
+    fprintf(stderr,
+        "usage: hal-check                       report what the driver is doing\n"
+        "       hal-check clock                 show which clock the timeline follows\n"
+        "       hal-check clock device|host     switch it, immediately\n");
+}
+
+int main(int argc, char** argv)
 {
     AudioObjectID device = find_device();
     if (device == kAudioObjectUnknown) {
@@ -92,6 +140,14 @@ int main(void)
                 DEVICE_UID);
         return 1;
     }
+    if (argc > 1) {
+        if (strcmp(argv[1], "clock") == 0) {
+            return clock_source(device, argc > 2 ? argv[2] : NULL);
+        }
+        usage();
+        return 2;
+    }
+
     printf("device found: AudioObjectID %u\n\n", device);
 
     AudioObjectPropertyAddress address = {

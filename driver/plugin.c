@@ -97,7 +97,29 @@ enum {
  */
 enum {
     kEMUProperty_Diagnostics = 'emuD',
+    /* Settable. Which clock Core Audio's timeline follows. */
+    kEMUProperty_ClockSource = 'emuK',
 };
+
+/*
+ * Where GetZeroTimeStamp gets its anchor.
+ *
+ * DEVICE is correct: it follows frames the hardware has actually consumed, so
+ * the two clocks cannot drift apart. It is also coarser, because the anchor only
+ * moves when an isochronous request completes -- every 8 ms -- and Core Audio
+ * extrapolates in between.
+ *
+ * HOST is smooth but wrong: it advances on mach_absolute_time, so any difference
+ * between the two clocks accumulates in the ring until it breaks. At a few ppm
+ * that takes hours.
+ *
+ * Switchable at runtime because which one sounds better is a question about this
+ * machine and this workload, not one to answer from first principles.
+ */
+typedef enum {
+    kClockSource_Device = 0,
+    kClockSource_Host   = 1,
+} ClockSource;
 
 /* Every rate the hardware supports, from the descriptors. */
 static const Float64 kSupportedRates[] = {
@@ -115,6 +137,7 @@ static Float64           gSampleRate     = 48000.0;
 static UInt32            gIOClients      = 0;
 static Boolean           gInputActive    = true;
 static Boolean           gOutputActive   = true;
+static ClockSource       gClockSource    = kClockSource_Device;
 static Float32           gVolumeScalar   = 1.0f;
 static Boolean           gMuted          = false;
 
@@ -386,6 +409,7 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 case kAudioDevicePropertyZeroTimeStampPeriod:
                 case kAudioObjectPropertyCustomPropertyInfoList:
                 case kEMUProperty_Diagnostics:
+                case kEMUProperty_ClockSource:
                     return true;
                 default: return false;
             }
@@ -466,6 +490,9 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o
         address->mSelector == kAudioBooleanControlPropertyValue) {
         *settable = true;
     }
+    if (object == kObjectID_Device && address->mSelector == kEMUProperty_ClockSource) {
+        *settable = true;
+    }
     return kAudioHardwareNoError;
 }
 
@@ -540,11 +567,13 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             *outSize = sizeof(Float64); return kAudioHardwareNoError;
 
         case kAudioObjectPropertyCustomPropertyInfoList:
-            *outSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+            *outSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
             return kAudioHardwareNoError;
 
         case kEMUProperty_Diagnostics:
             *outSize = sizeof(CFPropertyListRef); return kAudioHardwareNoError;
+        case kEMUProperty_ClockSource:
+            *outSize = sizeof(CFStringRef); return kAudioHardwareNoError;
 
         case kAudioDevicePropertyPreferredChannelsForStereo:
             *outSize = 2 * sizeof(UInt32); return kAudioHardwareNoError;
@@ -636,15 +665,34 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kAudioDevicePropertyNominalSampleRate: RETURN_F64(gSampleRate);
 
             case kAudioObjectPropertyCustomPropertyInfoList: {
-                if (dataSize < sizeof(AudioServerPlugInCustomPropertyInfo)) {
-                    *outSize = 0; return kAudioHardwareNoError;
-                }
                 AudioServerPlugInCustomPropertyInfo* info =
                     (AudioServerPlugInCustomPropertyInfo*)outData;
-                info[0].mSelector = kEMUProperty_Diagnostics;
-                info[0].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
-                info[0].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
-                *outSize = sizeof(AudioServerPlugInCustomPropertyInfo);
+                UInt32 capacity = dataSize / sizeof(AudioServerPlugInCustomPropertyInfo);
+                UInt32 n = 0;
+                if (n < capacity) {
+                    info[n].mSelector = kEMUProperty_Diagnostics;
+                    info[n].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+                    info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                    n++;
+                }
+                if (n < capacity) {
+                    info[n].mSelector = kEMUProperty_ClockSource;
+                    info[n].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
+                    info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                    n++;
+                }
+                *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
+                return kAudioHardwareNoError;
+            }
+
+            case kEMUProperty_ClockSource: {
+                if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+                pthread_mutex_lock(&gStateMutex);
+                ClockSource source = gClockSource;
+                pthread_mutex_unlock(&gStateMutex);
+                *(CFStringRef*)outData = (source == kClockSource_Host)
+                    ? CFSTR("host") : CFSTR("device");
+                *outSize = sizeof(CFStringRef);
                 return kAudioHardwareNoError;
             }
 
@@ -677,6 +725,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     { CFSTR("inputDepth"),     engine.input_depth          },
                     { CFSTR("inputUnderruns"), engine.input_underruns      },
                     { CFSTR("inputOverruns"),  engine.input_overruns       },
+                    { CFSTR("clockSourceIsHost"), (uint64_t)(gClockSource == kClockSource_Host) },
                 };
                 for (size_t i = 0; i < sizeof entries / sizeof entries[0]; i++) {
                     long long v = (long long)entries[i].value;
@@ -932,6 +981,36 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareNoError;
     }
 
+    if (object == kObjectID_Device && address->mSelector == kEMUProperty_ClockSource) {
+        if (dataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+        CFStringRef requested = *(const CFStringRef*)data;
+        if (!requested) return kAudioHardwareIllegalOperationError;
+
+        ClockSource source;
+        if (CFStringCompare(requested, CFSTR("host"), kCFCompareCaseInsensitive)
+            == kCFCompareEqualTo) {
+            source = kClockSource_Host;
+        } else if (CFStringCompare(requested, CFSTR("device"), kCFCompareCaseInsensitive)
+                   == kCFCompareEqualTo) {
+            source = kClockSource_Device;
+        } else {
+            return kAudioHardwareIllegalOperationError;
+        }
+
+        pthread_mutex_lock(&gStateMutex);
+        if (gClockSource != source) {
+            gClockSource = source;
+            /* Bump the seed so Core Audio discards whatever it had extrapolated
+             * from the previous anchor rather than splicing two timelines. */
+            gTimelineSeed++;
+        }
+        pthread_mutex_unlock(&gStateMutex);
+
+        EMU_LOG("clock source set to %{public}s",
+                source == kClockSource_Host ? "host" : "device");
+        return kAudioHardwareNoError;
+    }
+
     if (object == kObjectID_Mute_Output &&
         address->mSelector == kAudioBooleanControlPropertyValue) {
         if (dataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
@@ -1022,8 +1101,12 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
     if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
     if (!sampleTime || !hostTime || !seed) return kAudioHardwareIllegalOperationError;
 
+    pthread_mutex_lock(&gStateMutex);
+    bool followDevice = (gClockSource == kClockSource_Device);
+    pthread_mutex_unlock(&gStateMutex);
+
     uint64_t deviceFrames = 0, deviceHost = 0;
-    if (emu_engine_timeline(&deviceFrames, &deviceHost)) {
+    if (followDevice && emu_engine_timeline(&deviceFrames, &deviceHost)) {
         pthread_mutex_lock(&gStateMutex);
         Float64 ticksPerFrame = host_ticks_per_second() / gSampleRate;
 
@@ -1050,9 +1133,9 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
         return kAudioHardwareNoError;
     }
 
-    /* Before the first transfer completes there is no device clock to follow,
-     * so fall back to the host's. This lasts a few milliseconds at stream
-     * start. */
+    /* Either the host clock was asked for, or no transfer has completed yet and
+     * there is no device clock to follow. The latter lasts a few milliseconds at
+     * stream start. */
     pthread_mutex_lock(&gStateMutex);
     Float64 ticksPerFrame = host_ticks_per_second() / gSampleRate;
     UInt64  ticksPerPeriod = (UInt64)(ticksPerFrame * (Float64)RING_FRAMES);
