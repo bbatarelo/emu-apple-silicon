@@ -37,8 +37,11 @@ static const EmuDeviceIdentity kEmuDevices[] = {
 
 #define EMU_DEVICE_COUNT (sizeof(kEmuDevices) / sizeof(kEmuDevices[0]))
 
-/* The device this build drives. Until multi-device support exists in the HAL
- * plug-in, this is the one it opens and the one it advertises to Core Audio. */
+/* Which device to prefer when more than one from the table is plugged in. The
+ * driver and the tools look for every device in this table and take whichever
+ * is attached, so a single build serves any of them; this only breaks the tie.
+ * Until multi-device support exists in the HAL plug-in, exactly one device is
+ * published to Core Audio. */
 #define EMU_DEFAULT_PRODUCT_ID 0x3f0a
 
 static inline const EmuDeviceIdentity* emu_device_for_product(uint16_t product_id)

@@ -1,5 +1,5 @@
 /*
- * emu-probe -- userspace USB probe for the E-MU Tracker Pre.
+ * emu-probe -- userspace USB probe for E-MU CA0189 interfaces.
  *
  * Milestones 1 and 2 from EMU_Tracker_Pre_Development_Guidelines.md section 29:
  * descriptor topology, and clock rate control with SET_CUR -> GET_CUR
@@ -31,9 +31,9 @@
 #include "lltest.h"
 
 #include "../../shared/device.h"
+#include "../../shared/usb_util.h"
 
 #define EMU_VID EMU_VENDOR_ID
-#define EMU_PID EMU_DEFAULT_PRODUCT_ID
 
 #define CONTROL_TIMEOUT_MS 1000
 
@@ -41,45 +41,30 @@ typedef IOUSBDeviceInterface500** UsbDevice;
 
 /* ------------------------------------------------------------------ device */
 
+/* Whichever device open_device found. The probe drives one at a time. */
+static const EmuDeviceIdentity* gDevice = NULL;
+
 static UsbDevice open_device(io_service_t* out_service, bool* out_opened)
 {
     *out_opened = false;
 
-    CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBDeviceClassName);
-    if (!matching) {
-        fprintf(stderr, "error: IOServiceMatching failed\n");
-        return NULL;
-    }
-
-    SInt32 vid = EMU_VID, pid = EMU_PID;
-    CFNumberRef vref = CFNumberCreate(NULL, kCFNumberSInt32Type, &vid);
-    CFNumberRef pref = CFNumberCreate(NULL, kCFNumberSInt32Type, &pid);
-    CFDictionarySetValue(matching, CFSTR(kUSBVendorID), vref);
-    CFDictionarySetValue(matching, CFSTR(kUSBProductID), pref);
-    CFRelease(vref);
-    CFRelease(pref);
-
-    io_iterator_t iter = IO_OBJECT_NULL;
-    kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "error: IOServiceGetMatchingServices: 0x%08x\n", kr);
-        return NULL;
-    }
-
-    io_service_t service = IOIteratorNext(iter);
-    IOObjectRelease(iter);
-    if (!service) {
+    io_service_t service = IO_OBJECT_NULL;
+    gDevice = emu_find_device(EMU_DEFAULT_PRODUCT_ID, &service);
+    if (!gDevice) {
         fprintf(stderr,
-                "error: no E-MU Tracker Pre (%04x:%04x) found on the USB bus.\n"
-                "       Connect the device and try again.\n",
-                EMU_VID, EMU_PID);
+                "error: no known E-MU device found on the USB bus.\n"
+                "       Connect one and try again.\n");
         return NULL;
+    }
+    if (!gDevice->verified) {
+        fprintf(stderr, "note: %s has not been verified against this driver\n",
+                gDevice->name);
     }
 
     IOCFPlugInInterface** plugin = NULL;
     SInt32 score = 0;
-    kr = IOCreatePlugInInterfaceForService(service, kIOUSBDeviceUserClientTypeID,
-                                          kIOCFPlugInInterfaceID, &plugin, &score);
+    kern_return_t kr = IOCreatePlugInInterfaceForService(
+        service, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID, &plugin, &score);
     if (kr != KERN_SUCCESS || !plugin) {
         fprintf(stderr, "error: IOCreatePlugInInterfaceForService: 0x%08x\n", kr);
         IOObjectRelease(service);
@@ -278,7 +263,7 @@ static int cmd_descriptors(UsbDevice dev, const char* save_path)
     uint16_t raw_len = 0;
     if (!fetch_config(dev, &raw, &raw_len)) return 1;
 
-    printf("E-MU Tracker Pre  %04x:%04x\n", EMU_VID, EMU_PID);
+    printf("%s  %04x:%04x\n", gDevice->name, EMU_VID, gDevice->product_id);
     printf("configuration descriptor: %u bytes\n\n", raw_len);
 
     EmuDeviceModel model;
