@@ -115,7 +115,22 @@ the real test — this plays a 440 Hz tone, so turn the volume down:
 `STABLE` with a small tracking error, and an audible clean sine, means the
 transport works and the device is supportable.
 
-## 5. Make it official
+## 5. MIDI, if it has it
+
+If `descriptors` printed a `MIDI interface` line, the CoreMIDI driver should
+already handle it — the transport is descriptor-driven. Connect a DIN cable
+from the device's MIDI OUT to its MIDI IN and run:
+
+```
+./build/bin/emu-probe midi-loopback
+```
+
+`PASS` means the pipes, the packet framing and the physical ports all work.
+(If the MIDI driver is already installed, `make uninstall-midi` first — it
+holds the interface.) Then `make install` and verify the CoreMIDI path the
+same way: `./build/bin/midi-check dump` in one terminal, `send` in another.
+
+## 6. Make it official
 
 If all of that worked, two changes finish the job:
 
@@ -157,5 +172,8 @@ If they differ, the likely work is:
   `0xe306` for clock source, digital I/O, device options, direct monitoring and
   metering. The Tracker Pre has none of them; the 0404 has three, still unread.
   They are the route to exposing a device's own controls.
-- **MIDI.** The 0404 carries a standard USB-MIDI 1.0 interface on bulk
-  endpoints. Nothing in this driver looks at it.
+- **MIDI.** Written, for devices that advertise USB-MIDI 1.0 the way the 0404
+  does: the parser picks up the interface and the CoreMIDI plug-in drives it
+  with no per-device code. A device whose MIDI is *not* standard USB-MIDI —
+  the Tracker Pre advertises no MIDI interface at all despite having DIN
+  ports — is unexplored territory.

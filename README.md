@@ -8,7 +8,8 @@ has been silent on modern Macs for years. This brings it back.
 
 **It plays and it records.** The device appears in System Settings like any other
 audio interface, with working volume and mute, at every sample rate the hardware
-supports: 44.1, 48, 88.2, 96, 176.4 and 192 kHz.
+supports: 44.1, 48, 88.2, 96, 176.4 and 192 kHz. On the 0404 USB the DIN MIDI
+ports work too, as ordinary CoreMIDI endpoints.
 
 No kernel extension. No system extension. No disabling SIP, no lowered security
 settings, and no Apple Developer account required.
@@ -33,9 +34,10 @@ make
 make install
 ```
 
-`make install` asks for your password, because the driver goes in
-`/Library/Audio/Plug-Ins/HAL`, and restarts the audio daemon. **All audio on the
-machine stops for a second or two** — quit anything playing first.
+`make install` asks for your password, because the drivers go in
+`/Library/Audio/Plug-Ins/HAL` and `/Library/Audio/MIDI Drivers`, and restarts
+the audio and MIDI daemons. **All audio on the machine stops for a second or
+two** — quit anything playing first.
 
 Then open **System Settings → Sound** and choose the device — it appears under
 its own name, **E-MU Tracker Pre** or **E-MU 0404 USB** — for output, input, or
@@ -107,6 +109,20 @@ duplex drop about one playback packet a second on some setups**
 on that machine either rate leaves the *next* stream corrupt whatever rate it
 runs at. See `docs/FINDINGS.md`, and the input mode under Status below.
 
+```bash
+./build/bin/midi-check
+```
+
+Lists every MIDI endpoint on the system and flags the ones this driver
+publishes (0404 USB only — the Tracker Pre's descriptors expose no MIDI).
+`midi-check send` plays a middle C out the DIN OUT port; `midi-check dump`
+prints whatever arrives at the DIN IN. With a DIN cable looped from the
+device's MIDI OUT to its MIDI IN, those two commands in two terminals verify
+the whole path an application would use. `./build/bin/emu-probe midi-loopback`
+runs the same loop against the raw USB interface instead — use it *before*
+installing, or after `make uninstall-midi`, since the installed driver holds
+the interface.
+
 ---
 
 ## Which devices?
@@ -131,7 +147,10 @@ With two known devices plugged in at once, only one is published; which one is
 
 A Core Audio HAL plug-in, which is the supported way to add an audio device from
 userspace. It talks to the hardware over USB through IOKit, and does the
-isochronous streaming, clock recovery and format conversion itself.
+isochronous streaming, clock recovery and format conversion itself. MIDI is a
+second, much smaller plug-in of the same shape loaded by MIDIServer, because
+macOS keeps audio and MIDI in separate daemons; the two share the USB device by
+each claiming only its own interface.
 
 ```
    application
@@ -163,7 +182,8 @@ More in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 Working: playback, capture, all six sample rates, master volume and mute,
 correct channel mapping, clock tracking anchored to the device, latency
-reported from a loopback measurement.
+reported from a loopback measurement, and MIDI in and out on the 0404 USB —
+verified byte-for-byte through a DIN loopback cable.
 
 Known issue: on some setups — @dnadlinger's development 0404 USB among them,
 though another user's 0404 USB and Tracker Pre are reported clean — full
@@ -175,9 +195,9 @@ it. See `docs/FINDINGS.md`.
 
 Not done:
 
-- MIDI. Both devices have MIDI ports and this driver ignores them entirely. The
-  0404 exposes a standard USB-MIDI 1.0 interface; the Tracker Pre does not
-  advertise one at all.
+- MIDI on the Tracker Pre. It has DIN ports on the box but advertises no
+  MIDI-streaming interface, so how to reach them is still unknown. The 0404's
+  MIDI works.
 - The devices' own controls — pad, phantom power, direct monitoring, and the
   0404's S/PDIF — are not exposed. The Tracker Pre advertises only one extension
   unit, so some may not be reachable; the 0404 has three more that nothing reads

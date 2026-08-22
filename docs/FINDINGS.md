@@ -351,9 +351,27 @@ settings and their class-specific descriptors are skipped.
 The Tracker Pre has MIDI ports on the box but no MIDI-streaming interface in its
 descriptors, which is why this went unnoticed.
 
-For whoever implements MIDI: one embedded jack each way, on **bulk** endpoints
-`0x05` OUT and `0x85` IN, with a standard `MS_HEADER` and the usual
-in-jack/out-jack pairs. Ordinary USB-MIDI 1.0, unlike the audio side.
+The interface itself is ordinary USB-MIDI 1.0, unlike the audio side: one
+embedded jack each way on **bulk** endpoints `0x05` OUT and `0x85` IN, with a
+standard `MS_HEADER` and the usual in-jack/out-jack pairs. It is now driven —
+the parser records it in the model, the Rust core owns the event-packet
+framing, and a CoreMIDI plug-in (`midi-driver/`) publishes the ports.
+
+Measured on the hardware, with a DIN cable looped from MIDI OUT to MIDI IN
+(`emu-probe midi-loopback`): a 29-byte test stream covering both channel
+message lengths, running status, system common, real-time and a
+packet-spanning SysEx came back **byte-for-byte intact** (30 bytes returned —
+the USB framing legitimately expands running status, since every event packet
+carries its status byte).
+
+Two transport facts worth recording:
+
+- The bulk pipes coexist with the audio driver. coreaudiod claims interfaces
+  1 and 2 and MIDIServer claims interface 3, and neither needs the *device*
+  opened, so audio and MIDI run from different processes without contention.
+- USB interface claims are exclusive, so `emu-probe`'s raw `midi-*` commands
+  fail with `kIOReturnExclusiveAccess` once the CoreMIDI driver is installed.
+  `make uninstall-midi` frees the interface for probing.
 
 ### Four extension units instead of one
 

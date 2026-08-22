@@ -27,9 +27,10 @@ and opens USB directly, so there is no helper daemon and no IPC.
 | | |
 |---|---|
 | `driver/` | The HAL plug-in. This is the product. |
+| `midi-driver/` | The CoreMIDI plug-in: the 0404's DIN MIDI ports as system MIDI endpoints |
 | `shared/` | Device identity and IOKit helpers, used by the driver and the tools |
 | `rust/emu-ca0189/` | Descriptor parser, protocol model, feedback queue, clock estimator |
-| `tools/` | `emu-probe` (USB diagnostics), `hal-check` (device inspector), `hal-record` (capture verifier), `hal-trace` (stream-start timeline), `hal-loopback` (closes the loop with a cable) |
+| `tools/` | `emu-probe` (USB diagnostics), `hal-check` (device inspector), `hal-record` (capture verifier), `hal-trace` (stream-start timeline), `hal-loopback` (closes the loop with a cable), `midi-check` (CoreMIDI inspector) |
 | `captures/` | Descriptor and packet-trace fixtures, replayed by the tests |
 | `driverkit/` | An unfinished DriverKit version, parked |
 
@@ -37,14 +38,14 @@ and opens USB directly, so there is no helper daemon and no IPC.
 
 `rust/emu-ca0189` holds everything that is about the *device* rather than about
 macOS: parsing descriptors, the CA0189 request encoding, rate codes, the feedback
-queue and the clock estimator.
+queue, the clock estimator, and the USB-MIDI event packet codec.
 
 It knows nothing about IOKit, Core Audio or DriverKit. That is deliberate — it
 compiles `no_std` for a DriverKit dext and with `std` for userspace, and it is
 tested against captured traces with no hardware attached.
 
 ```bash
-make test        # 35 tests, replaying real captures
+make test        # 64 tests, replaying real captures
 ```
 
 Its C interface is `rust/emu-ca0189/include/emu_ca0189.h`. The boundary is a
@@ -369,6 +370,24 @@ frame-list entry per USB frame, which silently halves the audio on the
 Startup order matters and is not negotiable: parse descriptors, set the clock
 rate, **verify it by read-back**, then select alternate settings. Doing it in any
 other order can wedge the device until it is physically replugged.
+
+## The MIDI driver
+
+Audio and MIDI live in different daemons on macOS — coreaudiod hosts HAL
+plug-ins, MIDIServer hosts CoreMIDI drivers — so MIDI is its own small bundle,
+`midi-driver/`, installed to `/Library/Audio/MIDI Drivers`. The two processes
+share the USB device without conflict because each claims only its own
+interface and neither holds the device itself open.
+
+The 0404's MIDI interface is ordinary USB-MIDI 1.0 hiding under the
+vendor-specific class byte, which is the only reason Apple's class driver does
+not already drive it. Every MIDI message travels as a 4-byte event packet on a
+bulk endpoint; the framing — running status expansion, SysEx spanning packets,
+real-time bytes interleaved mid-message — lives in the Rust core
+(`src/midi.rs`), tested without hardware. The C plug-in is only the IOKit
+transport and the CoreMIDI object model: one device, one entity, one endpoint
+in each direction, hot-plug tracked through IOKit notifications so the
+endpoints go offline and online with the cable.
 
 ## Diagnostics
 
