@@ -161,8 +161,10 @@ static const char* extension_code_name(uint16_t code)
     }
 }
 
-static bool read_model(UsbDevice dev, EmuDeviceModel* model,
-                       const uint8_t** raw_out, uint16_t* raw_len_out)
+/* The raw configuration descriptor, before anyone tries to make sense of it.
+ * Kept separate from parsing so an unfamiliar device can still have its bytes
+ * saved and sent on when the parser rejects them. */
+static bool fetch_config(UsbDevice dev, const uint8_t** raw_out, uint16_t* raw_len_out)
 {
     IOUSBConfigurationDescriptorPtr cfg = NULL;
     kern_return_t kr = (*dev)->GetConfigurationDescriptorPtr(dev, 0, &cfg);
@@ -171,8 +173,17 @@ static bool read_model(UsbDevice dev, EmuDeviceModel* model,
         return false;
     }
 
-    uint16_t total = OSSwapLittleToHostInt16(cfg->wTotalLength);
-    const uint8_t* bytes = (const uint8_t*)cfg;
+    *raw_out = (const uint8_t*)cfg;
+    *raw_len_out = OSSwapLittleToHostInt16(cfg->wTotalLength);
+    return true;
+}
+
+static bool read_model(UsbDevice dev, EmuDeviceModel* model,
+                       const uint8_t** raw_out, uint16_t* raw_len_out)
+{
+    const uint8_t* bytes = NULL;
+    uint16_t total = 0;
+    if (!fetch_config(dev, &bytes, &total)) return false;
 
     int32_t rc = emu_parse_config_descriptor(bytes, total, model);
     if (rc != 0) {
@@ -251,26 +262,41 @@ static void print_model(const EmuDeviceModel* m)
     }
 }
 
+static bool save_raw(const uint8_t* raw, uint16_t raw_len, const char* path)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) { perror("fopen"); return false; }
+    fwrite(raw, 1, raw_len, f);
+    fclose(f);
+    printf("wrote %u raw bytes to %s\n", raw_len, path);
+    return true;
+}
+
 static int cmd_descriptors(UsbDevice dev, const char* save_path)
 {
-    EmuDeviceModel model;
     const uint8_t* raw = NULL;
     uint16_t raw_len = 0;
-
-    if (!read_model(dev, &model, &raw, &raw_len)) return 1;
+    if (!fetch_config(dev, &raw, &raw_len)) return 1;
 
     printf("E-MU Tracker Pre  %04x:%04x\n", EMU_VID, EMU_PID);
     printf("configuration descriptor: %u bytes\n\n", raw_len);
-    print_model(&model);
 
-    if (save_path) {
-        FILE* f = fopen(save_path, "wb");
-        if (!f) { perror("fopen"); return 1; }
-        fwrite(raw, 1, raw_len, f);
-        fclose(f);
-        printf("\nwrote %u raw bytes to %s\n", raw_len, save_path);
+    EmuDeviceModel model;
+    int32_t rc = emu_parse_config_descriptor(raw, raw_len, &model);
+    if (rc == 0) {
+        print_model(&model);
+        if (save_path) {
+            printf("\n");
+            if (!save_raw(raw, raw_len, save_path)) return 1;
+        }
+        return 0;
     }
-    return 0;
+
+    /* The bytes are worth keeping even when we cannot read them: an
+     * unrecognised descriptor is exactly what someone else needs to see. */
+    fprintf(stderr, "error: descriptor parse failed with code %d\n", rc);
+    if (save_path && !save_raw(raw, raw_len, save_path)) return 1;
+    return 1;
 }
 
 /* -------------------------------------------------------------- milestone 2 */
