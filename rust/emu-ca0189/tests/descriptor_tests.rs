@@ -247,3 +247,112 @@ fn truncating_anywhere_never_panics() {
         let _ = parse_configuration(&prefix);
     }
 }
+
+// ---------------------------------------------------------------- 0404 USB
+
+/// Captured 2026-08-22 from 0404 USB 041e:3f04, bcdDevice 0x0100. The same
+/// CA0189 protocol, but a larger device: four extension units instead of one,
+/// four-channel alternate settings alongside the stereo ones, and a
+/// MIDI-streaming interface the Tracker Pre does not have.
+const CONFIG_0404: &[u8] = include_bytes!("../../../captures/descriptors/0404-usb-config.bin");
+
+#[test]
+fn parses_the_0404_configuration() {
+    let m = parse_configuration(CONFIG_0404).expect("fixture must parse");
+
+    assert_eq!(CONFIG_0404.len(), 1832);
+    assert_eq!(m.configuration_value, 1);
+    // Audio control, playback, capture, and MIDI.
+    assert_eq!(m.num_interfaces, 4);
+    assert_eq!(m.control_interface, 0);
+    assert_eq!(m.status_endpoint, 0x83);
+}
+
+#[test]
+fn the_0404_midi_interface_contributes_no_alt_settings() {
+    // Its class-specific descriptors reuse the audio-streaming subtype numbers
+    // for jacks and elements. Reading them as audio is what made this fixture
+    // fail to parse at all, so the count is the regression guard.
+    let m = parse_configuration(CONFIG_0404).unwrap();
+
+    assert_eq!(m.num_alt_settings, 36);
+    assert!(
+        m.alts().iter().all(|a| a.interface_number == 1 || a.interface_number == 2),
+        "only the two audio-streaming interfaces may produce alt settings"
+    );
+}
+
+#[test]
+fn the_0404_clock_rate_unit_matches_the_tracker_pre() {
+    let m = parse_configuration(CONFIG_0404).unwrap();
+    let xu = m.clock_rate_unit().expect("must expose the clock rate unit");
+
+    // Same unit ID and same bmControls, which is why the existing clock code
+    // drives this device unchanged.
+    assert_eq!(xu.unit_id, 12);
+    assert_eq!(xu.extension_code, extension_code::CLOCK_RATE);
+    assert_eq!(xu.controls, 0x07);
+}
+
+#[test]
+fn the_0404_exposes_the_extra_extension_units() {
+    let m = parse_configuration(CONFIG_0404).unwrap();
+
+    // Clock source, digital I/O status and device options, none of which the
+    // Tracker Pre has. Nothing drives them yet; this records that they exist.
+    assert_eq!(m.num_extension_units, 4);
+    assert!(m.extension_unit(extension_code::CLOCK_SOURCE).is_some());
+    assert!(m.extension_unit(extension_code::DIGITAL_IO_STATUS).is_some());
+    assert!(m.extension_unit(extension_code::DEVICE_OPTIONS).is_some());
+}
+
+#[test]
+fn the_0404_advertises_all_six_sample_rates() {
+    let m = parse_configuration(CONFIG_0404).unwrap();
+
+    let mut rates = [0u32; 16];
+    let n = m.sample_rates(&mut rates);
+    assert_eq!(&rates[..n], &[44100, 48000, 88200, 96000, 176400, 192000]);
+}
+
+#[test]
+fn every_0404_rate_is_available_in_stereo_both_ways() {
+    // The driver's ring is stereo, so it selects alt settings by rate *and*
+    // channel count. That only works if a stereo alt exists at every rate in
+    // both directions.
+    let m = parse_configuration(CONFIG_0404).unwrap();
+
+    for rate in [44100, 48000, 88200, 96000, 176400, 192000] {
+        for input in [true, false] {
+            assert!(
+                m.alts().iter().any(|a| {
+                    a.sample_rate == rate && a.channels == 2 && a.is_input() == input
+                }),
+                "no stereo {} alt setting at {rate} Hz",
+                if input { "capture" } else { "playback" }
+            );
+        }
+    }
+}
+
+#[test]
+fn the_0404_offers_four_channel_alt_settings_too() {
+    // Not yet usable -- the ring and the published format are stereo -- but
+    // their existence is why rate alone no longer identifies an alt setting.
+    let m = parse_configuration(CONFIG_0404).unwrap();
+
+    let quad = m.alts().iter().filter(|a| a.channels == 4).count();
+    assert!(quad > 0, "the 0404 advertises four-channel alt settings");
+}
+
+#[test]
+fn truncating_the_0404_anywhere_never_panics() {
+    for n in 0..CONFIG_0404.len() {
+        let mut prefix = CONFIG_0404[..n].to_vec();
+        if prefix.len() >= 4 {
+            let len = prefix.len() as u16;
+            prefix[2..4].copy_from_slice(&len.to_le_bytes());
+        }
+        let _ = parse_configuration(&prefix);
+    }
+}

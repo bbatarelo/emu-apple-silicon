@@ -32,6 +32,14 @@ const AC_EXTENSION_UNIT: u8 = 0x08;
 const AS_GENERAL: u8 = 0x01;
 const AS_FORMAT_TYPE: u8 = 0x02;
 
+// Interface subclasses. The class byte is vendor-specific (0xff) on every E-MU
+// interface, but the subclass keeps USB-audio numbering. The 0404 USB also
+// carries a MIDI-streaming interface, whose class-specific descriptors reuse
+// the same subtype numbers for entirely different things, so which subclass we
+// are inside has to be tracked rather than assumed.
+const SUBCLASS_AUDIO_CONTROL: u8 = 0x01;
+const SUBCLASS_AUDIO_STREAMING: u8 = 0x02;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
     TooShort,
@@ -254,15 +262,17 @@ pub fn parse_configuration(bytes: &[u8]) -> Result<DeviceModel, ParseError> {
                 let num_endpoints = d[4];
                 let subclass = d[6];
 
-                // The Tracker Pre reports vendor-specific class (0xff) on every
-                // interface but keeps USB-audio subclass numbering: 1 for
-                // control, 2 for streaming.
-                current_is_control = subclass == 0x01;
+                // Vendor-specific class (0xff) throughout, USB-audio subclass
+                // numbering: 1 for control, 2 for streaming. Anything else --
+                // MIDI streaming on the 0404 USB -- belongs to neither, and
+                // its class-specific descriptors must be skipped rather than
+                // read as audio.
+                current_is_control = subclass == SUBCLASS_AUDIO_CONTROL;
+                current_alt_index = None;
 
                 if current_is_control {
                     model.control_interface = current_interface;
-                    current_alt_index = None;
-                } else {
+                } else if subclass == SUBCLASS_AUDIO_STREAMING {
                     let index = model.num_alt_settings as usize;
                     if index >= MAX_ALT_SETTINGS {
                         return Err(ParseError::TooManyAltSettings);
