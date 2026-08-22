@@ -28,11 +28,13 @@ typedef struct {
 
 static const EmuDeviceIdentity kEmuDevices[] = {
     { 0x3f0a, "E-MU Tracker Pre",  true  },
-    /* Believed to share the CA0189 protocol. Neither has been tested; they are
-     * listed so the shape of the work is obvious, not because they are known to
-     * function. Remove the entry or set verified once someone checks. */
+    /* Believed to share the CA0189 protocol, but untested. Listed so the shape
+     * of the work is obvious, not because it is known to function. Remove the
+     * entry or set verified once someone checks. */
     { 0x3f02, "E-MU 0202 USB",     false },
-    { 0x3f04, "E-MU 0404 USB",     false },
+    /* Descriptors read, all six rates set and verified by read-back, and duplex
+     * streaming ran clean at 48 kHz. See docs/FINDINGS.md. */
+    { 0x3f04, "E-MU 0404 USB",     true  },
 };
 
 #define EMU_DEVICE_COUNT (sizeof(kEmuDevices) / sizeof(kEmuDevices[0]))
