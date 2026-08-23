@@ -99,6 +99,8 @@ enum {
     kEMUProperty_Diagnostics = 'emuD',
     /* Settable. Which clock Core Audio's timeline follows. */
     kEMUProperty_ClockSource = 'emuK',
+    /* Settable. Writing anything zeroes the read-only counters. */
+    kEMUProperty_ResetCounters = 'emuR',
 };
 
 /*
@@ -150,6 +152,15 @@ static _Atomic uint64_t  gFramesOut      = 0;
 /* Timeline anchor. Advanced one ring period at a time so the sample clock and
  * the host clock stay tied together. */
 static UInt64            gAnchorHostTime = 0;
+/* Anchor jitter: how far each new timeline anchor lands from where the previous
+ * one predicted. Diagnostics only; nothing depends on it. */
+static UInt64            gAnchorJitterNs = 0;
+static UInt64            gAnchorJitterMaxNs = 0;
+static UInt64            gAnchorUpdates = 0;
+/* Deficit at the last reset, so the reported figure is what has accumulated
+ * since rather than including everything from stream start. */
+static UInt64            gDeficitBaseline = 0;
+static UInt64            gResetCount = 0;
 static UInt64            gTimelineSeed   = 1;
 static UInt64            gPeriodCount    = 0;
 
@@ -410,6 +421,7 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 case kAudioObjectPropertyCustomPropertyInfoList:
                 case kEMUProperty_Diagnostics:
                 case kEMUProperty_ClockSource:
+                case kEMUProperty_ResetCounters:
                     return true;
                 default: return false;
             }
@@ -490,7 +502,9 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o
         address->mSelector == kAudioBooleanControlPropertyValue) {
         *settable = true;
     }
-    if (object == kObjectID_Device && address->mSelector == kEMUProperty_ClockSource) {
+    if (object == kObjectID_Device &&
+        (address->mSelector == kEMUProperty_ClockSource ||
+         address->mSelector == kEMUProperty_ResetCounters)) {
         *settable = true;
     }
     return kAudioHardwareNoError;
@@ -567,12 +581,13 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             *outSize = sizeof(Float64); return kAudioHardwareNoError;
 
         case kAudioObjectPropertyCustomPropertyInfoList:
-            *outSize = 2 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            *outSize = 3 * sizeof(AudioServerPlugInCustomPropertyInfo);
             return kAudioHardwareNoError;
 
         case kEMUProperty_Diagnostics:
             *outSize = sizeof(CFPropertyListRef); return kAudioHardwareNoError;
         case kEMUProperty_ClockSource:
+        case kEMUProperty_ResetCounters:
             *outSize = sizeof(CFStringRef); return kAudioHardwareNoError;
 
         case kAudioDevicePropertyPreferredChannelsForStereo:
@@ -681,7 +696,25 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
                     n++;
                 }
+                if (n < capacity) {
+                    info[n].mSelector = kEMUProperty_ResetCounters;
+                    info[n].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
+                    info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                    n++;
+                }
                 *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
+                return kAudioHardwareNoError;
+            }
+
+            case kEMUProperty_ResetCounters: {
+                if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+                pthread_mutex_lock(&gStateMutex);
+                UInt64 count = gResetCount;
+                pthread_mutex_unlock(&gStateMutex);
+                CFStringRef value = CFStringCreateWithFormat(
+                    NULL, NULL, CFSTR("%llu"), (unsigned long long)count);
+                *(CFStringRef*)outData = value;   /* caller owns it */
+                *outSize = sizeof(CFStringRef);
                 return kAudioHardwareNoError;
             }
 
@@ -726,6 +759,21 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     { CFSTR("inputUnderruns"), engine.input_underruns      },
                     { CFSTR("inputOverruns"),  engine.input_overruns       },
                     { CFSTR("clockSourceIsHost"), (uint64_t)(gClockSource == kClockSource_Host) },
+                    { CFSTR("anchorUpdates"),     gAnchorUpdates      },
+                    { CFSTR("anchorJitterNs"),    gAnchorJitterNs     },
+                    { CFSTR("anchorJitterMaxNs"), gAnchorJitterMaxNs  },
+                    /* Frames the device consumed beyond what Core Audio handed
+                     * over. The clearest health check there is: if it grows, the
+                     * reported timeline is slower than the hardware and the ring
+                     * will keep starving. */
+                    /* Since the last reset, so a startup transient does not sit
+                     * in the figure for the rest of the session. */
+                    { CFSTR("frameDeficit"), (uint64_t)({
+                          uint64_t out = atomic_load(&gFramesOut);
+                          uint64_t raw = engine.frames_played > out
+                                       ? engine.frames_played - out : 0;
+                          raw > gDeficitBaseline ? raw - gDeficitBaseline : 0; }) },
+                    { CFSTR("counterResets"), gResetCount },
                 };
                 for (size_t i = 0; i < sizeof entries / sizeof entries[0]; i++) {
                     long long v = (long long)entries[i].value;
@@ -981,6 +1029,29 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareNoError;
     }
 
+    if (object == kObjectID_Device && address->mSelector == kEMUProperty_ResetCounters) {
+        emu_engine_reset_counters();
+
+        EmuEngineStats engine;
+        memset(&engine, 0, sizeof engine);
+        emu_engine_stats(&engine);
+
+        pthread_mutex_lock(&gStateMutex);
+        gAnchorJitterNs = 0;
+        gAnchorJitterMaxNs = 0;
+        gAnchorUpdates = 0;
+        atomic_store(&gIOCycles, 0);
+        /* Rebase rather than zero: frames_played cannot be reset without
+         * breaking the timeline, so record where the deficit stands now. */
+        uint64_t out = atomic_load(&gFramesOut);
+        gDeficitBaseline = engine.frames_played > out ? engine.frames_played - out : 0;
+        gResetCount++;
+        pthread_mutex_unlock(&gStateMutex);
+
+        EMU_LOG("counters reset");
+        return kAudioHardwareNoError;
+    }
+
     if (object == kObjectID_Device && address->mSelector == kEMUProperty_ClockSource) {
         if (dataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
         CFStringRef requested = *(const CFStringRef*)data;
@@ -1001,8 +1072,14 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         if (gClockSource != source) {
             gClockSource = source;
             /* Bump the seed so Core Audio discards whatever it had extrapolated
-             * from the previous anchor rather than splicing two timelines. */
+             * from the previous anchor rather than splicing two timelines, and
+             * restart the anchor so the incoming path does not inherit one the
+             * other path derived. */
             gTimelineSeed++;
+            gAnchorHostTime = 0;
+            gAnchorJitterNs = 0;
+            gAnchorJitterMaxNs = 0;
+            gAnchorUpdates = 0;
         }
         pthread_mutex_unlock(&gStateMutex);
 
@@ -1118,10 +1195,38 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
         UInt64 back = (UInt64)((Float64)(deviceFrames - boundaryFrames) * ticksPerFrame);
         UInt64 boundaryHost = deviceHost > back ? deviceHost - back : deviceHost;
 
-        /* Never hand back a timeline that goes backwards, whatever the
-         * arithmetic says. Core Audio treats that as a fault, and a rounding
-         * wobble near a boundary is not worth a glitch. */
-        if (boundaryFrames >= gPeriodCount * RING_FRAMES) {
+        /*
+         * Only when the period actually advances -- strictly greater, not
+         * greater-or-equal.
+         *
+         * Core Audio calls this many times within one period, and the pair it
+         * gets back must be stable across those calls: it derives the device's
+         * rate from consecutive anchors, so re-deriving hostTime each time for
+         * an unchanged sampleTime feeds it the scheduling jitter of whichever
+         * completion happened to be most recent. That was audible as an
+         * occasional glitch every few minutes, when a wobble grew large enough
+         * to survive Core Audio's own smoothing.
+         *
+         * Also never goes backwards, which Core Audio treats as a fault.
+         */
+        if (period > gPeriodCount) {
+            /* How far the new anchor sits from where the previous one predicted
+             * it would. This is the anchor jitter, and it is the thing that
+             * shows up as a glitch, so it is worth being able to see. */
+            if (gAnchorHostTime != 0) {
+                UInt64 ticksPerPeriod = (UInt64)(ticksPerFrame * (Float64)RING_FRAMES);
+                UInt64 predicted = gAnchorHostTime
+                                 + ticksPerPeriod * (period - gPeriodCount);
+                UInt64 delta = boundaryHost > predicted
+                             ? boundaryHost - predicted : predicted - boundaryHost;
+                Float64 ns = (Float64)delta * 1.0e9 / host_ticks_per_second();
+                gAnchorJitterNs = (UInt64)ns;
+                if (gAnchorJitterNs > gAnchorJitterMaxNs) {
+                    gAnchorJitterMaxNs = gAnchorJitterNs;
+                }
+                gAnchorUpdates++;
+            }
+
             gPeriodCount = period;
             gAnchorHostTime = boundaryHost;
         }
@@ -1141,7 +1246,9 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
     UInt64  ticksPerPeriod = (UInt64)(ticksPerFrame * (Float64)RING_FRAMES);
     UInt64  now = mach_absolute_time();
 
-    if (ticksPerPeriod > 0) {
+    if (gAnchorHostTime == 0) {
+        gAnchorHostTime = now;   /* first call, or just switched source */
+    } else if (ticksPerPeriod > 0) {
         while (now >= gAnchorHostTime + ticksPerPeriod) {
             gAnchorHostTime += ticksPerPeriod;
             gPeriodCount++;

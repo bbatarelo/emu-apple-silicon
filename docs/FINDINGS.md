@@ -219,6 +219,36 @@ Anchor `GetZeroTimeStamp` to frames the device has actually consumed, not to
 where it goes is the ring — slowly filling or emptying. At a few ppm that takes
 hours, which is what makes it the kind of bug that ships.
 
+Two things then have to be right, and getting either wrong is audible.
+
+**Do not timestamp in the completion callback.** `mach_absolute_time()` there
+records when the *callback ran*, which can only ever be later than the transfer,
+never earlier. A one-sided error does not average out: it biases the anchor late,
+so the device reads slow, so Core Audio delivers slower than the device consumes,
+so the ring starves — permanently. Measured at **1880 ppm**, with callback delays
+reaching **29 ms**.
+
+`IOUSBLowLatencyIsocFrame` carries `frTimeStamp`, recorded by the USB stack when
+the frame actually completed. Using it is the entire reason the low-latency API
+reports it. That one change took the drift from 1880 ppm to about 1.4 ppm.
+
+**Update the anchor only when the period advances**, strictly greater rather than
+greater-or-equal. Core Audio calls `GetZeroTimeStamp` many times inside one
+period and derives the device's rate from consecutive anchors, so re-deriving
+`hostTime` for an unchanged `sampleTime` hands it scheduling jitter dressed up as
+clock behaviour. Most gets smoothed away, which is why the artifact appears every
+few minutes rather than continuously — it only survives when a hiccup makes one
+wobble large enough.
+
+Measured after both fixes, over 3.7 minutes at 48 kHz: **zero ring underruns**,
+anchor jitter **49 µs** peak against 27 ms before, and 94 frames across 6.2
+million — which is oscillation in the pipeline, not drift.
+
+**A standing offset between frames played and frames delivered is not an
+error.** It is buffer occupancy: ring depth plus everything in flight. Here that
+is ~1000 + 8 requests × 8 ms × 48 frames/ms ≈ 4072, and the measured figure sits
+at 3940–4331. What matters is whether it *grows*, not what it is.
+
 ---
 
 ## Mistakes that look like hardware faults
@@ -236,6 +266,7 @@ right bytes in the right place.
 | Full-scale noise on a disconnected input | Producer moving the consumer's ring index |
 | Measured rate exactly half nominal | Treating a 0.5 ms entry as 1 ms |
 | Measured rate hundreds of ppm fast | Averaging across the startup ramp |
+| Ring underruns growing forever, glitch every few minutes | Anchoring the timeline to a timestamp taken in the completion callback |
 
 Two general lessons:
 

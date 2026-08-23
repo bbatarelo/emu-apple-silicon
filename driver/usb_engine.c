@@ -163,6 +163,22 @@ uint64_t emu_engine_frames_played(void)
 
 bool emu_engine_running(void) { return gRunning; }
 
+/*
+ * Zeroes the counters that only exist to be read.
+ *
+ * Deliberately leaves frames_played and frames_captured alone: the timeline
+ * derives its period from frames_played, so resetting it would send Core Audio's
+ * sample time backwards, which it treats as a fault.
+ */
+void emu_engine_reset_counters(void)
+{
+    atomic_store_explicit(&gOutputRing.underruns, 0, memory_order_relaxed);
+    atomic_store_explicit(&gOutputRing.overruns, 0, memory_order_relaxed);
+    atomic_store_explicit(&gInputRing.underruns, 0, memory_order_relaxed);
+    atomic_store_explicit(&gInputRing.overruns, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.usb_errors, 0, memory_order_relaxed);
+}
+
 void emu_engine_stats(EmuEngineStats* stats)
 {
     if (!stats) return;
@@ -312,11 +328,31 @@ static void playback_complete(void* refcon, IOReturn result, void* arg0)
                          emu_frames_in_packet(f->frActCount, e->bytes_per_frame));
     }
 
-    /* Published once per request rather than per entry: the whole request
-     * completed at essentially one moment, and Core Audio only samples this
-     * every ZeroTimeStampPeriod frames anyway. */
+    /*
+     * Timestamp from the kernel, not from this thread.
+     *
+     * mach_absolute_time() here reads the moment the completion *callback* ran,
+     * which can only ever be later than the transfer -- never earlier. That
+     * one-sided error does not average out: it biases the anchor late, which
+     * makes the device look slower than it is, which makes Core Audio deliver
+     * slower than the device consumes, which drains the ring. Measured at about
+     * 1880 ppm, with callback delays up to 29 ms.
+     *
+     * frTimeStamp is recorded by the USB stack when the frame actually
+     * completed. Using it is the whole reason the low-latency API reports it.
+     */
+    uint64_t stamp = 0;
+    for (int32_t i = (int32_t)e->entries_per_request - 1; i >= 0; i--) {
+        const IOUSBLowLatencyIsocFrame* f = &req->frames[i];
+        if (!emu_frame_ok(f->frStatus) || f->frActCount == 0) continue;
+        stamp = ((uint64_t)f->frTimeStamp.hi << 32) | (uint64_t)f->frTimeStamp.lo;
+        if (stamp) break;
+    }
+
+    /* Fall back only if the stack left no usable stamp; a late anchor beats
+     * none, and the next request will correct it. */
     timeline_publish(atomic_load_explicit(&e->frames_played, memory_order_relaxed),
-                     mach_absolute_time());
+                     stamp ? stamp : mach_absolute_time());
 
     if (e->stopping) return;
     if (submit_playback(req) != kIOReturnSuccess) {

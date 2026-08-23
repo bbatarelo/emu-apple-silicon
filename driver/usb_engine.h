@@ -48,4 +48,8 @@ uint64_t emu_engine_frames_played(void);
  * consistent pair. False until the first transfer has completed. */
 bool     emu_engine_timeline(uint64_t* frames, uint64_t* host_time);
 
+/* Zeroes read-only counters. Leaves frames_played alone, since the timeline
+ * derives from it and must never go backwards. */
+void     emu_engine_reset_counters(void);
+
 void     emu_engine_stats(EmuEngineStats* stats);

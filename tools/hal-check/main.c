@@ -123,12 +123,33 @@ static int clock_source(AudioObjectID device, const char* wanted)
     return 0;
 }
 
+/* Zeroes the driver's read-only counters, so a measurement is not dominated by
+ * whatever happened during startup. */
+static int reset_counters(AudioObjectID device)
+{
+    AudioObjectPropertyAddress address = {
+        'emuR', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    CFStringRef value = CFSTR("reset");
+    OSStatus s = AudioObjectSetPropertyData(device, &address, 0, NULL,
+                                            sizeof(value), &value);
+    if (s != noErr) {
+        fprintf(stderr, "error: could not reset counters (0x%x)\n", s);
+        return 1;
+    }
+    printf("counters reset\n");
+    printf("  frames played and captured keep counting: the timeline derives\n"
+           "  from them and cannot be sent backwards\n");
+    return 0;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
         "usage: hal-check                       report what the driver is doing\n"
         "       hal-check clock                 show which clock the timeline follows\n"
-        "       hal-check clock device|host     switch it, immediately\n");
+        "       hal-check clock device|host     switch it, immediately\n"
+        "       hal-check reset                 zero the counters, then measure\n");
 }
 
 int main(int argc, char** argv)
@@ -143,6 +164,9 @@ int main(int argc, char** argv)
     if (argc > 1) {
         if (strcmp(argv[1], "clock") == 0) {
             return clock_source(device, argc > 2 ? argv[2] : NULL);
+        }
+        if (strcmp(argv[1], "reset") == 0) {
+            return reset_counters(device);
         }
         usage();
         return 2;
