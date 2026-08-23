@@ -277,16 +277,86 @@ static ULONG ReleaseRef(void* driver)
 
 /* --- lifecycle ------------------------------------------------------------ */
 
+/*
+ * The device object is published only while hardware is attached.
+ *
+ * A HAL plug-in has no register/unregister call: it *is* its device list, and
+ * Core Audio creates and destroys its device objects by re-reading that list
+ * whenever the plug-in says it changed. So presence lives in the answers to
+ * kAudioPlugInPropertyDeviceList and kAudioObjectPropertyOwnedObjects, and
+ * this observer is what makes those answers reach Core Audio: it is told the
+ * list changed on every arrival and departure. Without that, an unplugged
+ * device stays in every device menu and can be picked as the default output,
+ * where it cannot start.
+ *
+ * Every identity change is reported as a list change, not only the ones that
+ * flip presence. A swap of one family member for another keeps the device
+ * and only renames it; the extra list notification costs Core Audio one
+ * re-read that finds the same object, and in exchange there is no
+ * last-reported-presence state here to fall out of step with the engine's.
+ *
+ * Arrives on the engine's hot-plug queue; PropertiesChanged is callable from
+ * any thread. What Core Audio does with a device it is withdrawing while IO
+ * runs on it -- StopIO, client removal -- happens on its own threads
+ * afterwards, the same as for any device that goes away.
+ */
+static void device_presence_changed(void)
+{
+    if (!gHost) return;
+
+    AudioObjectPropertyAddress list[] = {
+        { kAudioPlugInPropertyDeviceList,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioObjectPropertyOwnedObjects,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+    };
+    gHost->PropertiesChanged(gHost, kObjectID_PlugIn, 2, list);
+
+    if (emu_engine_device_attached()) {
+        /* The name follows whichever member of the family is attached, and a
+         * device Core Audio keeps across a swap is not re-queried unasked. */
+        AudioObjectPropertyAddress name = {
+            kAudioObjectPropertyName,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain,
+        };
+        gHost->PropertiesChanged(gHost, kObjectID_Device, 1, &name);
+        EMU_LOG("device attached: publishing %{public}s", emu_engine_device_name());
+    } else {
+        EMU_LOG("device detached: withdrawn from Core Audio");
+    }
+}
+
 static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef host)
 {
     (void)driver;
     gHost = host;
-    EMU_LOG("initialized, publishing %{public}s at %{public}.0f Hz",
-            emu_engine_device_name(), gSampleRate);
+    /* Arms the hot-plug watch, which resolves what is attached right now
+     * before returning -- the host reads the device list next. */
+    if (!emu_engine_set_identity_observer(device_presence_changed)) {
+        /* Without the watch nothing is published, so there is nothing to
+         * initialize; the engine has no look-up-once fallback on purpose.
+         * Failing here puts the reason in the log next to the HAL's own
+         * complaint, rather than leaving a plug-in that looks fine and lists
+         * nothing. */
+        EMU_LOG("initialize failed: could not arm the hot-plug watch "
+                "(IOKit notification port or matching notification), "
+                "so no device will be published");
+        gHost = NULL;
+        return kAudioHardwareUnspecifiedError;
+    }
+    if (emu_engine_device_attached()) {
+        EMU_LOG("initialized, publishing %{public}s at %{public}.0f Hz",
+                emu_engine_device_name(), gSampleRate);
+    } else {
+        EMU_LOG("initialized, no device attached: publishing nothing until one is");
+    }
     return kAudioHardwareNoError;
 }
 
-/* The device is static, so Core Audio never creates or destroys one. */
+/* The topology is fixed, so Core Audio never asks the plug-in to create or
+ * destroy a device; the one device comes and goes with the hardware through
+ * the device list instead. */
 static OSStatus CreateDevice(AudioServerPlugInDriverRef d, CFDictionaryRef desc,
                              const AudioServerPlugInClientInfo* c, AudioObjectID* out)
 { (void)d; (void)desc; (void)c; (void)out; return kAudioHardwareUnsupportedOperationError; }
@@ -554,8 +624,9 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             *outSize = sizeof(CFStringRef); return kAudioHardwareNoError;
 
         case kAudioObjectPropertyOwnedObjects:
-            if (object == kObjectID_PlugIn) { *outSize = sizeof(AudioObjectID); }
-            else if (object == kObjectID_Device) {
+            if (object == kObjectID_PlugIn) {
+                *outSize = emu_engine_device_attached() ? sizeof(AudioObjectID) : 0;
+            } else if (object == kObjectID_Device) {
                 UInt32 n = stream_count(address->mScope);
                 if (stream_matches_scope(kObjectID_Stream_Output, address->mScope)) n += 2;
                 *outSize = n * sizeof(AudioObjectID);
@@ -563,7 +634,8 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             return kAudioHardwareNoError;
 
         case kAudioPlugInPropertyDeviceList:
-            *outSize = sizeof(AudioObjectID); return kAudioHardwareNoError;
+            *outSize = emu_engine_device_attached() ? sizeof(AudioObjectID) : 0;
+            return kAudioHardwareNoError;
 
         case kAudioDevicePropertyStreams:
             *outSize = stream_count(address->mScope) * sizeof(AudioObjectID);
@@ -646,9 +718,15 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kAudioObjectPropertyManufacturer: RETURN_CFSTR(DEVICE_MANUFACTURER);
             case kAudioPlugInPropertyResourceBundle: RETURN_CFSTR("");
 
+            /* The device list is where presence is expressed: one device
+             * while hardware is attached, none otherwise. See
+             * device_presence_changed for how Core Audio learns it moved. */
             case kAudioObjectPropertyOwnedObjects:
             case kAudioPlugInPropertyDeviceList:
-                if (dataSize < sizeof(AudioObjectID)) { *outSize = 0; return kAudioHardwareNoError; }
+                if (!emu_engine_device_attached() || dataSize < sizeof(AudioObjectID)) {
+                    *outSize = 0;
+                    return kAudioHardwareNoError;
+                }
                 *(AudioObjectID*)outData = kObjectID_Device;
                 *outSize = sizeof(AudioObjectID);
                 return kAudioHardwareNoError;
@@ -659,7 +737,8 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 }
                 CFStringRef uid = *(const CFStringRef*)qualifier;
                 *(AudioObjectID*)outData =
-                    (uid && CFStringCompare(uid, CFSTR(DEVICE_UID), 0) == kCFCompareEqualTo)
+                    (emu_engine_device_attached() && uid &&
+                     CFStringCompare(uid, CFSTR(DEVICE_UID), 0) == kCFCompareEqualTo)
                         ? kObjectID_Device : kAudioObjectUnknown;
                 *outSize = sizeof(AudioObjectID);
                 return kAudioHardwareNoError;

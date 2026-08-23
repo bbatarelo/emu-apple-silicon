@@ -25,10 +25,32 @@ typedef struct {
     uint32_t input_overruns;     /* grows while nothing is recording, by design */
 } EmuEngineStats;
 
-/* Name of the attached device, for Core Audio to publish. Resolved on demand,
- * because the plug-in is asked long before anything opens the device and
- * possibly before one is plugged in at all. */
+/* Whether a supported device is attached right now. Cheap and safe to call
+ * from the property thread: presence is kept current by hot-plug notification,
+ * not looked up per call. The plug-in publishes its Core Audio device only
+ * while this is true, so an absent device is absent from the system's device
+ * list rather than listed and unable to start. */
+bool emu_engine_device_attached(void);
+
+/* Name of the attached device, for Core Audio to publish. Same source as
+ * emu_engine_device_attached. Only meaningful while a device is attached; the
+ * answer with none is a placeholder, since the plug-in has nothing published
+ * to name. */
 const char* emu_engine_device_name(void);
+
+/* Registers a callback for the attached device changing -- arriving, leaving,
+ * or being swapped for a sibling -- so the plug-in can tell Core Audio that
+ * its device list, or the name of the device on it, is no longer right:
+ * nothing re-queries a device on its own. Called on the engine's hot-plug
+ * queue, not on any Core Audio thread, and never from inside a property
+ * call.
+ *
+ * Also arms the hot-plug watch, and returns whether that worked. If not --
+ * which takes the process being out of Mach ports or memory -- no device is
+ * published and none will be: there is deliberately no look-up-once fallback,
+ * because a device that appears but cannot be followed is the stale-device
+ * problem over again. The plug-in should refuse to initialize, and say why. */
+bool emu_engine_set_identity_observer(void (*observer)(void));
 
 bool     emu_engine_start(uint32_t sample_rate);
 void     emu_engine_stop(void);

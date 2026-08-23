@@ -93,6 +93,36 @@ this driver does not currently use.
 creates it, `StopIO` joins it — outside the state lock, since holding a lock
 across a thread join invites deadlock.
 
+Before any of that, the engine's one standing job is knowing whether a device
+is there. IOKit first-match and terminated notifications on a private queue
+keep a per-product count of what is attached, and the plug-in publishes its
+Core Audio device only while that count says something is. There is no
+register/unregister call for a HAL plug-in — it *is* its device list, and
+Core Audio adds and removes the device by re-reading the list when told it
+changed — so presence lives in the answers to `kAudioPlugInPropertyDeviceList`
+and the plug-in sends a change notification on every arrival and departure.
+An unplugged Tracker Pre is therefore absent from every device menu rather
+than listed and unable to start, and swapping one family member for another
+renames the device in place.
+
+The choice among several attached devices is made in exactly one place, the
+watcher's resolve: the product the engine has open, while it stays attached;
+else the preferred product; else the first in the table. `StartIO` opens
+whatever that names rather than running a lookup of its own, so the name Core
+Audio shows and the hardware behind it cannot disagree. The engine pins its
+product before opening it and unpins in teardown; each is followed by a
+resolve on the hot-plug queue, so a sibling arriving between the engine's
+read and its pin is handled in the same order as any other arrival, and a
+preferred sibling arriving mid-stream renames nothing until the stream ends.
+
+The watch is armed in `Initialize`, all or nothing: if IOKit will not hand
+out a notification port or a matching notification -- in practice only when
+the process is out of Mach ports or memory -- whatever was armed is disarmed
+again, `Initialize` fails with a log line saying so, and nothing is
+published. There is deliberately no look-the-device-up-once fallback. It would
+degrade to exactly the stale-device behaviour the watch exists to fix, under
+conditions nobody could reproduce, without a word in the log.
+
 It uses **low-latency isochronous transfers**. The classic API delivers one
 frame-list entry per USB frame, which silently halves the audio on the
 `bInterval 3` endpoints used at 176.4 and 192 kHz. Buffers come from
