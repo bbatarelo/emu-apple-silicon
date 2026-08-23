@@ -9,7 +9,7 @@
 /* IOKit's USB matching only honours idVendor and idProduct as a pair -- asking
  * for a vendor alone matches nothing -- so each known product is looked up in
  * turn rather than filtering a vendor-wide list. */
-static io_service_t match_product(uint16_t product_id)
+io_service_t emu_find_product(uint16_t product_id)
 {
     CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBDeviceClassName);
     if (!matching) return IO_OBJECT_NULL;
@@ -36,12 +36,12 @@ const EmuDeviceIdentity* emu_find_device(uint16_t preferred_product_id,
 {
     const EmuDeviceIdentity* preferred = emu_device_for_product(preferred_product_id);
     if (preferred) {
-        *out_service = match_product(preferred->product_id);
+        *out_service = emu_find_product(preferred->product_id);
         if (*out_service) return preferred;
     }
 
     for (unsigned i = 0; i < EMU_DEVICE_COUNT; i++) {
-        *out_service = match_product(kEmuDevices[i].product_id);
+        *out_service = emu_find_product(kEmuDevices[i].product_id);
         if (*out_service) return &kEmuDevices[i];
     }
 

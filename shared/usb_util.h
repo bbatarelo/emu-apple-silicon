@@ -10,6 +10,11 @@
 
 #include "device.h"
 
+/* Finds an attached device with the given product ID (and the E-MU vendor
+ * ID), or IO_OBJECT_NULL. The caller owns the service and must release it.
+ * Which one, if several of that product are attached, is up to IOKit. */
+io_service_t emu_find_product(uint16_t product_id);
+
 /* Finds an attached device this driver knows about, preferring
  * `preferred_product_id` when more than one is plugged in. Returns its identity
  * and, in *out_service, the matching IOKit service, which the caller owns and
