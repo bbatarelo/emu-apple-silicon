@@ -186,6 +186,126 @@ impl ClockEstimator {
     }
 }
 
+/// Critically damped smoothing for the stream of transfer-completion
+/// timestamps that anchors Core Audio's timeline.
+///
+/// A port of the mass-spring-damper filter from the original EMUUSBAudio kext
+/// (`LowPassFilter.cpp`, Wouter Pasman), which was tuned against this hardware
+/// family: the raw USB timestamps are good to ~0.01 ms, but the thread that
+/// observes them takes occasional 1–3 ms scheduling hits, and an anchor that
+/// follows those hits drags Core Audio's clock model around audibly. The filter
+/// is a position `x` advancing by a velocity `dx` once per observation, with
+/// the observed error pulling on a weak, critically damped spring: `x` barely
+/// moves for a late observation, while a genuine rate difference steadily
+/// adjusts `dx`.
+///
+/// Observations must arrive at a uniform cadence — one per USB request — since
+/// the filter models time per observation, not time per frame.
+///
+/// Differences from the kext: mass and damping are scaled for a ~2 ms cadence
+/// rather than a buffer-wrap cadence, the arithmetic is f64 rather than the
+/// kext's integer math (this runs on the engine thread, not the realtime audio
+/// thread), and recovery from gross discontinuities (a resync after a scheduling
+/// overrun, an unplug) is a counted hard reset rather than the kext's
+/// good-wraps gate.
+#[derive(Clone, Copy, Debug)]
+pub struct TimestampFilter {
+    /// Filtered position: the smoothed timestamp last returned.
+    x: f64,
+    /// Filtered velocity: time per observation.
+    dx: f64,
+    /// Previous error, for the damping term.
+    u: f64,
+    /// Nominal time per observation. Bounds `dx` and sets the reset threshold.
+    step: f64,
+    resets: u32,
+}
+
+/// Spring constant, mass, and critical damping (`2·sqrt(K·M)`, precomputed
+/// because no_std has no sqrt). The kext used K=1, M=1000, DA=63 at its slower
+/// cadence; the larger mass keeps a comparable real-time constant — roughly 126
+/// observations, ~0.25 s at the engine's 2 ms request cadence.
+const FILTER_K: f64 = 1.0;
+const FILTER_M: f64 = 4000.0;
+const FILTER_DA: f64 = 126.49;
+
+/// Observations further than this many steps from prediction are a
+/// discontinuity, not jitter: snap instead of slewing through garbage.
+///
+/// Deliberately tight. With hardware completion timestamps the observation
+/// jitter is microseconds, so anything milliseconds off prediction means the
+/// bus schedule genuinely moved and snapping is correct. An earlier value of
+/// 25 steps left a blind spot exactly where stall-recovery gaps land
+/// (~16-50 ms): the filter slewed instead, and in the slew regime the clamp
+/// zeroes the damping term's input, turning the critically damped spring into
+/// a nearly undamped one -- the published anchor oscillated for many seconds
+/// and dragged Core Audio's write phase across the engine's fill cursor,
+/// heard as minutes of crackle until the stream was restarted. The original
+/// kext drew the same line at 10 ms ("USB hick ... timer re-syncing").
+const FILTER_RESET_STEPS: f64 = 3.0;
+
+impl TimestampFilter {
+    /// `start`: the timestamp the stream is expected to begin at (for the
+    /// engine, the scheduled bus time of the first packet). `nominal_step`:
+    /// expected time between observations, in the same unit as the timestamps.
+    pub fn new(start: u64, nominal_step: u64) -> TimestampFilter {
+        let step = nominal_step as f64;
+        TimestampFilter {
+            x: start as f64,
+            dx: step,
+            u: 0.0,
+            step,
+            resets: 0,
+        }
+    }
+
+    /// Feeds one raw observation, returns the filtered timestamp for it.
+    pub fn filter(&mut self, raw: u64) -> u64 {
+        let xnext = self.x + self.dx;
+        let error = raw as f64 - xnext;
+
+        if error.abs() > FILTER_RESET_STEPS * self.step {
+            self.resets += 1;
+            self.x = raw as f64;
+            self.dx = self.step;
+            self.u = 0.0;
+            return raw;
+        }
+
+        // A single very late observation may only pull with bounded force, so
+        // it cannot fling the velocity; a sustained offset still converges.
+        let u = error.clamp(-self.step, self.step);
+        let force = FILTER_K * u + FILTER_DA * (u - self.u);
+        self.dx += force / FILTER_M;
+        // The device cannot halve or double its clock; excursions beyond this
+        // are filter pathology, not measurement.
+        self.dx = self.dx.clamp(0.5 * self.step, 2.0 * self.step);
+
+        self.x = xnext;
+        self.u = u;
+        (self.x + 0.5) as u64
+    }
+
+    /// Moves the prediction to a known discontinuity without forgetting the
+    /// rate: after this, an observation of exactly `expected_next` is a zero
+    /// error, and `dx` is whatever the stream had taught the filter so far.
+    ///
+    /// For the engine this is a rebuilt bus schedule after a stall. The gap is
+    /// known from the bus frame numbers, so there is nothing for the filter to
+    /// discover -- feeding it the first post-gap observation cold would either
+    /// snap (a counted reset for an event that was not a surprise) or, worse,
+    /// slew through it. `resets` stays what it was: it counts the unplanned.
+    pub fn rebase(&mut self, expected_next: u64) {
+        self.x = expected_next as f64 - self.dx;
+        self.u = 0.0;
+    }
+
+    /// How often the filter had to snap to a discontinuity.
+    pub fn resets(&self) -> u32 {
+        self.resets
+    }
+}
+
 /// Nominal packet size for a rate that does not divide evenly into service
 /// intervals.
 ///

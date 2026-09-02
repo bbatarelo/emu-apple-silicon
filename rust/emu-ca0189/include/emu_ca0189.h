@@ -124,6 +124,27 @@ uint32_t emu_feedback_starved(EmuFeedback* fb);
 uint32_t emu_frames_in_packet(uint32_t bytes, uint32_t bytes_per_frame);
 uint32_t emu_output_packet_bytes(uint32_t frames, uint32_t output_bytes_per_frame);
 
+/* --- streaming: completion timestamp filter ---------------------------- */
+
+/* Opaque; storage is provided by the caller so nothing allocates. Critically
+ * damped smoothing of the once-per-request completion timestamps that anchor
+ * Core Audio's timeline; observations must arrive at a uniform cadence. */
+typedef struct EmuTsFilter EmuTsFilter;
+
+uint32_t     emu_ts_filter_size(void);
+uint32_t     emu_ts_filter_align(void);
+/* `start`: expected first timestamp; `nominal_step`: expected observation
+ * spacing, in the same unit as the timestamps (the engine uses host ticks). */
+EmuTsFilter* emu_ts_filter_init(uint8_t* storage, uint64_t start, uint64_t nominal_step);
+/* One raw timestamp in, the filtered timestamp out. */
+uint64_t emu_ts_filter_apply(EmuTsFilter* f, uint64_t raw);
+/* Moves the prediction to a discontinuity the caller knows about -- the raw
+ * timestamp the next observation will carry -- keeping the learned rate, and
+ * without counting a reset. For a rebuilt bus schedule after a stall. */
+void     emu_ts_filter_rebase(EmuTsFilter* f, uint64_t expected_next);
+/* Times the filter snapped to a discontinuity instead of slewing. */
+uint32_t emu_ts_filter_resets(EmuTsFilter* f);
+
 #ifdef __cplusplus
 }
 #endif
