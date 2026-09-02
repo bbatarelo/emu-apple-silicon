@@ -124,17 +124,35 @@ observed was +808 ppm at 44.1 kHz, and a 48 kHz capture that should read
 Consequence: **packet sizes are never guaranteed**, not even at 48/96/192 kHz
 where the settled size is constant.
 
-### Four unexplained bytes at `bInterval 3`
+### Capture packets at `bInterval 3` lead with a 4-byte length word
 
 At 176.4 and 192 kHz every **capture** packet is exactly 4 bytes longer than a
-whole number of sample frames — 100% of packets, never at `bInterval 4`.
+whole number of sample frames — 100% of packets, never at `bInterval 4`. The
+four bytes sit at the **front** and hold the packet's own total length,
+little-endian, counting themselves. E-MU's Windows driver reads the first
+`ULONG` of each IN packet and steps past it, for exactly these product IDs and
+only where the endpoint is serviced more than once per millisecond
+(`m_UseEmbeddedPacketLength`, `Audio.cpp`). Read on this hardware, the word
+equals `frActCount` on 11968 of 11968 packets through a clean 192 kHz stream.
 
-Playback does **not** share this framing: sending `frames × 6 + 4` produces no
-audio at all.
+The driver steps over them by remainder rather than by rate:
 
-Taking only whole frames and ignoring the remainder works. What the bytes are
-remains unknown. An earlier conclusion that they are not a header was drawn from
-a payload dump that was itself misaligned, so it should not be relied on.
+```c
+uint32_t lead = f->frActCount % e->bytes_per_frame;
+```
+
+which is zero at every rate up to 96 kHz, so those paths are untouched, and
+which keeps the read inside the packet by construction. Taking the frames from
+the packet's first byte instead puts every sample two thirds of a frame early
+and scrambles all of them: a −12 dBFS tone at 192 kHz comes back at −49 dBFS
+with the peak pinned at 1.0000 and +47 dB THD+N, where four bytes in it reads
+−17.6 dBFS at −62 dB, which is what the cable delivers.
+
+Playback has no such framing. An OUT packet of `frames × 6 + 4` bytes yields
+**silence** (−131 dBFS), not displaced audio, and oversizing only one packet in
+four silences the whole stream: the device rejects a size it dislikes
+wholesale, with every transfer reported successful and every byte delivered.
+Nothing on the host can see the device discard audio.
 
 ---
 
@@ -356,6 +374,7 @@ right bytes in the right place.
 | Measured rate exactly half nominal | Treating a 0.5 ms entry as 1 ms |
 | Measured rate hundreds of ppm fast | Averaging across the startup ramp |
 | Ring underruns growing forever, glitch every few minutes | Anchoring the timeline to a timestamp taken in the completion callback |
+| 176.4/192 kHz only: right byte counts, the other channel's tone stronger than this one's, peak pinned at 1.0000 | Frames taken from the packet's first byte, 4 bytes before they start |
 
 Two general lessons:
 
@@ -369,7 +388,6 @@ Two general lessons:
 
 ## Open questions
 
-- What the 4 bytes per capture packet at `bInterval 3` are.
 - What triggers the intermittent silent `SET_CUR` failure.
 - What alt 11 is for, given it duplicates alt 3 exactly.
 - Whether `kAudioDevicePropertyDeviceIsRunning` needs a change notification; it

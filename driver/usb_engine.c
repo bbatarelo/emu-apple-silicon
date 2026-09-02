@@ -514,10 +514,18 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
          * is recording. */
         emu_feedback_push(e->feedback, frames);
 
-        /* Take only whole sample frames. At bInterval 3 every packet carries 4
-         * bytes beyond them, still unexplained, and copying those would shift
-         * every frame boundary after the first. */
-        emu_ring_write_s24(&gInputRing, (const uint8_t*)req->buffer + offset, frames);
+        /* At bInterval 3 every packet leads with 4 bytes that are not sample
+         * frames: the packet's own byte length, which E-MU's Windows driver
+         * reads and steps over (FINDINGS). Taking the frames from the first
+         * byte instead puts every sample two thirds of a frame early and
+         * scrambles all of them.
+         *
+         * The offset is taken from the packet rather than the rate, so it is
+         * zero wherever the byte count already divides, which is every rate
+         * up to 96 kHz. The read stays inside the packet either way: lead +
+         * frames x bytes_per_frame is frActCount exactly. */
+        uint32_t lead = f->frActCount % e->bytes_per_frame;
+        emu_ring_write_s24(&gInputRing, (const uint8_t*)req->buffer + offset + lead, frames);
         atomic_fetch_add(&e->frames_captured, frames);
 
         offset += f->frReqCount;
