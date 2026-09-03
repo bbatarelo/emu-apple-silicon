@@ -213,6 +213,88 @@ static int safety_offset(AudioObjectID device, const char* wanted)
     return 0;
 }
 
+/* Whether the input stream is running, which is where `auto` resolves.
+ *
+ * Through kAudioDevicePropertyStreams rather than the plug-in's own object
+ * numbering: those constants (device 2, input stream 3) are internal to the
+ * plug-in, and the HAL hands clients AudioObjectIDs of its own. */
+static Boolean input_stream_active(AudioObjectID device)
+{
+    AudioObjectPropertyAddress streams = {
+        kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(device, &streams, 0, NULL, &size) != noErr
+        || size < sizeof(AudioObjectID)) {
+        return false;   /* no input stream published at all */
+    }
+
+    AudioObjectID first = kAudioObjectUnknown;
+    size = sizeof(first);
+    if (AudioObjectGetPropertyData(device, &streams, 0, NULL, &size, &first) != noErr
+        || first == kAudioObjectUnknown) {
+        return true;    /* unknown: do not claim capture is off */
+    }
+
+    AudioObjectPropertyAddress active = {
+        kAudioStreamPropertyIsActive, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 value = 0;
+    size = sizeof(value);
+    if (AudioObjectGetPropertyData(first, &active, 0, NULL, &size, &value) != noErr) {
+        return true;
+    }
+    return value != 0;
+}
+
+/* Reads or writes whether a stream opens capture. Returns 0 on success. */
+static int input_mode(AudioObjectID device, const char* wanted)
+{
+    AudioObjectPropertyAddress address = {
+        'emuI', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+
+    if (wanted) {
+        CFStringRef value = CFStringCreateWithCString(NULL, wanted, kCFStringEncodingUTF8);
+        if (!value) return 1;
+        OSStatus s = AudioObjectSetPropertyData(device, &address, 0, NULL,
+                                                sizeof(value), &value);
+        CFRelease(value);
+        if (s != noErr) {
+            fprintf(stderr, "error: could not set the input mode to '%s' (0x%x)\n", wanted, s);
+            fprintf(stderr, "       valid values are 'auto', 'on' and 'off'\n");
+            return 1;
+        }
+    }
+
+    CFStringRef current = NULL;
+    UInt32 size = sizeof(current);
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &current) != noErr
+        || !current) {
+        fprintf(stderr, "error: could not read the input mode\n");
+        return 1;
+    }
+    char buffer[32] = {0};
+    CFStringGetCString(current, buffer, sizeof buffer, kCFStringEncodingUTF8);
+    CFRelease(current);
+
+    Boolean active = input_stream_active(device);
+    printf("input mode: %s -> capture %s\n", buffer, active ? "on" : "off");
+    if (strcmp(buffer, "auto") == 0) {
+        printf("  auto: capture runs below 176.4 kHz and not at or above it,\n");
+        printf("  the rates at which duplex drops playback packets on some setups\n");
+    }
+    if (active) {
+        printf("  the input stream is running and can be recorded from\n");
+    } else {
+        printf("  no IN transactions and no recording; playback is sized from\n");
+        printf("  the feedback endpoint alone\n");
+    }
+    return 0;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -221,7 +303,9 @@ static void usage(void)
         "       hal-check clock device|host     switch it, immediately\n"
         "       hal-check reset                 zero the counters, then measure\n"
         "       hal-check safety                show the output safety offset (us)\n"
-        "       hal-check safety <us>           set it; effective at the next stream start\n");
+        "       hal-check safety <us>           set it; effective at the next stream start\n"
+        "       hal-check input                 show whether capture is opened\n"
+        "       hal-check input auto|on|off     switch it; a running stream restarts\n");
 }
 
 int main(int argc, char** argv)
@@ -242,6 +326,9 @@ int main(int argc, char** argv)
         }
         if (strcmp(argv[1], "safety") == 0) {
             return safety_offset(device, argc > 2 ? argv[2] : NULL);
+        }
+        if (strcmp(argv[1], "input") == 0) {
+            return input_mode(device, argc > 2 ? argv[2] : NULL);
         }
         usage();
         return 2;
@@ -273,6 +360,22 @@ int main(int argc, char** argv)
     size = sizeof(rate);
     if (AudioObjectGetPropertyData(device, &rateAddress, 0, NULL, &size, &rate) == noErr) {
         printf("  sample rate       %.0f Hz\n", rate);
+    }
+
+    {
+        AudioObjectPropertyAddress modeAddress = {
+            'emuI', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+        };
+        CFStringRef mode = NULL;
+        UInt32 modeSize = sizeof(mode);
+        if (AudioObjectGetPropertyData(device, &modeAddress, 0, NULL, &modeSize, &mode) == noErr
+            && mode) {
+            char buffer[32] = {0};
+            CFStringGetCString(mode, buffer, sizeof buffer, kCFStringEncodingUTF8);
+            CFRelease(mode);
+            printf("  input mode        %s -> capture %s\n", buffer,
+                   input_stream_active(device) ? "on" : "off");
+        }
     }
 
     OSStatus status = noErr;
@@ -355,12 +458,26 @@ int main(int argc, char** argv)
         const void** values = calloc((size_t)count, sizeof(void*));
         if (keys && values) {
             CFDictionaryGetKeysAndValues(dict, keys, values);
+            Boolean sawInputFlag = false, captureRan = true;
             for (CFIndex i = 0; i < count; i++) {
                 char name[64] = {0};
                 CFStringGetCString((CFStringRef)keys[i], name, sizeof name, kCFStringEncodingUTF8);
                 long long value = 0;
                 CFNumberGetValue((CFNumberRef)values[i], kCFNumberLongLongType, &value);
                 printf("  %-18s %lld\n", name, value);
+                if (strcmp(name, "inputEnabled") == 0) {
+                    sawInputFlag = true;
+                    captureRan = value != 0;
+                }
+            }
+            /* A dictionary has no order, so inputEnabled can print anywhere in
+             * the list. Said again here because without it every capture
+             * counter above reads 0, which is what a flawless capture run
+             * looks like. */
+            if (sawInputFlag && !captureRan) {
+                printf("\n  capture did not run this session: framesCaptured,\n"
+                       "  emptyCapture, inputDepth, inputUnderruns and\n"
+                       "  inputOverruns are inert, not clean\n");
             }
         }
         free(keys);

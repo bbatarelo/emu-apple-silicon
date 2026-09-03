@@ -179,6 +179,17 @@ enum {
      * published copy only follows a coreaudiod restart (see FINDINGS), so
      * `hal-check safety` reports both. */
     kEMUProperty_SafetyOffset = 'emuS',
+    /* Settable: "on", "off" or "auto". "on" opens the capture interface;
+     * "off" leaves it unclaimed at alternate setting 0, so no IN transaction
+     * reaches the bus and playback is sized from the feedback endpoint alone;
+     * "auto" is "off" at 176.4 and 192 kHz and "on" below.
+     *
+     * The workaround for setups on which duplex at those two rates drops
+     * playback packets while IN transactions are on the bus (FINDINGS). The
+     * cost is the whole input direction, so it is a choice rather than a fix.
+     * Read once per StartIO; changing it under a running stream restarts the
+     * stream. */
+    kEMUProperty_InputMode = 'emuI',
 };
 
 /*
@@ -217,6 +228,28 @@ static Float64           gSampleRate     = 48000.0;
 static UInt32            gIOClients      = 0;
 static Boolean           gInputActive    = true;
 static Boolean           gOutputActive   = true;
+/* Whether a stream opens the capture direction at all. See
+ * kEMUProperty_InputMode. Under gStateMutex; the effective answer is
+ * input_wanted_locked(), read once per StartIO. */
+typedef enum { kInputMode_Auto = 0, kInputMode_On, kInputMode_Off } InputMode;
+static InputMode         gInputMode      = kInputMode_On;
+
+/* The rate at and above which `auto` stops opening capture: 176.4 and
+ * 192 kHz, the two rates that exist only at bInterval 3 and the two at which
+ * duplex has been seen to drop playback packets (FINDINGS). Below it there is
+ * nothing to trade away. */
+#define EMU_INPUT_AUTO_OFF_HZ 176400.0
+
+/* The rate `auto` decides against, updated when the rate is *requested* rather
+ * than when it is performed.
+ *
+ * The HAL defers PerformDeviceConfigurationChange while no IO is running -- it
+ * can be minutes, or until the next stream starts -- and until it runs,
+ * gSampleRate still holds the old rate. Deriving the published input direction
+ * from gSampleRate therefore left the device advertising an input it was about
+ * to drop, for as long as the machine stayed quiet. Audio MIDI Setup reads the
+ * layout exactly then. */
+static Float64           gPolicyRate     = 48000.0;
 static ClockSource       gClockSource    = kClockSource_Device;
 static Float32           gVolumeScalar   = 1.0f;
 static Boolean           gMuted          = false;
@@ -450,6 +483,55 @@ static OSStatus RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID i
 { (void)d; (void)c; return id == kObjectID_Device ? kAudioHardwareNoError
                                                   : kAudioHardwareBadObjectError; }
 
+/* Whether this stream should open capture. Call with gStateMutex held.
+ *
+ * `on` is the default, so out of the box the driver is full duplex at every
+ * rate, and the high-rate duplex instability -- which not every setup shows
+ * -- is left as it is. Losing the input direction is not something to do to
+ * someone who did not ask: a device that records is what the hardware is, and
+ * a driver that quietly stopped being one at two of its six rates would be the
+ * more surprising failure of the two. `auto` and `off` are for whoever needs
+ * those rates clean and knows what it costs.
+ *
+ * Whichever mode is in force, it must not be silent: the input stream is
+ * withdrawn (input_published) and reports kAudioStreamPropertyIsActive false
+ * whenever this is false. */
+static Boolean input_wanted_locked(void)
+{
+    switch (gInputMode) {
+        case kInputMode_On:  return true;
+        case kInputMode_Off: return false;
+        case kInputMode_Auto:
+        default:             return gPolicyRate < EMU_INPUT_AUTO_OFF_HZ;
+    }
+}
+
+/* Tells Core Audio the input direction has appeared or disappeared.
+ *
+ * The stream list and the owned objects, not just the stream's active flag:
+ * the device gains or loses its input channels with it, and nothing
+ * re-queries a device on its own. Never call with gStateMutex held -- the host
+ * may call back in. */
+static void notify_input_visibility_changed(void)
+{
+    if (!gHost) return;
+    AudioObjectPropertyAddress device[] = {
+        { kAudioDevicePropertyStreams,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyStreams,
+          kAudioObjectPropertyScopeInput,  kAudioObjectPropertyElementMain },
+        { kAudioObjectPropertyOwnedObjects,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+    };
+    gHost->PropertiesChanged(gHost, kObjectID_Device, 3, device);
+
+    AudioObjectPropertyAddress active = {
+        kAudioStreamPropertyIsActive, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    gHost->PropertiesChanged(gHost, kObjectID_Stream_Input, 1, &active);
+}
+
 /* Rate changes arrive as a configuration change so Core Audio can quiesce IO
  * around them. The hardware SET_CUR and its read-back verification happen in
  * the engine when the stream next starts -- guidelines section 18. */
@@ -467,13 +549,22 @@ static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d,
     if (!known) return kAudioHardwareUnsupportedOperationError;
 
     pthread_mutex_lock(&gStateMutex);
+    Boolean was = input_wanted_locked();
     gSampleRate = rate;
+    gPolicyRate = rate;   /* for a change the HAL originated, not our setter */
     gAnchorHostTime = 0;   /* the timeline restarts with the rate */
     gPeriodCount = 0;
     gTimelineSeed++;
+    Boolean now = input_wanted_locked();
     pthread_mutex_unlock(&gStateMutex);
 
-    EMU_LOG("sample rate changed to %{public}.0f Hz", rate);
+    /* Under `auto` the rate decides the input direction, so crossing 176.4 kHz
+     * changes whether the input stream is running. Nothing re-queries a stream
+     * on its own. */
+    if (was != now) notify_input_visibility_changed();
+
+    EMU_LOG("sample rate changed to %{public}.0f Hz, capture %{public}s",
+            rate, now ? "on" : "off");
     return kAudioHardwareNoError;
 }
 
@@ -515,8 +606,26 @@ static OSStatus AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d,
         return kAudioHardwareNoError;                              \
     } while (0)
 
+/* Whether the input stream is published at all.
+ *
+ * kAudioStreamPropertyIsActive is what the API offers for "this stream is not
+ * running", and it is not enough: nothing in Audio MIDI Setup surfaces it, and
+ * a recording application simply reads zeroes. A device that cannot record has
+ * to stop having an input direction -- no stream in the input scope, and so no
+ * input channels -- which is a thing users and applications both understand.
+ *
+ * Takes gStateMutex itself: the property calls that need it do not hold it. */
+static Boolean input_published(void)
+{
+    pthread_mutex_lock(&gStateMutex);
+    Boolean published = input_wanted_locked();
+    pthread_mutex_unlock(&gStateMutex);
+    return published;
+}
+
 static Boolean stream_matches_scope(AudioObjectID stream, AudioObjectPropertyScope scope)
 {
+    if (stream == kObjectID_Stream_Input && !input_published()) return false;
     if (scope == kAudioObjectPropertyScopeGlobal) return true;
     if (scope == kAudioObjectPropertyScopeInput)  return stream == kObjectID_Stream_Input;
     if (scope == kAudioObjectPropertyScopeOutput) return stream == kObjectID_Stream_Output;
@@ -586,6 +695,7 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 case kEMUProperty_ClockSource:
                 case kEMUProperty_ResetCounters:
                 case kEMUProperty_SafetyOffset:
+                case kEMUProperty_InputMode:
                     return true;
                 default: return false;
             }
@@ -668,6 +778,7 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o
     }
     if (object == kObjectID_Device &&
         (address->mSelector == kEMUProperty_ClockSource ||
+         address->mSelector == kEMUProperty_InputMode ||
          address->mSelector == kEMUProperty_ResetCounters)) {
         *settable = true;
     }
@@ -750,13 +861,14 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             *outSize = sizeof(Float64); return kAudioHardwareNoError;
 
         case kAudioObjectPropertyCustomPropertyInfoList:
-            *outSize = 4 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            *outSize = 5 * sizeof(AudioServerPlugInCustomPropertyInfo);
             return kAudioHardwareNoError;
 
         case kEMUProperty_Diagnostics:
         case kEMUProperty_SafetyOffset:
             *outSize = sizeof(CFPropertyListRef); return kAudioHardwareNoError;
         case kEMUProperty_ClockSource:
+        case kEMUProperty_InputMode:
         case kEMUProperty_ResetCounters:
             *outSize = sizeof(CFStringRef); return kAudioHardwareNoError;
 
@@ -895,6 +1007,12 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
                     n++;
                 }
+                if (n < capacity) {
+                    info[n].mSelector = kEMUProperty_InputMode;
+                    info[n].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
+                    info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                    n++;
+                }
                 *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
                 return kAudioHardwareNoError;
             }
@@ -935,6 +1053,20 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 return kAudioHardwareNoError;
             }
 
+            case kEMUProperty_InputMode: {
+                if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+                pthread_mutex_lock(&gStateMutex);
+                InputMode mode = gInputMode;
+                pthread_mutex_unlock(&gStateMutex);
+                /* The mode, not the effect: what `auto` currently resolves to
+                 * is the input stream's kAudioStreamPropertyIsActive. */
+                *(CFStringRef*)outData = mode == kInputMode_On   ? CFSTR("on")
+                                       : mode == kInputMode_Off  ? CFSTR("off")
+                                                                 : CFSTR("auto");
+                *outSize = sizeof(CFStringRef);
+                return kAudioHardwareNoError;
+            }
+
             case kEMUProperty_Diagnostics: {
                 if (dataSize < sizeof(CFPropertyListRef)) {
                     return kAudioHardwareBadPropertySizeError;
@@ -962,6 +1094,21 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     /* Should stay 0: capture measurements the queue could not
                      * hold, which means the two directions have decoupled. */
                     { CFSTR("feedbackOverflows"), engine.feedback_overflows },
+                    /* The explicit feedback endpoint, 0x81 -- the device's own
+                     * statement of how many frames it wants per playback
+                     * service interval, in Q16.16 as sent. `feedbackQ16`
+                     * against `feedbackNominalQ16` is the disagreement between
+                     * what the device asks for and what the rate says. It
+                     * sizes the packets only while `inputEnabled` is 0. */
+                    { CFSTR("feedbackPackets"),  engine.feedback_packets    },
+                    { CFSTR("feedbackSilent"),   engine.feedback_silent     },
+                    { CFSTR("feedbackErrors"),   engine.feedback_errors     },
+                    { CFSTR("feedbackRejected"), engine.feedback_rejected   },
+                    { CFSTR("feedbackChanges"),  engine.feedback_changes    },
+                    { CFSTR("feedbackQ16"),      engine.feedback_q16        },
+                    { CFSTR("feedbackMinQ16"),   engine.feedback_min_q16    },
+                    { CFSTR("feedbackMaxQ16"),   engine.feedback_max_q16    },
+                    { CFSTR("feedbackNominalQ16"), engine.feedback_nominal_q16 },
                     { CFSTR("tsFallbacks"),    engine.timestamp_fallbacks  },
                     { CFSTR("tsResets"),       engine.timestamp_resets     },
                     { CFSTR("resyncs"),        engine.resyncs              },
@@ -984,6 +1131,9 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     /* Should stay 0: the schedule may otherwise be short of
                      * the write lead. */
                     { CFSTR("scheduleClamped"), engine.schedule_clamped ? 1u : 0u },
+                    /* Without it the capture counters below all read 0,
+                     * which is indistinguishable from a clean capture run. */
+                    { CFSTR("inputEnabled"),   engine.input_enabled ? 1u : 0u },
                     { CFSTR("framesCaptured"), engine.frames_captured      },
                     { CFSTR("inputDepth"),     engine.input_depth          },
                     { CFSTR("inputUnderruns"), engine.input_underruns      },
@@ -1089,8 +1239,18 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                            : kAudioStreamTerminalTypeSpeaker);
             case kAudioStreamPropertyStartingChannel: RETURN_U32(1);
             case kAudioStreamPropertyLatency:         RETURN_U32(0);
-            case kAudioStreamPropertyIsActive:
-                RETURN_U32(object == kObjectID_Stream_Input ? gInputActive : gOutputActive);
+            case kAudioStreamPropertyIsActive: {
+                /* The input stream is active only if something also opened it
+                 * on the USB side. A client that deactivated it stays
+                 * deactivated; the mode can only take it away, never grant it.
+                 */
+                pthread_mutex_lock(&gStateMutex);
+                UInt32 active = (object == kObjectID_Stream_Input)
+                              ? (gInputActive && input_wanted_locked())
+                              : gOutputActive;
+                pthread_mutex_unlock(&gStateMutex);
+                RETURN_U32(active);
+            }
 
             case kAudioStreamPropertyVirtualFormat:
             case kAudioStreamPropertyPhysicalFormat: {
@@ -1207,6 +1367,19 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
 
         for (size_t i = 0; i < NUM_RATES; i++) {
             if (kSupportedRates[i] != requested) continue;
+
+            /* The input direction follows the rate under `auto`, and it has to
+             * follow it now rather than when the change is performed: the HAL
+             * defers that indefinitely while nothing is playing, which is
+             * exactly when a user is in Audio MIDI Setup looking at the
+             * device. */
+            pthread_mutex_lock(&gStateMutex);
+            Boolean was = input_wanted_locked();
+            gPolicyRate = requested;
+            Boolean now = input_wanted_locked();
+            pthread_mutex_unlock(&gStateMutex);
+            if (was != now) notify_input_visibility_changed();
+
             /* Ask the host to quiesce IO and call back into
              * PerformDeviceConfigurationChange, rather than switching underneath
              * a running stream. */
@@ -1324,6 +1497,51 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareNoError;
     }
 
+    if (object == kObjectID_Device && address->mSelector == kEMUProperty_InputMode) {
+        if (dataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+        CFStringRef requested = *(const CFStringRef*)data;
+        if (!requested) return kAudioHardwareIllegalOperationError;
+
+        InputMode mode;
+        if (CFStringCompare(requested, CFSTR("on"), kCFCompareCaseInsensitive)
+            == kCFCompareEqualTo) {
+            mode = kInputMode_On;
+        } else if (CFStringCompare(requested, CFSTR("off"), kCFCompareCaseInsensitive)
+                   == kCFCompareEqualTo) {
+            mode = kInputMode_Off;
+        } else if (CFStringCompare(requested, CFSTR("auto"), kCFCompareCaseInsensitive)
+                   == kCFCompareEqualTo) {
+            mode = kInputMode_Auto;
+        } else {
+            return kAudioHardwareIllegalOperationError;
+        }
+
+        pthread_mutex_lock(&gStateMutex);
+        Boolean was = input_wanted_locked();
+        gInputMode = mode;
+        Boolean now = input_wanted_locked();
+        Float64 rate = gSampleRate;
+        pthread_mutex_unlock(&gStateMutex);
+
+        if (was != now) {
+            notify_input_visibility_changed();
+            /* Claiming or releasing an interface cannot happen underneath a
+             * running stream: it rebuilds the schedule, which is a dropout on
+             * the output side -- the side this mode exists to protect. Ask the
+             * HAL to stop IO, re-apply the rate it already has, and start
+             * again, which is the same path a rate change takes and gives two
+             * clean streams either side of the switch. */
+            if (gHost) {
+                gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device,
+                                                        (UInt64)rate, NULL);
+            }
+        }
+        EMU_LOG("input mode set to %{public}s, capture %{public}s",
+                mode == kInputMode_On ? "on" : mode == kInputMode_Off ? "off" : "auto",
+                now ? "on" : "off");
+        return kAudioHardwareNoError;
+    }
+
     if (object == kObjectID_Device && address->mSelector == kEMUProperty_SafetyOffset) {
         if (dataSize != sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
         CFPropertyListRef value = *(const CFPropertyListRef*)data;
@@ -1398,7 +1616,10 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
          * GetZeroTimeStamp is already on the device's clock. A host-clock
          * guess spliced to the device clock later stalls coreaudiod's IO
          * thread for the length of the discrepancy (FINDINGS). */
-        if (!emu_engine_start((uint32_t)gSampleRate, gOutputSafetyUS)) {
+        /* gStateMutex is held here, so the effective answer is read against
+         * the same rate the engine is about to be started at. */
+        if (!emu_engine_start((uint32_t)gSampleRate, gOutputSafetyUS,
+                              input_wanted_locked())) {
             pthread_mutex_unlock(&gStateMutex);
             EMU_LOG("IO start failed: USB engine did not come up");
             return kAudioHardwareNotRunningError;

@@ -53,6 +53,22 @@ typedef struct {
     uint32_t feedback_overflows; /* capture measurements the queue could not hold:
                                     playback and capture have decoupled */
 
+    /* The explicit feedback endpoint, 0x81. The device states its own demand
+     * there in Q16.16 sample frames per playback service interval, about every
+     * 32 ms. It sizes playback only while capture is off; otherwise these are
+     * a second, device-side reading of the same clock to check the first
+     * against. Raw words as sent -- the scaling correction is applied where
+     * the value is used, not where it is reported. */
+    uint64_t feedback_packets;   /* values received                            */
+    uint64_t feedback_silent;    /* intervals the endpoint had nothing to say  */
+    uint64_t feedback_errors;
+    uint64_t feedback_rejected;  /* values outside one frame of nominal, ignored */
+    uint64_t feedback_changes;   /* consecutive values that differed           */
+    uint32_t feedback_q16;       /* the last value                             */
+    uint32_t feedback_min_q16;
+    uint32_t feedback_max_q16;
+    uint32_t feedback_nominal_q16; /* what the rate and interval say it should be */
+
     /* The output path. Core Audio writes into the submitted USB buffers
      * itself (emu_engine_write_output), so what these measure is that
      * thread's progress against the bus, not a staging buffer's occupancy. */
@@ -71,6 +87,7 @@ typedef struct {
     bool     schedule_clamped;   /* ...and whether MAX_REQUESTS truncated it, which
                                     means the schedule may be short of the write lead */
 
+    bool     input_enabled;      /* whether capture was opened at all this session */
     uint64_t frames_captured;    /* frames written to the input ring, silence included */
     uint32_t input_depth;
     uint32_t input_underruns;
@@ -117,8 +134,14 @@ bool emu_engine_set_identity_observer(void (*observer)(void));
  * play head -- Core Audio's definition of the offset is how far ahead of the
  * hardware position it is safe to do IO, and the fill is this driver's
  * hardware position -- so the same number sets how late the engine thread may
- * run before a packet transmits silence: the offset less one request period. */
-bool     emu_engine_start(uint32_t sample_rate, uint32_t output_safety_us);
+ * run before a packet transmits silence: the offset less one request period.
+ *
+ * `with_input` false leaves the capture interface unclaimed at alternate
+ * setting 0, so no IN transaction reaches the bus, and playback is sized from
+ * the explicit feedback endpoint instead of from capture (planner_next in
+ * usb_engine.c). */
+bool     emu_engine_start(uint32_t sample_rate, uint32_t output_safety_us,
+                          bool with_input);
 
 void     emu_engine_stop(void);
 bool     emu_engine_running(void);

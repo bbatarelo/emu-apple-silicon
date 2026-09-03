@@ -264,16 +264,58 @@ the offset can be 4 ms rather than 10.
 
 ## Packet sizing
 
-Playback packet sizes come from the capture stream. Each capture service interval
-reports how many sample frames the device produced; that count sizes the next
-playback packet, through the feedback queue in the Rust core.
+Playback packet sizes come from the capture stream while it runs. Each capture
+service interval reports how many sample frames the device produced; that
+count sizes the next playback packet, through the feedback queue in the Rust
+core. It is a measurement rather than a report, it keeps the two directions'
+cursors advancing by the same amount for the same interval by construction,
+and it is what E-MU's original driver did.
 
-This is why **capture runs even when only playback is wanted** — it is how the
-driver measures what the hardware is doing. It is also what E-MU's original
-driver did.
+The explicit feedback endpoint (`0x81`) on the playback interface is read as
+well: Q16.16 sample frames per playback service interval, about thirty times a
+second, the device's own statement of the same demand. Its firmware scales the
+fractional part by 64000 where the format says 65536, so the whole 44.1 kHz
+family reads 53.1 ppm low; `emu_feedback_true_q16` corrects that before use
+(FINDINGS). It sizes playback only while capture is off. Then interface 2 is
+never claimed and stays at alternate setting 0, no IN transaction reaches the
+bus, and the endpoint is the only clock there is.
 
-There is an explicit feedback endpoint (`0x81`) on the playback interface which
-this driver does not currently use.
+Whether capture is opened is the input mode (`'emuI'`, `hal-check input`):
+
+| mode | capture |
+|---|---|
+| `on` (default) | always |
+| `auto` | on below 176.4 kHz, off at and above it |
+| `off` | never |
+
+It exists because on some setups — @dnadlinger's development machine among
+them, though not every unit reported — duplex at 176.4 and 192 kHz drops about
+one playback packet a second while IN transactions are on the bus, and
+playback without capture does not (FINDINGS). `on` is the default because an
+interface that records is what this hardware is, and one that silently stopped
+recording at two of its six rates would surprise someone worse than a known,
+documented fault. `auto` and `off` are the opt-in workaround; the cost is the
+entire input direction at the affected rates.
+
+While capture is off, **the device stops having an input direction**: no stream
+in the input scope, no input channels, `kAudioStreamPropertyIsActive` false,
+with a change notification on every transition — including the ones a rate
+change causes under `auto`. A stream that is merely inactive is not enough:
+nothing in Audio MIDI Setup surfaces it, and a recording application just reads
+zeroes, which looks like a hardware fault. The policy decides against the
+*requested* rate, because the HAL defers `PerformDeviceConfigurationChange`
+while no IO is running — sometimes until the next stream starts — and until
+then the plug-in's own rate still holds the old value, which is exactly when
+someone is looking at Audio MIDI Setup.
+
+The mode is read once per `StartIO`. Changing it under a running stream goes
+through `RequestDeviceConfigurationChange`, the path a rate change takes:
+claiming or releasing an interface rebuilds the schedule, which is a dropout on
+the output side, so the HAL stops IO and starts it again and the switch falls
+between two clean streams.
+
+None of this touches the timeline, which anchors to frames the device has
+consumed on the *playback* side.
 
 ## The USB engine
 
@@ -316,7 +358,8 @@ Each direction keeps `num_requests` requests of `REQUEST_MS` (2 ms) in flight
 — between `MIN_REQUESTS` (16) and `MAX_REQUESTS` (128), derived per session by
 `schedule_depth()`; see Latency above. The request length sets the completion
 cadence; the count sets how far ahead Core Audio may write and how long a stall
-the schedule survives.
+the schedule survives. The feedback endpoint has a shallow schedule of its own
+(`FB_REQUESTS`) on its own `bInterval`.
 
 It uses **low-latency isochronous transfers**. The classic API delivers one
 frame-list entry per USB frame, which silently halves the audio on the

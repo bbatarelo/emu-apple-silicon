@@ -186,6 +186,131 @@ and nothing else.
 
 Whether every unit does this is not known.
 
+### Duplex at 176.4 and 192 kHz drops playback packets on some setups
+
+On @dnadlinger's development setup — a 0404 USB on a MacBook Pro M1 Max
+(macOS 15.7.4), on a direct port and behind a USB 2.0 hub alike — full duplex
+at the two `bInterval 3` rates loses about one playback packet a second,
+audible as crackle:
+
+| rate | silent playback packets |
+|---|---|
+| 44.1 – 96 kHz | none |
+| 176.4 kHz | 2.75 / s |
+| 192 kHz | 1.50 / s |
+
+Each is a single whole packet on the packet grid. The tone resumes in phase, so
+the timeline never moved: silence replaced the audio rather than displacing it.
+
+**Not every setup shows it.** Bruno Batarelo reports duplex at both rates
+working on a 0404 USB and on a Tracker Pre. It is therefore a property of some
+combination of unit, firmware and host, not of the device family, and the
+workaround below is opt-in rather than the default.
+
+**It follows the presence of IN transactions on the bus.** Playback with the
+capture interface never claimed is clean at both rates, in the driver
+(`hal-check input off`) and in `emu-probe play-only`. So is `emu-probe
+play-idle`, which claims interface 2, selects the streaming alternate setting
+— bandwidth reserved, ADC clocked, FIFO filling — and never queues a read, so
+the host issues no IN token. Only full duplex drops packets. The device's own
+feedback value says the same without anyone listening: identical to the bit in
+either no-capture mode, 14–38 excursions per 8 s window in duplex. (Excursion
+counts spread widely between runs; this order-of-magnitude separation is the
+one feedback statistic that survived repetition.)
+
+**Everything on the host has been varied without effect.** The rate stays at
+1.1–1.7 per second at 192 kHz throughout:
+
+| ruled out | how |
+|---|---|
+| Core Audio not writing the frames | `framesToOutput == framesBound`, exactly |
+| the write missing the buffer that transmitted | a marker fill in place of the submit-time zeros never came back; every dropout was silence |
+| the transfer failing | `usbErrors` 0 |
+| the bus carrying fewer bytes than asked | `shortPlayback` 0 |
+| the packet size | every packet is 96 frames at 192 kHz; 44.1 kHz changes size about 110 times a second and never drops |
+| the 0.5 ms service interval | 48 and 96 kHz on their own 0.5 ms endpoints drop nothing |
+| the write lead | a 20 ms safety offset, 5× the default: unchanged |
+| the playback architecture | a staging ring, the direct bind and `emu-probe`'s own engine all drop at the same rate |
+| the request granularity | 1, 2 and 8 ms requests all drop |
+| the schedule phase between the directions | playback started 0–7 ms after capture: unchanged. E-MU's Windows driver's +3 ms offset primes its output FIFO; any whole millisecond is a whole number of 0.5 ms intervals and cannot move the phase |
+| the planner source | sizing from `0x81` instead of capture: identical over six paired loopback runs |
+| the port and the electrical path | direct port and behind a hub: the same |
+
+**The loss is past the host, and the driver cannot see it.** The buffer held
+audio when the packet went out, the transfer succeeded, the bus carried every
+byte, and the DAC went quiet. The device can be watched discarding audio with
+every counter clean (the oversize OUT packet above), so there is no counter to
+add: the information does not cross the bus. What finds it is `hal-loopback`,
+which listens.
+
+Untried: a different USB host controller, and a different Mac. Given the
+report above, that or the unit itself is where the difference lives.
+
+**The workaround is the input mode.** `hal-check input auto` leaves capture
+unopened at 176.4 and 192 kHz; playback is then sized from the feedback
+endpoint, and the two rates go from unusable to playback-only. A five-minute
+playback-only run at 176.4 kHz is clean by ear and delivers −2.3 ppm against
+the host clock. `off` does the same at every rate.
+
+### The explicit feedback endpoint
+
+`0x81` is a real endpoint, not just a `bSynchAddress`: every playback alt
+setting carries a 4-byte isochronous IN descriptor for it at `bInterval` 4. The
+driver reads it always and sizes playback from it while capture is off.
+
+**Units.** Q16.16 sample frames per playback **service interval**, the reading
+E-MU's Windows driver uses — not frames per millisecond, which the same
+vendor's macOS kext assumed and which differs by a factor of two on a
+`bInterval 3` endpoint. The hardware settles it: at 192 kHz on a 0.5 ms
+endpoint the value is `0x00600000`, 96.0000 frames.
+
+**Cadence.** One value every 32 service intervals — 32 ms at `bInterval` 4,
+16 ms at `bInterval` 3, the period the kext hard-codes as `kEMURefreshRate` —
+and nothing in between. Resolution 1/128 of a frame.
+
+**Scaling.** The value is a constant, exact at the integer rates and 53.1 ppm
+low at every 44.1-family rate:
+
+| rate | interval | nominal | device says | | vs nominal |
+|---|---|---|---|---|---|
+| 44100 | 1.00 ms | 44.1000 | `0x002c1900` | 44.0977 | −53.1 ppm |
+| 44100 | 0.50 ms | 22.0500 | `0x00160c80` | 22.0488 | −53.1 ppm |
+| 48000 | 1.00 ms | 48.0000 | `0x00300000` | 48.0000 | 0 |
+| 48000 | 0.50 ms | 24.0000 | `0x00180000` | 24.0000 | 0 |
+| 88200 | 1.00 ms | 88.2000 | `0x00583200` | 88.1953 | −53.1 ppm |
+| 88200 | 0.50 ms | 44.1000 | `0x002c1900` | 44.0977 | −53.1 ppm |
+| 96000 | 1.00 ms | 96.0000 | `0x00600000` | 96.0000 | 0 |
+| 96000 | 0.50 ms | 48.0000 | `0x00300000` | 48.0000 | 0 |
+| 176400 | 0.50 ms | 88.2000 | `0x00583200` | 88.1953 | −53.1 ppm |
+| 192000 | 0.50 ms | 96.0000 | `0x00600000` | 96.0000 | 0 |
+
+The fraction bytes say why: `0x0c80` = 3200 for .05, `0x1900` = 6400 for .1,
+`0x3200` = 12800 for .2 — each the fraction times **64000**, where Q16.16 wants
+65536. It is the firmware's arithmetic, not the clock: in one duplex stream at
+176.4 kHz, capture measures the device producing 88.2000 frames per interval,
+nominal to 0.1 ppm, while the endpoint says 88.1953. `emu_feedback_true_q16`
+in the Rust core undoes the scaling, and everything that sizes packets from
+`0x81` goes through it. The same constant scales the excursions: a raw step of
+`0x1000` reads as 1/16 of a frame and means 4096/64000 = 0.064 frames.
+
+The correction only matters when the endpoint is the sole clock. Playback-only
+at 176.4 kHz delivers 88.2000 frames per interval corrected; uncorrected it
+delivers 88.1997, only 3.4 ppm short rather than 53 because the device servos
+against the shortfall, hunting through about 100 trims per 20 s.
+
+**The excursions are the servo.** Playback-only at 176.4 kHz sits on nominal
+with the demand quiescent for the first minute, then trims by one low value
+every 5.04 s: one trim is 0.064 frames held for one reporting period, which at
+one per 5 s is 2.3 ppm — the −2.3 ppm the run delivers. The device's crystal
+sits about that far from the host clock and the loop absorbs it.
+
+**Capture stays the planner while capture runs.** Capture sizing keeps
+`in_cursor` and `out_cursor` advancing by the same amount for the same interval
+by construction, and it is a measurement, where the endpoint is a rounded
+constant that moves a sixteenth of a frame a few times in ten seconds. Values
+further than one frame from nominal are refused: through a corrupt stream
+(above) the endpoint returns nonsense along with everything else.
+
 ---
 
 ## The 0404 USB
@@ -640,6 +765,15 @@ Two general lessons:
 
 ## Open questions
 
+- Why duplex at 176.4 and 192 kHz drops playback packets on @dnadlinger's
+  development setup and not on another user's 0404 USB and Tracker Pre.
+  Everything the driver controls is ruled out and the loss is past the host. A
+  different host controller and a different Mac are the untried variables;
+  whether the unit or its firmware differs is unknown.
+- What a `bInterval 3` stream leaves behind that corrupts exactly one
+  following stream, and why only running a stream clears it. The length word
+  says the corruption is a two-byte shift of the IN stream, so something starts
+  its read two bytes into the FIFO. Whether every unit does it is also unknown.
 - How the internal path's 4.23 ms divides between input and output. A loopback
   yields only the sum, so the driver splits it evenly; the kext asked the same
   question ("Can we measure one-way directly?") and did not answer it.

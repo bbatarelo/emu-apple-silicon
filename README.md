@@ -97,9 +97,11 @@ another rate, set it first — in Audio MIDI Setup, or by passing `-r <hz>` to
 glitch test at every rate the device offers.
 
 Set the input gain so the returned tone does not clip; the tests report the
-level they saw. On @dnadlinger's development machine a stream at 176.4 or
-192 kHz leaves the *next* stream corrupt whatever rate it runs at — see
-`docs/FINDINGS.md` before reading a run at those rates.
+level they saw. 44.1 to 96 kHz pass everywhere. **176.4 and 192 kHz in full
+duplex drop about one playback packet a second on some setups**
+(@dnadlinger's development machine among them, not every unit reported), and
+on that machine either rate leaves the *next* stream corrupt whatever rate it
+runs at. See `docs/FINDINGS.md`, and the input mode under Status below.
 
 ---
 
@@ -134,7 +136,7 @@ isochronous streaming, clock recovery and format conversion itself.
         |
    AudioServerPlugIn        this driver
         |
-   lock-free ring           the join between two clocks
+   timeline-indexed buffers  the join between two clocks
         |
    USB engine thread        24-bit packed, packets sized by the device's clock
         |
@@ -144,8 +146,10 @@ isochronous streaming, clock recovery and format conversion itself.
 ```
 
 The interesting part is that the device's clock, not the computer's, decides how
-fast audio moves. Capture runs even when only playback is wanted, because the
-capture stream is how the driver measures what the hardware is actually doing.
+fast audio moves. Capture normally runs even when only playback is wanted,
+because the capture stream is how the driver measures what the hardware is
+actually doing; with capture switched off, the device's own feedback endpoint
+takes over.
 
 More in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
@@ -156,6 +160,14 @@ More in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 Working: playback, capture, all six sample rates, master volume and mute,
 correct channel mapping, clock tracking anchored to the device, latency
 reported from a loopback measurement.
+
+Known issue: on some setups — @dnadlinger's development 0404 USB among them,
+though another user's 0404 USB and Tracker Pre are reported clean — full
+duplex at 176.4 and 192 kHz crackles, about one dropped playback packet a
+second.
+`build/bin/hal-check input auto` runs those two rates playback-only, which is
+clean, at the cost of the input at those rates; `hal-check input on` restores
+it. See `docs/FINDINGS.md`.
 
 Not done:
 
@@ -190,8 +202,9 @@ Not done:
 The most useful thing anyone can do is run `tools/emu-probe` against an 0202 and
 send the output. It is the last member of the family nobody has checked.
 
-After that: MIDI, the 0404's unread extension units, and the four unexplained
-bytes documented in FINDINGS.
+After that: MIDI, the 0404's unread extension units, and reports of whether
+176.4 and 192 kHz are clean in full duplex on your unit — `make loopback` with
+a cable says, and FINDINGS explains why it matters.
 
 ---
 
