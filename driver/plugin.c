@@ -47,19 +47,19 @@ static os_log_t emu_log(void)
 
 /* --- object model --------------------------------------------------------
  *
- * Fixed IDs. Core Audio addresses every property by object, and a plug-in that
- * publishes a static topology has no reason to allocate them dynamically.
+ * Core Audio addresses every property by object. The plug-in object is fixed;
+ * a device's objects are computed from its slot, because the topology is no
+ * longer static -- see DEVICE_OBJECT_BASE and DeviceRole below. The old fixed
+ * constants are gone deliberately: keeping them alongside the arithmetic would
+ * be two sources of truth for the same numbers, and the first device's block
+ * happens to land on exactly the values they had.
+ *
+ * The device carries software volume and mute controls because this hardware
+ * has no master output level -- only a headphone knob -- and without them
+ * macOS greys out the volume slider entirely.
  */
 enum {
-    kObjectID_PlugIn        = kAudioObjectPlugInObject,  /* 1 */
-    kObjectID_Device        = 2,
-    kObjectID_Stream_Input  = 3,
-    kObjectID_Stream_Output = 4,
-    /* The Tracker Pre has no hardware master output level -- only a headphone
-     * knob -- so these are software controls over the output stream. Without
-     * them macOS greys out its volume slider entirely. */
-    kObjectID_Volume_Output = 5,
-    kObjectID_Mute_Output   = 6,
+    kObjectID_PlugIn = kAudioObjectPlugInObject,  /* 1 */
 };
 
 /* Range of the software fader. -96 dB is far enough below anything audible to
@@ -294,6 +294,29 @@ static inline AudioObjectID device_object(const Device* dev, DeviceRole role)
     return dev->base + (AudioObjectID)role;
 }
 
+/*
+ * What an object ID denotes: the plug-in itself, or one role of one device.
+ *
+ * The property handlers switch over "which object is this", and with computed
+ * IDs that can no longer be a switch over the ID: device 1's stream is a
+ * different number from device 0's but wants the same code. Classifying first
+ * lets the switches stay switches, over the role rather than the number.
+ * Negative values keep the plug-in and the unknown case clear of DeviceRole,
+ * whose members start at zero.
+ */
+enum { kObjKind_Unknown = -2, kObjKind_PlugIn = -1 };
+
+static Device* device_for_object(AudioObjectID id, DeviceRole* role);
+
+static int object_kind(AudioObjectID object, Device** out_dev)
+{
+    if (object == kObjectID_PlugIn) { if (out_dev) *out_dev = NULL; return kObjKind_PlugIn; }
+    DeviceRole role = kRole_Device;
+    Device* dev = device_for_object(object, &role);
+    if (out_dev) *out_dev = dev;
+    return dev ? (int)role : kObjKind_Unknown;
+}
+
 /* Maps an object ID back to the device that owns it. NULL for the plug-in
  * object and for anything out of range, which callers answer with
  * kAudioHardwareBadObjectError exactly as they did when there was one device. */
@@ -336,7 +359,7 @@ static void device_set_alive(Device* dev, bool alive)
         { kAudioDevicePropertyDeviceIsRunning,
           kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
     };
-    gHost->PropertiesChanged(gHost, kObjectID_Device, 2, changed);
+    gHost->PropertiesChanged(gHost, device_object(dev, kRole_Device), 2, changed);
 }
 
 /* Engine thread, once, when it has exhausted its rebuild attempts. */
@@ -515,6 +538,10 @@ static ULONG ReleaseRef(void* driver)
  */
 static void device_presence_changed(void)
 {
+    /* Stage 3: these fire from the hot-plug observer and the input-mode
+     * setter, neither of which names a device yet. With several published
+     * they have to notify each one, not just the first. */
+    Device* dev = &gDevices[0];
     if (!gHost) return;
 
     AudioObjectPropertyAddress list[] = {
@@ -533,7 +560,7 @@ static void device_presence_changed(void)
             kAudioObjectPropertyScopeGlobal,
             kAudioObjectPropertyElementMain,
         };
-        gHost->PropertiesChanged(gHost, kObjectID_Device, 1, &name);
+        gHost->PropertiesChanged(gHost, device_object(dev, kRole_Device), 1, &name);
         EMU_LOG("device attached: publishing %{public}s", emu_engine_device_name());
     } else {
         EMU_LOG("device detached: withdrawn from Core Audio");
@@ -608,13 +635,23 @@ static OSStatus DestroyDevice(AudioServerPlugInDriverRef d, AudioObjectID id)
 
 static OSStatus AddDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id,
                                 const AudioServerPlugInClientInfo* c)
-{ (void)d; (void)c; return id == kObjectID_Device ? kAudioHardwareNoError
-                                                  : kAudioHardwareBadObjectError; }
+{
+    (void)d; (void)c;
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
+    return (dev && role_ == kRole_Device) ? kAudioHardwareNoError
+                                         : kAudioHardwareBadObjectError;
+}
 
 static OSStatus RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID id,
-                                   const AudioServerPlugInClientInfo* c)
-{ (void)d; (void)c; return id == kObjectID_Device ? kAudioHardwareNoError
-                                                  : kAudioHardwareBadObjectError; }
+                                const AudioServerPlugInClientInfo* c)
+{
+    (void)d; (void)c;
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
+    return (dev && role_ == kRole_Device) ? kAudioHardwareNoError
+                                         : kAudioHardwareBadObjectError;
+}
 
 /* Whether this stream should open capture. Call with gStateMutex held.
  *
@@ -647,6 +684,10 @@ static Boolean input_wanted_locked(Device* dev)
  * may call back in. */
 static void notify_input_visibility_changed(void)
 {
+    /* Stage 3: these fire from the hot-plug observer and the input-mode
+     * setter, neither of which names a device yet. With several published
+     * they have to notify each one, not just the first. */
+    Device* dev = &gDevices[0];
     if (!gHost) return;
     AudioObjectPropertyAddress device[] = {
         { kAudioDevicePropertyStreams,
@@ -656,13 +697,13 @@ static void notify_input_visibility_changed(void)
         { kAudioObjectPropertyOwnedObjects,
           kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
     };
-    gHost->PropertiesChanged(gHost, kObjectID_Device, 3, device);
+    gHost->PropertiesChanged(gHost, device_object(dev, kRole_Device), 3, device);
 
     AudioObjectPropertyAddress active = {
         kAudioStreamPropertyIsActive, kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
-    gHost->PropertiesChanged(gHost, kObjectID_Stream_Input, 1, &active);
+    gHost->PropertiesChanged(gHost, device_object(dev, kRole_StreamInput), 1, &active);
 }
 
 /* Rate changes arrive as a configuration change so Core Audio can quiesce IO
@@ -674,7 +715,7 @@ static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d,
     DeviceRole role_ = kRole_Device;
     Device* dev = device_for_object(id, &role_);
     (void)d; (void)info;
-    if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if ((!dev || role_ != kRole_Device)) return kAudioHardwareBadObjectError;
 
     Float64 rate = (Float64)action;
     Boolean known = false;
@@ -760,10 +801,10 @@ static Boolean input_published(Device* dev)
 
 static Boolean stream_matches_scope(Device* dev, AudioObjectID stream, AudioObjectPropertyScope scope)
 {
-    if (stream == kObjectID_Stream_Input && !input_published(dev)) return false;
+    if (stream == device_object(dev, kRole_StreamInput) && !input_published(dev)) return false;
     if (scope == kAudioObjectPropertyScopeGlobal) return true;
-    if (scope == kAudioObjectPropertyScopeInput)  return stream == kObjectID_Stream_Input;
-    if (scope == kAudioObjectPropertyScopeOutput) return stream == kObjectID_Stream_Output;
+    if (scope == kAudioObjectPropertyScopeInput)  return stream == device_object(dev, kRole_StreamInput);
+    if (scope == kAudioObjectPropertyScopeOutput) return stream == device_object(dev, kRole_StreamOutput);
     return false;
 }
 
@@ -771,8 +812,8 @@ static Boolean stream_matches_scope(Device* dev, AudioObjectID stream, AudioObje
 static UInt32 stream_count(Device* dev, AudioObjectPropertyScope scope)
 {
     UInt32 n = 0;
-    if (stream_matches_scope(dev, kObjectID_Stream_Input, scope))  n++;
-    if (stream_matches_scope(dev, kObjectID_Stream_Output, scope)) n++;
+    if (stream_matches_scope(dev, device_object(dev, kRole_StreamInput), scope))  n++;
+    if (stream_matches_scope(dev, device_object(dev, kRole_StreamOutput), scope)) n++;
     return n;
 }
 
@@ -781,11 +822,15 @@ static UInt32 stream_count(Device* dev, AudioObjectPropertyScope scope)
 static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                            pid_t client, const AudioObjectPropertyAddress* address)
 {
+    Device* dev = NULL;
+    int kind_ = object_kind(object, &dev);
+    DeviceRole role_ = kind_ >= 0 ? (DeviceRole)kind_ : kRole_Device;
+    (void)role_;
     (void)d; (void)client;
     if (!address) return false;
 
-    switch (object) {
-        case kObjectID_PlugIn:
+    switch (kind_) {
+        case kObjKind_PlugIn:
             switch (address->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -799,7 +844,7 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 default: return false;
             }
 
-        case kObjectID_Device:
+        case kRole_Device:
             switch (address->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -836,7 +881,7 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 default: return false;
             }
 
-        case kObjectID_Volume_Output:
+        case kRole_VolumeOutput:
             switch (address->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -852,7 +897,7 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 default: return false;
             }
 
-        case kObjectID_Mute_Output:
+        case kRole_MuteOutput:
             switch (address->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -864,8 +909,8 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 default: return false;
             }
 
-        case kObjectID_Stream_Input:
-        case kObjectID_Stream_Output:
+        case kRole_StreamInput:
+        case kRole_StreamOutput:
             switch (address->mSelector) {
                 case kAudioObjectPropertyBaseClass:
                 case kAudioObjectPropertyClass:
@@ -891,35 +936,37 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o
                                    pid_t client, const AudioObjectPropertyAddress* address,
                                    Boolean* settable)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(object, &role_);
     (void)d; (void)client;
     if (!address || !settable) return kAudioHardwareIllegalOperationError;
 
     *settable = false;
-    if (object == kObjectID_Device &&
+    if ((dev && role_ == kRole_Device) &&
         address->mSelector == kAudioDevicePropertyNominalSampleRate) {
         *settable = true;
     }
-    if ((object == kObjectID_Stream_Input || object == kObjectID_Stream_Output) &&
+    if (((dev && role_ == kRole_StreamInput) || (dev && role_ == kRole_StreamOutput)) &&
         address->mSelector == kAudioStreamPropertyIsActive) {
         *settable = true;
     }
-    if (object == kObjectID_Volume_Output &&
+    if ((dev && role_ == kRole_VolumeOutput) &&
         (address->mSelector == kAudioLevelControlPropertyScalarValue ||
          address->mSelector == kAudioLevelControlPropertyDecibelValue)) {
         *settable = true;
     }
-    if (object == kObjectID_Mute_Output &&
+    if ((dev && role_ == kRole_MuteOutput) &&
         address->mSelector == kAudioBooleanControlPropertyValue) {
         *settable = true;
     }
-    if (object == kObjectID_Device &&
+    if ((dev && role_ == kRole_Device) &&
         (address->mSelector == kEMUProperty_ClockSource ||
          address->mSelector == kEMUProperty_InputMode ||
          address->mSelector == kEMUProperty_ResetCounters ||
          address->mSelector == kEMUProperty_FaultInject)) {
         *settable = true;
     }
-    if (object == kObjectID_Device && address->mSelector == kEMUProperty_SafetyOffset) {
+    if ((dev && role_ == kRole_Device) && address->mSelector == kEMUProperty_SafetyOffset) {
         *settable = true;
     }
     return kAudioHardwareNoError;
@@ -956,9 +1003,9 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
         case kAudioObjectPropertyOwnedObjects:
             if (object == kObjectID_PlugIn) {
                 *outSize = emu_engine_device_attached() ? sizeof(AudioObjectID) : 0;
-            } else if (object == kObjectID_Device) {
+            } else if ((dev && role_ == kRole_Device)) {
                 UInt32 n = stream_count(dev, address->mScope);
-                if (stream_matches_scope(dev, kObjectID_Stream_Output, address->mScope)) n += 2;
+                if (stream_matches_scope(dev, device_object(dev, kRole_StreamOutput), address->mScope)) n += 2;
                 *outSize = n * sizeof(AudioObjectID);
             } else { *outSize = 0; }
             return kAudioHardwareNoError;
@@ -1037,15 +1084,17 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                                 UInt32 qualifierSize, const void* qualifier,
                                 UInt32 dataSize, UInt32* outSize, void* outData)
 {
-    DeviceRole role_ = kRole_Device;
-    Device* dev = device_for_object(object, &role_);
+    Device* dev = NULL;
+    int kind_ = object_kind(object, &dev);
+    DeviceRole role_ = kind_ >= 0 ? (DeviceRole)kind_ : kRole_Device;
+    (void)role_;
     (void)d; (void)client;
     if (!address || !outSize || !outData) return kAudioHardwareIllegalOperationError;
 
-    switch (object) {
+    switch (kind_) {
 
     /* ---------------- plug-in ---------------- */
-    case kObjectID_PlugIn:
+    case kObjKind_PlugIn:
         switch (address->mSelector) {
             case kAudioObjectPropertyBaseClass: RETURN_U32(kAudioObjectClassID);
             case kAudioObjectPropertyClass:     RETURN_U32(kAudioPlugInClassID);
@@ -1062,7 +1111,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     *outSize = 0;
                     return kAudioHardwareNoError;
                 }
-                *(AudioObjectID*)outData = kObjectID_Device;
+                *(AudioObjectID*)outData = device_object(&gDevices[0], kRole_Device);
                 *outSize = sizeof(AudioObjectID);
                 return kAudioHardwareNoError;
 
@@ -1074,7 +1123,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 *(AudioObjectID*)outData =
                     (emu_engine_device_attached() && uid &&
                      CFStringCompare(uid, CFSTR(DEVICE_UID), 0) == kCFCompareEqualTo)
-                        ? kObjectID_Device : kAudioObjectUnknown;
+                        ? device_object(&gDevices[0], kRole_Device) : kAudioObjectUnknown;
                 *outSize = sizeof(AudioObjectID);
                 return kAudioHardwareNoError;
             }
@@ -1082,7 +1131,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         }
 
     /* ---------------- device ---------------- */
-    case kObjectID_Device:
+    case kRole_Device:
         switch (address->mSelector) {
             case kAudioObjectPropertyBaseClass: RETURN_U32(kAudioObjectClassID);
             case kAudioObjectPropertyClass:     RETURN_U32(kAudioDeviceClassID);
@@ -1345,8 +1394,8 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 AudioObjectID* ids = (AudioObjectID*)outData;
                 UInt32 capacity = dataSize / sizeof(AudioObjectID);
                 UInt32 n = 0;
-                if (n < capacity) ids[n++] = kObjectID_Volume_Output;
-                if (n < capacity) ids[n++] = kObjectID_Mute_Output;
+                if (n < capacity) ids[n++] = device_object(dev, kRole_VolumeOutput);
+                if (n < capacity) ids[n++] = device_object(dev, kRole_MuteOutput);
                 *outSize = n * sizeof(AudioObjectID);
                 return kAudioHardwareNoError;
             }
@@ -1356,17 +1405,17 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 AudioObjectID* ids = (AudioObjectID*)outData;
                 UInt32 capacity = dataSize / sizeof(AudioObjectID);
                 UInt32 n = 0;
-                if (stream_matches_scope(dev, kObjectID_Stream_Input, address->mScope) && n < capacity) {
-                    ids[n++] = kObjectID_Stream_Input;
+                if (stream_matches_scope(dev, device_object(dev, kRole_StreamInput), address->mScope) && n < capacity) {
+                    ids[n++] = device_object(dev, kRole_StreamInput);
                 }
-                if (stream_matches_scope(dev, kObjectID_Stream_Output, address->mScope) && n < capacity) {
-                    ids[n++] = kObjectID_Stream_Output;
+                if (stream_matches_scope(dev, device_object(dev, kRole_StreamOutput), address->mScope) && n < capacity) {
+                    ids[n++] = device_object(dev, kRole_StreamOutput);
                 }
                 /* Controls are owned objects too, but they are not streams. */
                 if (address->mSelector == kAudioObjectPropertyOwnedObjects &&
-                    stream_matches_scope(dev, kObjectID_Stream_Output, address->mScope)) {
-                    if (n < capacity) ids[n++] = kObjectID_Volume_Output;
-                    if (n < capacity) ids[n++] = kObjectID_Mute_Output;
+                    stream_matches_scope(dev, device_object(dev, kRole_StreamOutput), address->mScope)) {
+                    if (n < capacity) ids[n++] = device_object(dev, kRole_VolumeOutput);
+                    if (n < capacity) ids[n++] = device_object(dev, kRole_MuteOutput);
                 }
                 *outSize = n * sizeof(AudioObjectID);
                 return kAudioHardwareNoError;
@@ -1396,16 +1445,16 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         }
 
     /* ---------------- streams ---------------- */
-    case kObjectID_Stream_Input:
-    case kObjectID_Stream_Output:
+    case kRole_StreamInput:
+    case kRole_StreamOutput:
         switch (address->mSelector) {
             case kAudioObjectPropertyBaseClass: RETURN_U32(kAudioObjectClassID);
             case kAudioObjectPropertyClass:     RETURN_U32(kAudioStreamClassID);
-            case kAudioObjectPropertyOwner:     RETURN_U32(kObjectID_Device);
+            case kAudioObjectPropertyOwner:     RETURN_U32(device_object(dev, kRole_Device));
             case kAudioStreamPropertyDirection:
-                RETURN_U32(object == kObjectID_Stream_Input ? 1 : 0);
+                RETURN_U32((dev && role_ == kRole_StreamInput) ? 1 : 0);
             case kAudioStreamPropertyTerminalType:
-                RETURN_U32(object == kObjectID_Stream_Input
+                RETURN_U32((dev && role_ == kRole_StreamInput)
                            ? kAudioStreamTerminalTypeMicrophone
                            : kAudioStreamTerminalTypeSpeaker);
             case kAudioStreamPropertyStartingChannel: RETURN_U32(1);
@@ -1416,7 +1465,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                  * deactivated; the mode can only take it away, never grant it.
                  */
                 pthread_mutex_lock(&gStateMutex);
-                UInt32 active = (object == kObjectID_Stream_Input)
+                UInt32 active = ((dev && role_ == kRole_StreamInput))
                               ? (dev->inputActive && input_wanted_locked(dev))
                               : dev->outputActive;
                 pthread_mutex_unlock(&gStateMutex);
@@ -1452,11 +1501,11 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         }
 
     /* ---------------- controls ---------------- */
-    case kObjectID_Volume_Output:
+    case kRole_VolumeOutput:
         switch (address->mSelector) {
             case kAudioObjectPropertyBaseClass: RETURN_U32(kAudioLevelControlClassID);
             case kAudioObjectPropertyClass:     RETURN_U32(kAudioVolumeControlClassID);
-            case kAudioObjectPropertyOwner:     RETURN_U32(kObjectID_Device);
+            case kAudioObjectPropertyOwner:     RETURN_U32(device_object(dev, kRole_Device));
             case kAudioControlPropertyScope:    RETURN_U32(kAudioObjectPropertyScopeOutput);
             case kAudioControlPropertyElement:  RETURN_U32(kAudioObjectPropertyElementMain);
 
@@ -1500,11 +1549,11 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             default: return kAudioHardwareUnknownPropertyError;
         }
 
-    case kObjectID_Mute_Output:
+    case kRole_MuteOutput:
         switch (address->mSelector) {
             case kAudioObjectPropertyBaseClass: RETURN_U32(kAudioBooleanControlClassID);
             case kAudioObjectPropertyClass:     RETURN_U32(kAudioMuteControlClassID);
-            case kAudioObjectPropertyOwner:     RETURN_U32(kObjectID_Device);
+            case kAudioObjectPropertyOwner:     RETURN_U32(device_object(dev, kRole_Device));
             case kAudioControlPropertyScope:    RETURN_U32(kAudioObjectPropertyScopeOutput);
             case kAudioControlPropertyElement:  RETURN_U32(kAudioObjectPropertyElementMain);
             case kAudioBooleanControlPropertyValue: {
@@ -1533,7 +1582,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
     (void)d; (void)client; (void)qualifierSize; (void)qualifier;
     if (!address || !data) return kAudioHardwareIllegalOperationError;
 
-    if (object == kObjectID_Device &&
+    if ((dev && role_ == kRole_Device) &&
         address->mSelector == kAudioDevicePropertyNominalSampleRate) {
         if (dataSize != sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
         Float64 requested = *(const Float64*)data;
@@ -1557,7 +1606,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
              * PerformDeviceConfigurationChange, rather than switching underneath
              * a running stream. */
             if (gHost) {
-                gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device,
+                gHost->RequestDeviceConfigurationChange(gHost, device_object(dev, kRole_Device),
                                                         (UInt64)requested, NULL);
             }
             return kAudioHardwareNoError;
@@ -1565,18 +1614,18 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareIllegalOperationError;
     }
 
-    if ((object == kObjectID_Stream_Input || object == kObjectID_Stream_Output) &&
+    if (((dev && role_ == kRole_StreamInput) || (dev && role_ == kRole_StreamOutput)) &&
         address->mSelector == kAudioStreamPropertyIsActive) {
         if (dataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
         Boolean active = *(const UInt32*)data != 0;
         pthread_mutex_lock(&gStateMutex);
-        if (object == kObjectID_Stream_Input) dev->inputActive = active;
+        if ((dev && role_ == kRole_StreamInput)) dev->inputActive = active;
         else                                  dev->outputActive = active;
         pthread_mutex_unlock(&gStateMutex);
         return kAudioHardwareNoError;
     }
 
-    if (object == kObjectID_Volume_Output &&
+    if ((dev && role_ == kRole_VolumeOutput) &&
         (address->mSelector == kAudioLevelControlPropertyScalarValue ||
          address->mSelector == kAudioLevelControlPropertyDecibelValue)) {
         if (dataSize != sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
@@ -1601,12 +1650,12 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 { kAudioLevelControlPropertyDecibelValue,
                   kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             };
-            gHost->PropertiesChanged(gHost, kObjectID_Volume_Output, 2, changed);
+            gHost->PropertiesChanged(gHost, device_object(dev, kRole_VolumeOutput), 2, changed);
         }
         return kAudioHardwareNoError;
     }
 
-    if (object == kObjectID_Device && address->mSelector == kEMUProperty_ResetCounters) {
+    if ((dev && role_ == kRole_Device) && address->mSelector == kEMUProperty_ResetCounters) {
         emu_engine_reset_counters(dev->engine);
 
         EmuEngineStats engine;
@@ -1634,7 +1683,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareNoError;
     }
 
-    if (object == kObjectID_Device && address->mSelector == kEMUProperty_ClockSource) {
+    if ((dev && role_ == kRole_Device) && address->mSelector == kEMUProperty_ClockSource) {
         if (dataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
         CFStringRef requested = *(const CFStringRef*)data;
         if (!requested) return kAudioHardwareIllegalOperationError;
@@ -1670,7 +1719,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareNoError;
     }
 
-    if (object == kObjectID_Device && address->mSelector == kEMUProperty_FaultInject) {
+    if ((dev && role_ == kRole_Device) && address->mSelector == kEMUProperty_FaultInject) {
         if (dataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
         CFStringRef requested = *(const CFStringRef*)data;
         if (!requested) return kAudioHardwareIllegalOperationError;
@@ -1701,7 +1750,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareNoError;
     }
 
-    if (object == kObjectID_Device && address->mSelector == kEMUProperty_InputMode) {
+    if ((dev && role_ == kRole_Device) && address->mSelector == kEMUProperty_InputMode) {
         if (dataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
         CFStringRef requested = *(const CFStringRef*)data;
         if (!requested) return kAudioHardwareIllegalOperationError;
@@ -1736,7 +1785,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
              * again, which is the same path a rate change takes and gives two
              * clean streams either side of the switch. */
             if (gHost) {
-                gHost->RequestDeviceConfigurationChange(gHost, kObjectID_Device,
+                gHost->RequestDeviceConfigurationChange(gHost, device_object(dev, kRole_Device),
                                                         (UInt64)rate, NULL);
             }
         }
@@ -1746,7 +1795,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareNoError;
     }
 
-    if (object == kObjectID_Device && address->mSelector == kEMUProperty_SafetyOffset) {
+    if ((dev && role_ == kRole_Device) && address->mSelector == kEMUProperty_SafetyOffset) {
         if (dataSize != sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
         CFPropertyListRef value = *(const CFPropertyListRef*)data;
         if (!value || CFGetTypeID(value) != CFNumberGetTypeID()) {
@@ -1774,13 +1823,13 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 { kEMUProperty_SafetyOffset,
                   kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             };
-            gHost->PropertiesChanged(gHost, kObjectID_Device, 2, changed);
+            gHost->PropertiesChanged(gHost, device_object(dev, kRole_Device), 2, changed);
         }
         EMU_LOG("output safety offset set to %{public}lld us", us);
         return kAudioHardwareNoError;
     }
 
-    if (object == kObjectID_Mute_Output &&
+    if ((dev && role_ == kRole_MuteOutput) &&
         address->mSelector == kAudioBooleanControlPropertyValue) {
         if (dataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
 
@@ -1794,7 +1843,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 kAudioBooleanControlPropertyValue,
                 kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
             };
-            gHost->PropertiesChanged(gHost, kObjectID_Mute_Output, 1, &changed);
+            gHost->PropertiesChanged(gHost, device_object(dev, kRole_MuteOutput), 1, &changed);
         }
         return kAudioHardwareNoError;
     }
@@ -1809,7 +1858,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
     DeviceRole role_ = kRole_Device;
     Device* dev = device_for_object(id, &role_);
     (void)d; (void)client;
-    if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if ((!dev || role_ != kRole_Device)) return kAudioHardwareBadObjectError;
 
     atomic_fetch_add_explicit(&dev->startIOCount, 1, memory_order_relaxed);
 
@@ -1861,7 +1910,7 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 cl
     DeviceRole role_ = kRole_Device;
     Device* dev = device_for_object(id, &role_);
     (void)d; (void)client;
-    if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if ((!dev || role_ != kRole_Device)) return kAudioHardwareBadObjectError;
 
     pthread_mutex_lock(&gStateMutex);
     bool last = (dev->iOClients > 0 && --dev->iOClients == 0);
@@ -1910,7 +1959,7 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
     DeviceRole role_ = kRole_Device;
     Device* dev = device_for_object(id, &role_);
     (void)d; (void)client;
-    if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if ((!dev || role_ != kRole_Device)) return kAudioHardwareBadObjectError;
     if (!sampleTime || !hostTime || !seed) return kAudioHardwareIllegalOperationError;
 
     pthread_mutex_lock(&gStateMutex);
@@ -2006,8 +2055,10 @@ static OSStatus WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id
                                   UInt32 client, UInt32 operation, Boolean* willDo,
                                   Boolean* willDoInPlace)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
     (void)d; (void)client;
-    if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if ((!dev || role_ != kRole_Device)) return kAudioHardwareBadObjectError;
     if (!willDo || !willDoInPlace) return kAudioHardwareIllegalOperationError;
 
     switch (operation) {
@@ -2023,8 +2074,12 @@ static OSStatus WillDoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id
 static OSStatus BeginIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id,
                                  UInt32 client, UInt32 operation, UInt32 frameCount,
                                  const AudioServerPlugInIOCycleInfo* cycle)
-{ (void)d; (void)client; (void)operation; (void)frameCount; (void)cycle;
-  return id == kObjectID_Device ? kAudioHardwareNoError : kAudioHardwareBadObjectError; }
+{
+    (void)d; (void)client; (void)operation; (void)frameCount; (void)cycle;
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
+    return (dev && role_ == kRole_Device) ? kAudioHardwareNoError : kAudioHardwareBadObjectError;
+}
 
 /*
  * The audio path.
@@ -2048,7 +2103,7 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id,
     DeviceRole role_ = kRole_Device;
     Device* dev = device_for_object(id, &role_);
     (void)d; (void)stream; (void)client; (void)secondaryBuffer;
-    if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
+    if ((!dev || role_ != kRole_Device)) return kAudioHardwareBadObjectError;
 
     atomic_fetch_add_explicit(&dev->iOCycles, 1, memory_order_relaxed);
 
@@ -2073,8 +2128,12 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id,
 static OSStatus EndIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id,
                                UInt32 client, UInt32 operation, UInt32 frameCount,
                                const AudioServerPlugInIOCycleInfo* cycle)
-{ (void)d; (void)client; (void)operation; (void)frameCount; (void)cycle;
-  return id == kObjectID_Device ? kAudioHardwareNoError : kAudioHardwareBadObjectError; }
+{
+    (void)d; (void)client; (void)operation; (void)frameCount; (void)cycle;
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
+    return (dev && role_ == kRole_Device) ? kAudioHardwareNoError : kAudioHardwareBadObjectError;
+}
 
 /* --- interface and factory ------------------------------------------------ */
 
