@@ -15,6 +15,31 @@
  * Which one, if several of that product are attached, is up to IOKit. */
 io_service_t emu_find_product(uint16_t product_id);
 
+/*
+ * One attached unit.
+ *
+ * `location_id` identifies the physical port and is what the engine opens: it
+ * distinguishes two boxes of the same model, which a product ID cannot. It
+ * changes if the cable moves to another port, so it is an address, not a name.
+ *
+ * `serial` is the unit's own, from the USB device descriptor -- both of these
+ * devices report one (E-MU-69-3F04-... and E-MU-C7-3F0A-...). It survives
+ * replugging and reboots, so it is what a stable Core Audio UID is built from.
+ */
+typedef struct {
+    const EmuDeviceIdentity* identity;
+    uint64_t                 location_id;
+    char                     serial[80];
+} EmuUnit;
+
+/* Every attached known device, in registry order. Returns how many were
+ * written, at most `max`. */
+unsigned emu_enumerate_units(EmuUnit* out, unsigned max);
+
+/* The service for one specific unit, or IO_OBJECT_NULL if it has gone. The
+ * caller owns the returned service. */
+io_service_t emu_find_unit(uint16_t product_id, uint64_t location_id);
+
 /* Finds an attached device this driver knows about, preferring
  * `preferred_product_id` when more than one is plugged in. Returns its identity
  * and, in *out_service, the matching IOKit service, which the caller owns and

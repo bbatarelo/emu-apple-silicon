@@ -9,6 +9,91 @@
 /* IOKit's USB matching only honours idVendor and idProduct as a pair -- asking
  * for a vendor alone matches nothing -- so each known product is looked up in
  * turn rather than filtering a vendor-wide list. */
+/* Reads a registry number/string property, tolerating its absence. */
+static uint64_t service_number(io_service_t s, CFStringRef key)
+{
+    uint64_t v = 0;
+    CFTypeRef ref = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);
+    if (ref) {
+        if (CFGetTypeID(ref) == CFNumberGetTypeID()) {
+            CFNumberGetValue((CFNumberRef)ref, kCFNumberSInt64Type, &v);
+        }
+        CFRelease(ref);
+    }
+    return v;
+}
+
+static void service_string(io_service_t s, CFStringRef key, char* out, size_t cap)
+{
+    out[0] = 0;
+    CFTypeRef ref = IORegistryEntryCreateCFProperty(s, key, kCFAllocatorDefault, 0);
+    if (ref) {
+        if (CFGetTypeID(ref) == CFStringGetTypeID()) {
+            CFStringGetCString((CFStringRef)ref, out, (CFIndex)cap, kCFStringEncodingUTF8);
+        }
+        CFRelease(ref);
+    }
+}
+
+unsigned emu_enumerate_units(EmuUnit* out, unsigned max)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < EMU_DEVICE_COUNT && n < max; i++) {
+        CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBDeviceClassName);
+        if (!matching) continue;
+        SInt32 vid = EMU_VENDOR_ID, pid = kEmuDevices[i].product_id;
+        CFNumberRef vref = CFNumberCreate(NULL, kCFNumberSInt32Type, &vid);
+        CFNumberRef pref = CFNumberCreate(NULL, kCFNumberSInt32Type, &pid);
+        CFDictionarySetValue(matching, CFSTR(kUSBVendorID), vref);
+        CFDictionarySetValue(matching, CFSTR(kUSBProductID), pref);
+        CFRelease(vref);
+        CFRelease(pref);
+
+        io_iterator_t iter = IO_OBJECT_NULL;
+        if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) != KERN_SUCCESS) {
+            continue;
+        }
+        io_service_t s;
+        while ((s = IOIteratorNext(iter)) && n < max) {
+            out[n].identity    = &kEmuDevices[i];
+            out[n].location_id = service_number(s, CFSTR("locationID"));
+            service_string(s, CFSTR("USB Serial Number"), out[n].serial, sizeof out[n].serial);
+            n++;
+            IOObjectRelease(s);
+        }
+        IOObjectRelease(iter);
+    }
+    return n;
+}
+
+io_service_t emu_find_unit(uint16_t product_id, uint64_t location_id)
+{
+    CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBDeviceClassName);
+    if (!matching) return IO_OBJECT_NULL;
+    SInt32 vid = EMU_VENDOR_ID, pid = product_id;
+    CFNumberRef vref = CFNumberCreate(NULL, kCFNumberSInt32Type, &vid);
+    CFNumberRef pref = CFNumberCreate(NULL, kCFNumberSInt32Type, &pid);
+    CFDictionarySetValue(matching, CFSTR(kUSBVendorID), vref);
+    CFDictionarySetValue(matching, CFSTR(kUSBProductID), pref);
+    CFRelease(vref);
+    CFRelease(pref);
+
+    io_iterator_t iter = IO_OBJECT_NULL;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) != KERN_SUCCESS) {
+        return IO_OBJECT_NULL;
+    }
+    io_service_t s, found = IO_OBJECT_NULL;
+    while ((s = IOIteratorNext(iter))) {
+        if (!found && (location_id == 0 || service_number(s, CFSTR("locationID")) == location_id)) {
+            found = s;                      /* kept: the caller owns it */
+        } else {
+            IOObjectRelease(s);
+        }
+    }
+    IOObjectRelease(iter);
+    return found;
+}
+
 io_service_t emu_find_product(uint16_t product_id)
 {
     CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBDeviceClassName);

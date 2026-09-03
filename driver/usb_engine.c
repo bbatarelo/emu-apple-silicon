@@ -536,7 +536,13 @@ struct Engine {
     _Atomic uint64_t timeline_frames;
     _Atomic uint64_t timeline_host;
 
-    void (* _Atomic failure_handler)(void);
+    /* The physical unit this engine owns. product_id alone cannot tell two
+     * boxes of the same model apart, so the port is what it opens. */
+    uint16_t  unit_product_id;
+    uint64_t  unit_location_id;
+
+    void (* _Atomic failure_handler)(void*);
+    void* _Atomic failure_context;
     _Atomic bool stopping;
     _Atomic bool faulted;
 
@@ -707,11 +713,13 @@ static bool fault_should_fail(Engine* e)
 static Engine gTheEngine;
 static bool   gTheEngineTaken;
 
-EmuEngine* emu_engine_create(void)
+EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id)
 {
     if (gTheEngineTaken) return NULL;
     Engine* e = &gTheEngine;
     memset(e, 0, sizeof *e);
+    e->unit_product_id  = product_id;
+    e->unit_location_id = location_id;
     pthread_mutex_init(&e->lifecycle_lock, NULL);
     pthread_mutex_init(&e->stats_lock, NULL);
     pthread_mutex_init(&e->start_lock, NULL);
@@ -1011,9 +1019,10 @@ bool emu_engine_streaming(EmuEngine* e)
     return atomic_load_explicit(&e->streaming, memory_order_acquire);
 }
 
-void emu_engine_set_failure_handler(EmuEngine* e, void (*handler)(void))
+void emu_engine_set_failure_handler(EmuEngine* e, void (*handler)(void*), void* context)
 {
     if (!e) return;
+    atomic_store_explicit(&e->failure_context, context, memory_order_relaxed);
     atomic_store_explicit(&e->failure_handler, handler, memory_order_relaxed);
 }
 
@@ -1701,7 +1710,10 @@ static bool open_device(Engine* e)
     /* The watcher decides which product is published; this opens that one.
      * NULL means nothing is published, so nothing should be starting. */
     watch_identity();
-    e->identity = atomic_load_explicit(&gIdentity, memory_order_relaxed);
+    /* Its own unit, not the watcher's preferred product: with two boxes
+     * attached the preferred one is somebody else's. */
+    e->identity = e->unit_product_id ? emu_device_for_product(e->unit_product_id)
+                                     : atomic_load_explicit(&gIdentity, memory_order_relaxed);
     if (!e->identity) return false;
     /* Pinned before the open, not after. A sibling arriving in between may
      * move the identity; the refresh this queues moves it back, ordered
@@ -1709,7 +1721,9 @@ static bool open_device(Engine* e)
      * this device leaves, the lookup or the open fails and teardown unpins. */
     set_running_identity(e->identity);
 
-    e->service = emu_find_product(e->identity->product_id);
+    e->service = e->unit_location_id
+               ? emu_find_unit(e->identity->product_id, e->unit_location_id)
+               : emu_find_product(e->identity->product_id);
     if (!e->service) return false;
 
     IOCFPlugInInterface** plugin = NULL;
@@ -2391,9 +2405,10 @@ static void* engine_thread(void* arg)
     /* Last, and outside everything: the handler re-enters the plug-in, which
      * must not find the engine half torn down. */
     if (gave_up) {
-        void (*handler)(void) =
+        void (*handler)(void*) =
             atomic_load_explicit(&e->failure_handler, memory_order_relaxed);
-        if (handler) handler();
+        void* ctx = atomic_load_explicit(&e->failure_context, memory_order_relaxed);
+        if (handler) handler(ctx);
     }
     return NULL;
 }

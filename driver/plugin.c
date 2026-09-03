@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "usb_engine.h"
+#include "../shared/usb_util.h"
 #include "../shared/device.h"
 
 #define LOG_SUBSYSTEM "net.quantum-bit.EMUTrackerPre"
@@ -261,6 +262,9 @@ typedef struct {
     unsigned                 index;
     AudioObjectID            base;      /* first object ID of this device's block */
     const EmuDeviceIdentity* identity;
+    uint16_t                 unitProductID;
+    uint64_t                 unitLocationID;
+    char                     uid[160];
     EmuEngine* engine;
     _Atomic bool deviceAlive;
     Float64 sampleRate;
@@ -363,12 +367,10 @@ static void device_set_alive(Device* dev, bool alive)
 }
 
 /* Engine thread, once, when it has exhausted its rebuild attempts. */
-static void engine_failed(void)
+static void engine_failed(void* context)
 {
-    /* The engine's handler takes no context, so it can only mean the device
-     * this plug-in publishes. Stage 3 has to give the callback its engine, or
-     * two devices will report each other's failures. */
-    Device* dev = &gDevices[0];
+    Device* dev = (Device*)context;
+    if (!dev) return;
     EMU_LOG("USB engine gave up; the device is unusable until it returns");
     device_set_alive(dev, false);
 }
@@ -589,6 +591,22 @@ static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
     dev->outputSafetyUS = OUTPUT_SAFETY_DEFAULT_US;
     dev->timelineSeed = 1;
     atomic_init(&dev->deviceAlive, true);
+
+    /* Bind the slot to a physical unit. One device is still published, but it
+     * is now a *named* one: the engine opens that port rather than whichever
+     * box of that model the registry happens to return first. */
+    EmuUnit units[EMU_MAX_DEVICES];
+    unsigned found = emu_enumerate_units(units, EMU_MAX_DEVICES);
+    unsigned pick = 0;
+    for (unsigned u = 0; u < found; u++) {
+        if (units[u].identity->product_id == EMU_DEFAULT_PRODUCT_ID) { pick = u; break; }
+    }
+    if (found > 0) {
+        dev->identity       = units[pick].identity;
+        dev->unitProductID  = units[pick].identity->product_id;
+        dev->unitLocationID = units[pick].location_id;
+        snprintf(dev->uid, sizeof dev->uid, "%s.%s", DEVICE_UID, units[pick].serial);
+    }
     gDeviceCount = 1;
 
     (void)driver;
@@ -607,13 +625,13 @@ static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
         gHost = NULL;
         return kAudioHardwareUnspecifiedError;
     }
-    dev->engine = emu_engine_create();
+    dev->engine = emu_engine_create(dev->unitProductID, dev->unitLocationID);
     if (!dev->engine) {
         EMU_LOG("initialize failed: could not create the USB transport");
         gHost = NULL;
         return kAudioHardwareUnspecifiedError;
     }
-    emu_engine_set_failure_handler(dev->engine, engine_failed);
+    emu_engine_set_failure_handler(dev->engine, engine_failed, dev);
     if (emu_engine_device_attached()) {
         EMU_LOG("initialized, publishing %{public}s at %{public}.0f Hz",
                 emu_engine_device_name(), dev->sampleRate);

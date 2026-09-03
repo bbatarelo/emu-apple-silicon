@@ -165,7 +165,7 @@ bool emu_engine_set_identity_observer(void (*observer)(void));
  * usb_engine.c). */
 /* One handle per attached device. Stage 1 permits exactly one; create returns
  * NULL if one is already outstanding. */
-EmuEngine* emu_engine_create(void);
+EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id);
 void       emu_engine_destroy(EmuEngine* engine);
 
 bool     emu_engine_start(EmuEngine* engine, uint32_t sample_rate, uint32_t output_safety_us,
@@ -220,7 +220,9 @@ bool     emu_engine_streaming(EmuEngine* engine);
  * longer there. Runs with no locks held and must not call emu_engine_stop,
  * which would join the thread it is running on.
  */
-void     emu_engine_set_failure_handler(EmuEngine* engine, void (*handler)(void));
+void     emu_engine_set_failure_handler(EmuEngine* engine,
+                                        void (*handler)(void* context),
+                                        void* context);
 
 /*
  * Fault injection, so the recovery path can be exercised without unplugging
