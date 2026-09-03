@@ -154,6 +154,38 @@ four silences the whole stream: the device rejects a size it dislikes
 wholesale, with every transfer reported successful and every byte delivered.
 Nothing on the host can see the device discard audio.
 
+### A `bInterval 3` stream leaves the next stream corrupt
+
+Observed on @dnadlinger's development 0404 USB: after a stream at 176.4 or
+192 kHz, exactly one following stream is corrupt — a −12 dBFS tone returns
+near −38 dBFS with the peak pinned at 1.0000 and the *other* channel's tone
+stronger than the wanted one — and the stream after that is clean. It follows
+the 0.5 ms service interval, not the rate: a 96 kHz stream on its 0.5 ms
+alternate setting does the same, and 48 kHz is corrupted as readily as 96 when
+it runs after 192 kHz.
+
+| sequence | result |
+|---|---|
+| 48 → 192 → **96** → 96 → 96 | broken, clean, clean |
+| 48 → 192 → **48** → 48 → 48 | broken, clean, clean |
+| 48 → **96** → 96 → 96 | clean throughout |
+
+Only running a stream clears it; waiting ten seconds, or changing the rate in
+between, does not. The length word shows what it is: in the corrupt stream the
+word turns up two bytes into the packet instead of at its front, so the IN
+stream is shifted by two bytes — the shape of a stale partial packet left in
+the device's IN FIFO, which the next stream drains as misaligned data. It can
+outlast a short stream by a few seconds. Every fault counter reads zero
+throughout.
+
+For measuring anything at these rates: prime with two streams, not one, and
+when one rate is broken and the same rate is clean a moment later, look at what
+ran *before* the broken stream. Consecutive streams at 192 kHz alternate broken
+and clean, so a per-rate failure rate taken over consecutive runs measures this
+and nothing else.
+
+Whether every unit does this is not known.
+
 ---
 
 ## The 0404 USB
@@ -537,6 +569,7 @@ right bytes in the right place.
 | Sustained crackle after a stall, every clock counter healthy, cured by restart | A packet the bus never carried moved one timeline cursor and not the others; the shear is permanent |
 | One stall, three brief glitches spread over ~50 ms; `anchorJitterMaxNs` in the tens of ms, ring underruns with no HAL overload | The schedule rebuild paused the sample clock instead of skipping the dead bus time; the seed change made the HAL resynchronise, and the anchor jump landed inside the new seed |
 | 176.4/192 kHz only: right byte counts, the other channel's tone stronger than this one's, peak pinned at 1.0000 | Frames taken from the packet's first byte, 4 bytes before they start |
+| One rate broken and the same rate clean a moment later, no code or setting changed in between | The previous stream ran at `bInterval 3`; look at what came *before* the broken stream, not at the broken stream |
 
 Two general lessons:
 

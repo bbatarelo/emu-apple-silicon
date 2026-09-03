@@ -72,6 +72,35 @@ If the input meter never moves, check **System Settings → Privacy & Security �
 Microphone**. macOS requires permission for audio input, and that is separate
 from whether the driver works.
 
+```bash
+make loopback
+```
+
+With a cable from the outputs back to the inputs, this closes the loop: it
+plays a known signal, records what comes back, and says whether the two agree.
+That is the only check here that can catch the failure this driver keeps
+producing — right byte counts, no errors, wrong audio. It reports whether the
+tone came back on the right channel, whether a single frame moved over the run,
+and what the round trip actually measures against what the driver declares.
+
+```bash
+build/bin/hal-loopback smoke        # a tone goes out and comes back
+build/bin/hal-loopback glitches     # a long tone: level, phase, splices, drift
+build/bin/hal-loopback latency      # round trip by chirp
+build/bin/hal-loopback sweep        # the glitch test at every rate
+build/bin/hal-loopback selftest     # the analysers themselves; no hardware
+```
+
+`make loopback` runs at whatever sample rate the device is set to. To test
+another rate, set it first — in Audio MIDI Setup, or by passing `-r <hz>` to
+`hal-loopback`, which sets it before the run — or use `sweep`, which does the
+glitch test at every rate the device offers.
+
+Set the input gain so the returned tone does not clip; the tests report the
+level they saw. On @dnadlinger's development machine a stream at 176.4 or
+192 kHz leaves the *next* stream corrupt whatever rate it runs at — see
+`docs/FINDINGS.md` before reading a run at those rates.
+
 ---
 
 ## Which devices?

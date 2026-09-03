@@ -29,7 +29,7 @@ and opens USB directly, so there is no helper daemon and no IPC.
 | `driver/` | The HAL plug-in. This is the product. |
 | `shared/` | Device identity and IOKit helpers, used by the driver and the tools |
 | `rust/emu-ca0189/` | Descriptor parser, protocol model, feedback queue, clock estimator |
-| `tools/` | `emu-probe` (USB diagnostics), `hal-check` (device inspector), `hal-record` (capture verifier), `hal-trace` (stream-start timeline) |
+| `tools/` | `emu-probe` (USB diagnostics), `hal-check` (device inspector), `hal-record` (capture verifier), `hal-trace` (stream-start timeline), `hal-loopback` (closes the loop with a cable) |
 | `captures/` | Descriptor and packet-trace fixtures, replayed by the tests |
 | `driverkit/` | An unfinished DriverKit version, parked |
 
