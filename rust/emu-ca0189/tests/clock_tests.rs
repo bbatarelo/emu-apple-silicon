@@ -4,7 +4,9 @@
 //! Guidelines Milestone 3: "Use these captures to validate the feedback and
 //! clock-estimator model." These run with `cargo test` and need no hardware.
 
-use emu_ca0189::clock::{frames_in_packet, output_packet_bytes, ClockEstimator, FeedbackQueue};
+use emu_ca0189::clock::{
+    feedback_true_q16, frames_in_packet, output_packet_bytes, ClockEstimator, FeedbackQueue,
+};
 use emu_ca0189::types::{ByteCount, SampleFrames};
 
 const BYTES_PER_FRAME: u32 = 6; // 2 channels x 3 bytes, every alt setting
@@ -428,4 +430,269 @@ fn nominal_rate_is_exact_on_integer_rates() {
             assert_eq!(nominal.next().0, expect, "{rate} Hz should be constant");
         }
     }
+}
+
+// --- timestamp filter -------------------------------------------------------
+
+/// 2 ms in nanoseconds: the engine's request cadence, the filter's natural step.
+const STEP: u64 = 2_000_000;
+
+/// Deterministic stand-in for completion jitter: a fixed pattern of scheduling
+/// noise, mostly small with occasional millisecond-scale spikes, matching what
+/// the kext documented (0.01 ms USB jitter, rare 1-3 ms callback pulses).
+fn jitter(n: u64) -> i64 {
+    match n % 17 {
+        0 => 1_400_000, // a late callback
+        5 => 300_000,
+        11 => -80_000,
+        _ => ((n * 7919) % 20_000) as i64 - 10_000,
+    }
+}
+
+#[test]
+fn timestamp_filter_tracks_a_clean_clock_exactly() {
+    use emu_ca0189::clock::TimestampFilter;
+
+    let start = 1_000_000_000u64;
+    let mut f = TimestampFilter::new(start, STEP);
+    for n in 1..=5000u64 {
+        let out = f.filter(start + n * STEP);
+        let err = out as i64 - (start + n * STEP) as i64;
+        assert!(err.abs() < 1_000, "step {n}: filtered {err} ns from truth");
+    }
+    assert_eq!(f.resets(), 0);
+}
+
+#[test]
+fn timestamp_filter_suppresses_scheduling_jitter() {
+    use emu_ca0189::clock::TimestampFilter;
+
+    let start = 1_000_000_000u64;
+    let mut f = TimestampFilter::new(start, STEP);
+    let mut worst = 0i64;
+    for n in 1..=5000u64 {
+        let raw = (start + n * STEP) as i64 + jitter(n);
+        let out = f.filter(raw as u64);
+        let err = out as i64 - (start + n * STEP) as i64;
+        if n > 500 {
+            worst = worst.max(err.abs());
+        }
+    }
+    // Raw observations are up to 1.4 ms off the true clock; the filtered
+    // timeline must stay an order of magnitude closer.
+    assert!(worst < 140_000, "worst filtered error {worst} ns");
+    assert_eq!(f.resets(), 0);
+}
+
+#[test]
+fn timestamp_filter_converges_to_an_offset_rate() {
+    use emu_ca0189::clock::TimestampFilter;
+
+    // A device clock 100 ppm fast. The kext measured ~30 ppm on real hardware;
+    // 100 ppm is comfortably beyond anything a working crystal produces.
+    let start = 1_000_000_000u64;
+    let true_step = STEP + STEP / 10_000;
+    let mut f = TimestampFilter::new(start, STEP);
+    let mut last_in = 0i64;
+    let mut last_out = 0i64;
+    let (mut sum_err, mut count) = (0i64, 0i64);
+    for n in 1..=20_000u64 {
+        let raw = start + n * true_step;
+        let out = f.filter(raw) as i64;
+        if n > 10_000 {
+            sum_err += out - raw as i64;
+            count += 1;
+        }
+        last_in = raw as i64;
+        last_out = out;
+    }
+    // Converged: no growing lag, and the filtered clock sits on the true one.
+    assert!((last_out - last_in).abs() < 30_000, "lag {} ns", last_out - last_in);
+    assert!((sum_err / count).abs() < 30_000, "mean error {} ns", sum_err / count);
+    assert_eq!(f.resets(), 0);
+}
+
+#[test]
+fn timestamp_filter_snaps_on_discontinuity() {
+    use emu_ca0189::clock::TimestampFilter;
+
+    let start = 1_000_000_000u64;
+    let mut f = TimestampFilter::new(start, STEP);
+    for n in 1..=100u64 {
+        f.filter(start + n * STEP);
+    }
+    // A 200 ms hole, as a resync after a stall would produce: snap, not slew.
+    let jumped = start + 100 * STEP + 200_000_000;
+    let out = f.filter(jumped);
+    assert_eq!(out, jumped);
+    assert_eq!(f.resets(), 1);
+    // And the filter keeps tracking cleanly from the new position.
+    for n in 1..=100u64 {
+        let raw = jumped + n * STEP;
+        let err = f.filter(raw) as i64 - raw as i64;
+        assert!(err.abs() < 1_000, "post-reset step {n}: {err} ns off");
+    }
+}
+
+#[test]
+fn timestamp_filter_output_is_monotonic() {
+    use emu_ca0189::clock::TimestampFilter;
+
+    // Even fed hostile input -- stuck timestamps, bursts of catch-up -- the
+    // filtered timeline must never run backwards; Core Audio treats a
+    // regressing anchor as a fault.
+    let start = 1_000_000_000u64;
+    let mut f = TimestampFilter::new(start, STEP);
+    let mut prev = 0u64;
+    for n in 1..=2000u64 {
+        let raw = if n % 13 < 3 {
+            start + (n - n % 13) * STEP // a stalled observer: repeated values
+        } else {
+            start + n * STEP
+        };
+        let out = f.filter(raw);
+        assert!(out >= prev, "step {n}: {out} < {prev}");
+        prev = out;
+    }
+}
+
+#[test]
+fn timestamp_filter_snaps_on_a_stall_sized_gap() {
+    use emu_ca0189::clock::TimestampFilter;
+
+    // A 20 ms hole -- the size a stall-plus-resync actually leaves, and the
+    // range an earlier 50 ms threshold slewed through, which oscillated for
+    // seconds and crackled until stream restart. Must snap, first observation.
+    let start = 1_000_000_000u64;
+    let mut f = TimestampFilter::new(start, STEP);
+    for n in 1..=200u64 {
+        f.filter(start + n * STEP);
+    }
+    let jumped = start + 200 * STEP + 20_000_000;
+    assert_eq!(f.filter(jumped), jumped);
+    assert_eq!(f.resets(), 1);
+    for n in 1..=200u64 {
+        let raw = jumped + n * STEP;
+        let err = f.filter(raw) as i64 - raw as i64;
+        assert!(err.abs() < 1_000, "post-snap step {n}: {err} ns off");
+    }
+}
+
+#[test]
+fn timestamp_filter_rebase_crosses_a_known_gap_without_resetting() {
+    use emu_ca0189::clock::TimestampFilter;
+
+    // A device 300 ppm fast, long enough for the filter to have learned it.
+    const STEP: u64 = 48_000;
+    let true_step = STEP as f64 * (1.0 - 300e-6);
+    let start = 1_000_000u64;
+    let mut f = TimestampFilter::new(start, STEP);
+    let mut t = start as f64;
+    let mut n = 0u64;
+    let mut last_out = 0u64;
+    while n < 4000 {
+        n += 1;
+        t += true_step;
+        last_out = f.filter(t.round() as u64);
+    }
+    assert_eq!(f.resets(), 0);
+    // Learned: output tracks the fast clock, not the nominal one.
+    let nominal_here = start as f64 + n as f64 * STEP as f64;
+    assert!((nominal_here - last_out as f64) > 100.0 * STEP as f64 * 300e-6);
+
+    // A 30-step hole in the observations (a stall and a rebuilt schedule),
+    // announced to the filter: the next observation lands exactly where the
+    // caller said it would.
+    t += 30.0 * true_step;
+    let expected_next = t.round() as u64;
+    f.rebase(expected_next);
+    let out = f.filter(expected_next);
+    assert_eq!(f.resets(), 0, "a rebase must not count as a reset");
+    assert_eq!(out, expected_next);
+
+    // And the learned rate is intact: a further run stays within a few ticks
+    // of the raw clock, which a filter re-seeded with the nominal step would
+    // take hundreds of observations to manage.
+    for _ in 0..50 {
+        t += true_step;
+        let raw = t.round() as u64;
+        let out = f.filter(raw);
+        let err = (out as f64 - raw as f64).abs();
+        assert!(err < 4.0, "drifted {err} ticks from raw after rebase");
+    }
+    assert_eq!(f.resets(), 0);
+}
+
+/// Every rate and service interval the device publishes, with the raw feedback
+/// word read from the hardware at each. Corrected, all ten must land on the
+/// nominal frames-per-interval they claim to describe.
+///
+/// The 48 kHz family has no fraction and must come back untouched; the 44.1
+/// family is the whole point, being 53.1 ppm low as sent.
+#[test]
+fn corrects_the_feedback_scaling_at_every_published_rate() {
+    // (rate, interval in microframes, raw word, nominal frames per interval)
+    let rows: &[(u32, u32, u32, f64)] = &[
+        (44_100, 8, 0x002c_1900, 44.1),
+        (44_100, 4, 0x0016_0c80, 22.05),
+        (48_000, 8, 0x0030_0000, 48.0),
+        (48_000, 4, 0x0018_0000, 24.0),
+        (88_200, 8, 0x0058_3200, 88.2),
+        (88_200, 4, 0x002c_1900, 44.1),
+        (96_000, 8, 0x0060_0000, 96.0),
+        (96_000, 4, 0x0030_0000, 48.0),
+        (176_400, 4, 0x0058_3200, 88.2),
+        (192_000, 4, 0x0060_0000, 96.0),
+    ];
+
+    for &(rate, microframes, raw, nominal) in rows {
+        let corrected = feedback_true_q16(raw) as f64 / 65536.0;
+        let error_ppm = (corrected - nominal) / nominal * 1e6;
+        assert!(
+            error_ppm.abs() < 1.0,
+            "{rate} Hz on {microframes} microframes: {raw:#010x} corrected to \
+             {corrected} frames, wanted {nominal} ({error_ppm:.1} ppm off)"
+        );
+
+        // And the uncorrected value is wrong by the documented amount, so a
+        // regression that stopped correcting could not pass quietly.
+        let raw_ppm = (raw as f64 / 65536.0 - nominal) / nominal * 1e6;
+        if raw & 0xffff == 0 {
+            assert_eq!(feedback_true_q16(raw), raw, "integer rates must pass through");
+        } else {
+            assert!(
+                (raw_ppm + 53.1).abs() < 0.5,
+                "{rate} Hz: raw word should read -53.1 ppm, read {raw_ppm:.1}"
+            );
+        }
+    }
+}
+
+/// The device's deviation from nominal has to survive the correction --
+/// otherwise the planner would follow a constant and not a servo.
+///
+/// It also fixes the size of that deviation, which the raw word misstates. The
+/// hardware's excursion at 192 kHz is one raw step of 0x1000, which reads as
+/// 1/16 of a frame and is really 4096/64000 = 0.064 frames. Anything quoting
+/// 0.0625 is quoting the firmware's arithmetic rather than the device.
+#[test]
+fn the_correction_preserves_the_devices_own_deviation() {
+    let nominal = 0x0060_0000u32; // 96.0000 at 192 kHz, no fraction
+    let low = nominal - 0x1000; // reads as 95.9375; means 95.9600
+
+    let corrected = feedback_true_q16(low) as f64 / 65536.0;
+    assert!(
+        (corrected - 95.96).abs() < 0.001,
+        "one raw step should be 0.064 frames, got {corrected}"
+    );
+    assert!(corrected < 96.0, "an excursion below nominal must stay below");
+    assert_eq!(feedback_true_q16(nominal), nominal, "nominal must not move");
+}
+
+/// A fraction the model cannot have produced is passed through rather than
+/// scaled into something larger and wronger.
+#[test]
+fn refuses_to_correct_what_the_model_cannot_explain() {
+    let impossible = 0x0060_0000 | 0xfa00; // fraction at the scale itself
+    assert_eq!(feedback_true_q16(impossible), impossible);
 }

@@ -201,6 +201,15 @@ pub unsafe extern "C" fn emu_feedback_set_nominal(
     }
 }
 
+/// Corrects the fixed-point scaling of a raw feedback word from endpoint 0x81.
+///
+/// Pure: no state, safe to call from anywhere. See `clock::feedback_true_q16`
+/// for why the device's value needs correcting and how that was established.
+#[no_mangle]
+pub extern "C" fn emu_feedback_true_q16(reported: u32) -> u32 {
+    crate::clock::feedback_true_q16(reported)
+}
+
 /// Records the sample frames observed on one capture service interval.
 ///
 /// # Safety
@@ -255,6 +264,97 @@ pub unsafe extern "C" fn emu_feedback_overflows(fb: *mut EmuFeedback) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn emu_feedback_starved(fb: *mut EmuFeedback) -> u32 {
     feedback(fb).map_or(0, |fb| fb.starved)
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp filtering: smooths the completion timestamps that anchor Core
+// Audio's timeline. Same caller-provided-storage pattern as EmuFeedback.
+// ---------------------------------------------------------------------------
+
+use crate::clock::TimestampFilter;
+
+/// Opaque to C. Caller provides the storage, so nothing here allocates.
+#[repr(C)]
+pub struct EmuTsFilter {
+    magic: u32,
+    filter: TimestampFilter,
+}
+
+const EMU_TS_FILTER_MAGIC: u32 = 0x5453_464c; // "TSFL"
+
+#[no_mangle]
+pub extern "C" fn emu_ts_filter_size() -> u32 {
+    core::mem::size_of::<EmuTsFilter>() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn emu_ts_filter_align() -> u32 {
+    core::mem::align_of::<EmuTsFilter>() as u32
+}
+
+/// Initializes caller-provided storage in place. `start` is the timestamp the
+/// stream is expected to begin at; `nominal_step` the expected spacing of
+/// observations, in the same unit.
+///
+/// # Safety
+/// `storage` must point to at least `emu_ts_filter_size()` writable, suitably
+/// aligned bytes.
+#[no_mangle]
+pub unsafe extern "C" fn emu_ts_filter_init(
+    storage: *mut u8,
+    start: u64,
+    nominal_step: u64,
+) -> *mut EmuTsFilter {
+    if storage.is_null() || (storage as usize) % core::mem::align_of::<EmuTsFilter>() != 0 {
+        return core::ptr::null_mut();
+    }
+    let p = storage as *mut EmuTsFilter;
+    p.write(EmuTsFilter {
+        magic: EMU_TS_FILTER_MAGIC,
+        filter: TimestampFilter::new(start, nominal_step),
+    });
+    p
+}
+
+/// Feeds one raw timestamp, returns the filtered one. Returns `raw` unchanged
+/// if `f` is not a valid filter.
+///
+/// # Safety
+/// `f` must come from `emu_ts_filter_init`.
+#[no_mangle]
+pub unsafe extern "C" fn emu_ts_filter_apply(f: *mut EmuTsFilter, raw: u64) -> u64 {
+    match f.as_mut() {
+        Some(f) if f.magic == EMU_TS_FILTER_MAGIC => f.filter.filter(raw),
+        _ => raw,
+    }
+}
+
+/// Moves the filter's prediction to `expected_next` -- the raw timestamp the
+/// next observation is expected to carry -- keeping the rate it has learned.
+/// For a discontinuity the caller knows about in advance; see
+/// `TimestampFilter::rebase`.
+///
+/// # Safety
+/// `f` must come from `emu_ts_filter_init`.
+#[no_mangle]
+pub unsafe extern "C" fn emu_ts_filter_rebase(f: *mut EmuTsFilter, expected_next: u64) {
+    if let Some(f) = f.as_mut() {
+        if f.magic == EMU_TS_FILTER_MAGIC {
+            f.filter.rebase(expected_next);
+        }
+    }
+}
+
+/// How often the filter snapped to a discontinuity instead of slewing.
+///
+/// # Safety
+/// `f` must come from `emu_ts_filter_init`.
+#[no_mangle]
+pub unsafe extern "C" fn emu_ts_filter_resets(f: *mut EmuTsFilter) -> u32 {
+    match f.as_mut() {
+        Some(f) if f.magic == EMU_TS_FILTER_MAGIC => f.filter.resets(),
+        _ => 0,
+    }
 }
 
 /// Whole sample frames carried by a packet of `bytes`.

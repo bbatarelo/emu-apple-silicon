@@ -23,7 +23,7 @@ CFLAGS  := -std=c17 -Wall -Wextra -O2
 FRAMEWORKS := -framework CoreFoundation -framework CoreAudio -framework IOKit
 AUDIO_FRAMEWORKS := -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 
-.PHONY: all driver tools install uninstall check record test clean help
+.PHONY: all driver tools install uninstall check record loopback test clean help
 
 all: driver tools
 
@@ -53,7 +53,8 @@ $(BUNDLE): driver/*.c driver/*.h driver/Info.plist shared/*.c shared/*.h $(CORE_
 
 # --------------------------------------------------------------- the tools
 
-tools: $(BIN)/emu-probe $(BIN)/hal-check $(BIN)/hal-record $(BIN)/hal-trace
+tools: $(BIN)/emu-probe $(BIN)/hal-check $(BIN)/hal-record $(BIN)/hal-trace \
+       $(BIN)/hal-loopback
 
 $(BIN)/emu-probe: tools/emu-probe/*.c tools/emu-probe/*.h shared/*.c shared/*.h $(CORE_LIB)
 	@mkdir -p $(BIN)
@@ -72,6 +73,13 @@ $(BIN)/hal-record: tools/hal-record/main.c
 $(BIN)/hal-trace: tools/hal-trace/main.c
 	@mkdir -p $(BIN)
 	@clang $(CFLAGS) -o $@ $< -framework CoreAudio -framework CoreFoundation
+
+$(BIN)/hal-loopback: tools/hal-loopback/*.c tools/hal-loopback/*.h
+	@mkdir -p $(BIN)
+	@clang $(CFLAGS) -o $@ \
+	    tools/hal-loopback/main.c tools/hal-loopback/analysis.c \
+	    tools/hal-loopback/selftest.c \
+	    -framework CoreAudio -framework CoreFoundation
 
 # ------------------------------------------------------------------ install
 #
@@ -101,8 +109,17 @@ record: $(BIN)/hal-record
 	@echo
 	@echo "listen with: afplay $(BUILD)/recording.wav"
 
-test:
+# Needs a cable from the outputs back to the inputs, both channels, at a level
+# that does not clip. Everything else here can be checked without hardware;
+# this is the only thing that closes the loop. Runs at whatever sample rate the
+# device is set to; hal-loopback -r <hz> sets one first.
+loopback: $(BIN)/hal-loopback
+	@$(BIN)/hal-loopback -w $(BUILD)/loopback.wav
+
+test: $(BIN)/hal-loopback
 	@cd $(CORE) && cargo test
+	@echo
+	@$(BIN)/hal-loopback selftest
 
 clean:
 	rm -rf $(BUILD)

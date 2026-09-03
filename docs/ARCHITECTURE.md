@@ -7,7 +7,7 @@
         |
    driver/plugin.c             AudioServerPlugIn: device, streams, controls
         |
-   driver/ring.h               lock-free SPSC rings, both directions
+   driver/ring.h               lock-free timeline-indexed ring (capture side)
         |
    driver/usb_engine.c         its own thread and run loop
         |
@@ -29,7 +29,7 @@ and opens USB directly, so there is no helper daemon and no IPC.
 | `driver/` | The HAL plug-in. This is the product. |
 | `shared/` | Device identity and IOKit helpers, used by the driver and the tools |
 | `rust/emu-ca0189/` | Descriptor parser, protocol model, feedback queue, clock estimator |
-| `tools/` | `emu-probe` (USB diagnostics), `hal-check` (device inspector), `hal-record` (capture verifier) |
+| `tools/` | `emu-probe` (USB diagnostics), `hal-check` (device inspector), `hal-record` (capture verifier), `hal-trace` (stream-start timeline), `hal-loopback` (closes the loop with a cable) |
 | `captures/` | Descriptor and packet-trace fixtures, replayed by the tests |
 | `driverkit/` | An unfinished DriverKit version, parked |
 
@@ -59,38 +59,269 @@ Core Audio delivers fixed 512-frame buffers paced by the host clock. USB moves
 variable packets — 44 or 45 frames at 44.1 kHz — paced by the *device's* clock.
 The two never agree exactly.
 
-The rings absorb the difference; the timeline removes it.
-
-**The rings** (`driver/ring.h`) are single-producer single-consumer, lock-free,
-and count underruns and overruns rather than hiding them. Format conversion
-happens during the copy, since that side already touches every sample.
-
-Only the consumer may move the read index. Violating that produced audio that
-looked like full-scale noise — see FINDINGS.
+The timeline removes the disagreement; both directions are addressed by it.
 
 **The timeline** (`GetZeroTimeStamp`) anchors to frames the device has actually
-consumed, not to `mach_absolute_time`. The engine publishes a matched pair —
-frames consumed, and the host time that count was true — through a seqlock. Two
-plain atomics would let a frame count from one completion pair with a timestamp
-from the next, which is worse than no anchor at all.
+consumed, not to `mach_absolute_time`, and it exists before the first sample
+moves: the engine publishes the scheduled bus time of the first packet as the
+anchor for sample 0 *before* `StartIO` returns (which is why `StartIO` blocks
+through USB bring-up — it is off the IO path, and a slow start is the
+sanctioned kind). Every completed request then re-anchors from the frame
+list's hardware timestamps (`frTimeStamp`, stamped by the host controller, far
+steadier than callback timing) through a critically damped filter in the Rust
+core — the same mass-spring-damper the original EMUUSBAudio kext tuned on this
+hardware. The anchor is published as a matched pair — frames consumed, and the
+host time that count was true — through a seqlock. Two plain atomics would let
+a frame count from one completion pair with a timestamp from the next, which
+is worse than no anchor at all.
+
+The one discipline above all: **never splice timelines.** Handing out a
+host-clock guess first and switching to the device clock later, same seed,
+makes Core Audio absorb the discrepancy by stalling its IO thread for its
+length — an audible dropout ~0.3 s into every stream (FINDINGS has the
+measurement).
+
+The same discipline applies mid-stream, and there it is stricter: **the seed
+never changes.** When a scheduling stall outlasts the in-flight window the
+request queue goes stale and the engine rebuilds the bus schedule ahead of a
+fresh frame number. The bus frames between the end of the old schedule and the
+start of the new one carried no packets, but the device's clock ran through
+them all the same, so the engine accounts them as what they were: frames the
+device consumed while nothing reached it. Each direction's cursor skips exactly
+that many frames, the timestamp filter is rebased (it keeps the rate it has
+learned; only its prediction moves to the new schedule), completions still
+draining from the old schedule are muted by generation, and the (frames, host)
+pair Core Audio sees stays on the same straight line with a hole in the audio
+where the dropout was. That is what any DMA engine looks like when it
+underruns, and it is what the HAL's clock model is built for.
+
+Pausing the sample clock instead — cursors held, host time jumping — would
+need a new zero-timestamp seed, the HAL's mechanism for a genuinely new
+timeline, and the HAL answers a seed change by resynchronising its IO thread:
+a second glitch for every stall (FINDINGS has the measurement). `deadFrames`
+reports the dropout length of every rebuild.
+
+**The cursors keep bus time, not delivery.** `out_cursor`, `frames_played`
+and `in_cursor` all count sample frames per scheduled bus interval from the
+stream's first packet, and the safety offsets hold only while all three
+advance by the same amount for the same interval. The device's clock runs
+through an interval whether the packet in it was delivered, errored, arrived
+empty, or was never scheduled at all, so the completions count every
+interval: the planned frames for a playback entry the bus did not carry, a
+nominal packet of silence for a capture entry that brought nothing
+(`emptyCapture` counts these; a couple at every start is the ADC spinning up —
+the packet traces show two), and a rebuild counts the intervals no request
+covered. The one interval nobody counts is one that was never on the bus: a
+failed playback submission rolls its cursor advance back. Skipping any of
+these instead moves one cursor and not the others, and the offset never
+heals — every skipped packet takes its size out of the safety margin for the
+rest of the stream: persistent crackle with a perfectly healthy clock, cured
+only by a stream restart (FINDINGS).
+
+The filter itself snaps at 3 observation steps (~6 ms), because with hardware
+timestamps anything past that is a real schedule move, not jitter — a
+threshold wide enough to slew through a stall-sized gap puts the filter in
+its clamp regime, where the damping term has no input and the anchor
+oscillates for seconds (FINDINGS). A planned discontinuity (a rebuilt
+schedule) is rebased, not snapped, so `tsResets` counts only surprises.
+The `resyncs`, `deadFrames`, `tsResets` and
+`unfilledPlayback` counters exist to make the next such event legible — and
+the final counters of a session survive engine teardown, so a post-mortem
+`make check` reads evidence instead of zeros.
+
+**Everything is timeline-indexed, never a FIFO.** Output needs no staging at
+all — Core Audio writes into the USB request that carries the frames its IO
+cycle names, so the phase is the map. Capture does need a buffer, and
+`driver/ring.h` is one addressed the same way: the engine writes at the frame
+it just received, Core Audio reads at the sample time its cycle names
+(`slot = frame mod ring size`), and the consumer zeroes slots behind itself,
+so an unwritten slot reads silence and never a stale lap.
+
+The phase between producer and consumer is therefore a constant fixed by the
+published safety offset — not an accident of which side started first, which
+is what a FIFO makes it. This is how IOAudioFamily sample buffers and the
+original kext work, and it is what makes an underrun *one* glitch: an earlier
+FIFO here slipped its phase permanently on every dropped frame, which both
+grew latency without bound and was the mechanism behind the startup crackle.
+
+## Latency
+
+The driver's contribution is the output safety offset: how far ahead of the
+play head Core Audio must deliver samples. It is specified in microseconds and
+converted at the current rate (a fixed frame count would be wrong at every
+other rate), published per direction, and it is taken literally — it is the
+*only* budget on the output path, because only one thread is on that path.
+
+That is the kext's central latency trick, reproduced here. Its fill ran on
+coreaudiod's own IO thread (`clipOutputSamples` wrote straight into the USB
+buffer), so no second thread ever touched the audio and the offset covered
+only the IO thread's own jitter. Here **Core Audio's `WriteMix` converts
+directly into the submitted USB request buffers**.
+
+A request's frame list — packet count and sizes — must be fixed when the
+request is queued, and sizes do come from the feedback servo that far in
+advance (a rate servo does not mind the lag). The audio bytes do not: each
+request's buffer goes out zeroed, the engine publishes the slice of the
+timeline that request carries, and the IO thread converts into it afterwards.
+Low-latency buffers are what make this legal — shared, wired memory the
+controller reads at transmission time; `frTimeStamp` arriving in our frame
+lists is the same memory working the other way. Zeroing at submit is also the
+experiment's control: a USB stack that secretly snapshotted the buffer at
+submit would play exact silence, so late binding is verified the moment
+anything is audible at all. Verified on the 0404 USB.
+
+What makes the map cheap is that a request's byte layout is **linear in the
+timeline**. Entries are contiguous and `frReqCount` is the packet's real size
+(`emu_output_packet_bytes` is frames × bytesPerFrame and nothing else), so the
+offset of any frame the request covers is
+`(frame - data_frame_start) × bytesPerFrame`, and the whole map is three
+numbers per request: where its slice starts, where it ends, and the buffer.
+Variable packet sizes never enter it. It is published through a per-request
+seqlock as the request goes on the bus.
+
+The hazard staging did not have is recycling. A slot is reused at the far end
+of the schedule while the IO thread writes at `writeLead`, so the two are
+normally the schedule's margin apart and cannot meet; under a stall they can.
+The seqlock makes that a best-effort counted event (`bindRaces`) rather than
+unexplained noise — it cannot take the bytes back, but the damage is one packet
+inside a stretch that is already glitching. Its post-write check uses only a
+compiler barrier: a full store/load hardware fence on every normal request
+slice would cost more than the diagnostic is worth.
+
+Both hazards live or die on memory ordering, and the orderings are not the
+obvious ones. The writer bumps the sequence to odd with a *relaxed* store and
+a release **fence**, because a release store orders what precedes it and would
+let the memset and the new range float above the marker — a reader would then
+see a clean sequence over a half-rewritten entry, which is the exact tear the
+seqlock exists to catch.
+
+Teardown's stronger hazard is represented separately by one atomic gate: its
+high bit closes admission and its low bit records the single serialized
+`WriteMix` callback. The writer claims the gate with acquire semantics and
+leaves with release semantics; teardown sets the closed bit and waits for the
+writer bit to clear.
+Admission and closure therefore share one modification order, with no Dekker
+protocol and no sequentially consistent operations on the IO path. Teardown
+has no unsafe timeout: it never frees a low-latency buffer until the admitted
+writer has left.
+
+The default offset is 4 ms out, 5 ms in. The output value is tunable through
+the `SafetyOffsetMicroSec` custom property (`'emuS'`, `hal-check safety`), the
+same knob the original kext exposed. The engine takes the value at the next
+stream start; coreaudiod's published copy only follows a coreaudiod restart
+(FINDINGS), which `hal-check safety` makes visible. Reported presentation
+latency past the offset is the converter path, measured with a loopback cable:
+68 frames of converter group delay plus 4.23 ms of device buffering, split
+between the two directions (FINDINGS).
+
+**Where Core Audio actually writes is not the offset**, and this is what sizes
+the schedule. Measured across every IO buffer the HAL will grant,
+
+    writeLead ≈ 2 × bufferFrames + safetyOffset + ~208 frames
+
+— the HAL computes an IO cycle's output time one buffer period ahead of
+presentation and then hands over a buffer-length range, so the far end lands
+at offset + 2 × buffer; the residual is peak cycle jitter. A frame no
+submitted request covers has nowhere to go, so **the schedule must reach past
+that**. It is bounded, because the buffer size is not the client's to choose
+without limit: the HAL caps it at `min(4096, ZeroTimeStampPeriod × 3/8)`,
+which is this driver's own constant coming back (FINDINGS has the fit and
+three confirming predictions). So the depth is *derived*, not tuned —
+`schedule_depth()` computes it per session from the rate, the offset and
+`HAL_MAX_IO_BUFFER`. It is sized against the offset *ceiling*
+(`EMU_OUTPUT_SAFETY_MAX_US`, 20 ms) rather than the offset in force, because
+the lead depends on the offset **coreaudiod has cached** — which follows a
+coreaudiod restart and nothing else. Lower `'emuS'` at runtime and the HAL
+keeps writing at the old, larger offset; a schedule sized for the new value
+would be short by the difference and drop it silently. Sizing for the ceiling
+makes any cached value safe. `EMU_ZERO_TIMESTAMP_PERIOD` and
+`EMU_OUTPUT_SAFETY_MAX_US` both live in `usb_engine.h` rather than staying
+private to the plug-in precisely so these cannot drift apart, and
+`scheduleClamped` reports the case where `MAX_REQUESTS` truncates the answer
+anyway.
+
+Depth costs wired memory — ~120 KB for both directions at 48 kHz, under half a
+megabyte at 192 kHz — and feedback-servo lag, which does not show:
+`frameDeficit` stayed flat at 0 over 30 s. It costs no latency at all, and it
+is what a scheduling stall must outlast before the schedule goes stale and has
+to be rebuilt (`resyncs`, `deadFrames`). A stall shorter than the offset is
+nothing; one shorter than the schedule is silence of exactly its excess
+(`unfilledPlayback` counts the requests, `outputUnderruns` the frames).
+
+The engine thread still declares its cadence via
+`THREAD_TIME_CONSTRAINT_POLICY` — it must keep the schedule ahead of the bus
+and re-anchor the clock every couple of milliseconds. The period is
+`REQUEST_MS`, and one arrival carries *both* directions' completions —
+capture and playback requests go into identical bus frames, so the pair lands
+together and shares the budget. The declared constraint is 1 ms rather than
+the 2 ms period on purpose: the kernel forces `computation` up to
+`constraint/2`, so declaring the period would reserve half a core every period
+instead of a quarter. What it no longer has to buy is data-path punctuality:
+nothing in a thread policy governs how promptly the USB stack delivers a
+completion, and with the audio bound by Core Audio itself that jitter is
+absorbed by schedule depth instead of by the offset. That is the whole reason
+the offset can be 4 ms rather than 10.
 
 ## Packet sizing
 
-Playback packet sizes come from the capture stream. Each capture service interval
-reports how many sample frames the device produced; that count sizes the next
-playback packet, through the feedback queue in the Rust core.
+Playback packet sizes come from the capture stream while it runs. Each capture
+service interval reports how many sample frames the device produced; that
+count sizes the next playback packet, through the feedback queue in the Rust
+core. It is a measurement rather than a report, it keeps the two directions'
+cursors advancing by the same amount for the same interval by construction,
+and it is what E-MU's original driver did.
 
-This is why **capture runs even when only playback is wanted** — it is how the
-driver measures what the hardware is doing. It is also what E-MU's original
-driver did.
+The explicit feedback endpoint (`0x81`) on the playback interface is read as
+well: Q16.16 sample frames per playback service interval, about thirty times a
+second, the device's own statement of the same demand. Its firmware scales the
+fractional part by 64000 where the format says 65536, so the whole 44.1 kHz
+family reads 53.1 ppm low; `emu_feedback_true_q16` corrects that before use
+(FINDINGS). It sizes playback only while capture is off. Then interface 2 is
+never claimed and stays at alternate setting 0, no IN transaction reaches the
+bus, and the endpoint is the only clock there is.
 
-There is an explicit feedback endpoint (`0x81`) on the playback interface which
-this driver does not currently use.
+Whether capture is opened is the input mode (`'emuI'`, `hal-check input`):
+
+| mode | capture |
+|---|---|
+| `on` (default) | always |
+| `auto` | on below 176.4 kHz, off at and above it |
+| `off` | never |
+
+It exists because on some setups — @dnadlinger's development machine among
+them, though not every unit reported — duplex at 176.4 and 192 kHz drops about
+one playback packet a second while IN transactions are on the bus, and
+playback without capture does not (FINDINGS). `on` is the default because an
+interface that records is what this hardware is, and one that silently stopped
+recording at two of its six rates would surprise someone worse than a known,
+documented fault. `auto` and `off` are the opt-in workaround; the cost is the
+entire input direction at the affected rates.
+
+While capture is off, **the device stops having an input direction**: no stream
+in the input scope, no input channels, `kAudioStreamPropertyIsActive` false,
+with a change notification on every transition — including the ones a rate
+change causes under `auto`. A stream that is merely inactive is not enough:
+nothing in Audio MIDI Setup surfaces it, and a recording application just reads
+zeroes, which looks like a hardware fault. The policy decides against the
+*requested* rate, because the HAL defers `PerformDeviceConfigurationChange`
+while no IO is running — sometimes until the next stream starts — and until
+then the plug-in's own rate still holds the old value, which is exactly when
+someone is looking at Audio MIDI Setup.
+
+The mode is read once per `StartIO`. Changing it under a running stream goes
+through `RequestDeviceConfigurationChange`, the path a rate change takes:
+claiming or releasing an interface rebuilds the schedule, which is a dropout on
+the output side, so the HAL stops IO and starts it again and the switch falls
+between two clean streams.
+
+None of this touches the timeline, which anchors to frames the device has
+consumed on the *playback* side.
 
 ## The USB engine
 
 `driver/usb_engine.c` runs on its own thread with its own run loop. `StartIO`
-creates it, `StopIO` joins it — outside the state lock, since holding a lock
+creates it and blocks until the streams are scheduled and the timeline anchor
+is published; `StopIO` joins it — outside the state lock, since holding a lock
 across a thread join invites deadlock.
 
 Before any of that, the engine's one standing job is knowing whether a device
@@ -123,6 +354,13 @@ published. There is deliberately no look-the-device-up-once fallback. It would
 degrade to exactly the stale-device behaviour the watch exists to fix, under
 conditions nobody could reproduce, without a word in the log.
 
+Each direction keeps `num_requests` requests of `REQUEST_MS` (2 ms) in flight
+— between `MIN_REQUESTS` (16) and `MAX_REQUESTS` (128), derived per session by
+`schedule_depth()`; see Latency above. The request length sets the completion
+cadence; the count sets how far ahead Core Audio may write and how long a stall
+the schedule survives. The feedback endpoint has a shallow schedule of its own
+(`FB_REQUESTS`) on its own `bInterval`.
+
 It uses **low-latency isochronous transfers**. The classic API delivers one
 frame-list entry per USB frame, which silently halves the audio on the
 `bInterval 3` endpoints used at 176.4 and 192 kHz. Buffers come from
@@ -139,7 +377,7 @@ process to attach to, and log queries proved unreliable while developing it.
 
 Instead the driver publishes counters through a declared custom property, and
 `hal-check` enumerates whatever it finds rather than a list kept client-side.
-Frames played and captured, ring depths, underruns, overruns, USB errors,
+Frames played, captured and bound, the output lead, underruns, USB errors,
 feedback starvation.
 
 This is not scaffolding. Every misalignment bug in this project produced correct

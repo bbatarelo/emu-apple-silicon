@@ -1,8 +1,8 @@
 /*
  * USB engine for the HAL plug-in.
  *
- * The duplex transport proven in Milestone 4, with the tone generator replaced
- * by a ring that Core Audio fills. Everything load-bearing is unchanged and was
+ * The duplex transport proven in Milestone 4, joined to Core Audio through
+ * timeline-indexed rings. Everything load-bearing about the transport was
  * established the hard way:
  *
  *   - low-latency isochronous transfers, because the classic API delivers one
@@ -13,6 +13,43 @@
  *     is selected, because a mismatch wedges the device until it is replugged
  *   - capture as the clock reference, sizing playback packets through the
  *     feedback queue in the Rust core
+ *
+ * The shape of the transport follows from the two budgets Core Audio's model
+ * leaves to a driver, kept separate on purpose:
+ *
+ *   - Playback data is late-bound, and bound by Core Audio itself. A
+ *     request's frame list -- packet count and sizes -- is fixed when it is
+ *     submitted, but its buffer goes out zeroed; the engine publishes the
+ *     slice of the timeline that request carries, and WriteMix converts the
+ *     audio straight into it on Core Audio's own IO thread. Low-latency
+ *     buffers are what make that legal: shared, wired memory the controller
+ *     reads at transmission time (the kernel updating our frame lists in
+ *     place is the same memory working the other way). No engine thread sits
+ *     on the data path at all, so the safety offset buys tolerance for one
+ *     thread rather than two, and completion-delivery jitter -- which no
+ *     thread policy bounds -- is absorbed by schedule depth instead. This is
+ *     what the original kext did from clipOutputSamples. 'emuS' tunes the
+ *     offset; see bind_publish and write_output_bind.
+ *   - The frame lists are queued far deeper than the audio is written:
+ *     num_requests x REQUEST_MS of bus schedule in flight, which costs wired
+ *     memory and nothing in latency. A stall shorter than that is one silent
+ *     stretch and has no other consequence. Only a stall that outlasts it
+ *     leaves the schedule stale, and rebuilding the schedule is then a
+ *     dropout of known length on a clock that never stopped: the cursors
+ *     skip the dead bus time and the timeline stays continuous; see
+ *     reschedule().
+ *   - The engine thread runs under a time-constraint policy: it must keep
+ *     the schedule ahead of the bus and re-anchor the clock every couple of
+ *     milliseconds, and a default-priority thread's scheduling hiccups would
+ *     eventually stale the schedule.
+ *
+ * The timeline is the device's own and is never guessed: the anchor for
+ * sample 0 is the scheduled bus time of the first packet, published before
+ * emu_engine_start returns, and every completed request re-anchors it from the
+ * frame list's hardware timestamps through the Rust core's critically damped
+ * filter. Core Audio never sees a host-clock placeholder, so there is no
+ * splice when the real clock appears; a spliced timeline stalls coreaudiod's
+ * IO thread for the length of the discrepancy, an audible dropout (FINDINGS).
  */
 
 #include "usb_engine.h"
@@ -20,9 +57,15 @@
 #include "../shared/usb_util.h"
 #include "../shared/device.h"
 
+#include <errno.h>
+#include <mach/mach_init.h>
+#include <mach/mach_port.h>
 #include <mach/mach_time.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,10 +78,43 @@
 
 #include "../rust/emu-ca0189/include/emu_ca0189.h"
 
-#define NUM_REQUESTS  8
-#define REQUEST_MS    8
+/* Requests in flight per direction: the depth of the bus schedule. It is what
+ * a scheduling stall has to outlast before the schedule goes stale and has to
+ * be rebuilt, and -- because Core Audio writes into the submitted buffers
+ * themselves -- it is also what bounds how far ahead Core Audio may write.
+ * A frame no submitted request covers has nowhere to go, so the schedule must
+ * reach past the write lead, which is not the safety offset but (FINDINGS)
+ *
+ *     writeLead ~ 2 x bufferFrames + safetyOffset + ~208 frames
+ *
+ * The running value is e->num_requests, computed per session by
+ * schedule_depth() from the rate, the offset and the largest buffer the HAL
+ * will grant. Deepening costs wired memory and feedback-servo lag, not
+ * latency. MAX_REQUESTS is well clear of the worst combination as the
+ * constants stand: 87 at 44.1 kHz against the 20 ms offset ceiling. */
+#define MAX_REQUESTS     128
+#define MIN_REQUESTS     16
+
+/* The largest IO buffer the HAL will hand a client on this device. Not a
+ * Core Audio constant: it follows from the zero-timestamp period the plug-in
+ * publishes (see EMU_ZERO_TIMESTAMP_PERIOD), so it is derived here rather
+ * than measured and pasted. */
+#define HAL_MAX_IO_BUFFER  (EMU_ZERO_TIMESTAMP_PERIOD * 3u / 8u > 4096u \
+                            ? 4096u : EMU_ZERO_TIMESTAMP_PERIOD * 3u / 8u)
+/* The residual in the write-lead law below: peak IO-cycle jitter, measured at
+ * ~208 frames and rounded up. */
+#define WRITE_LEAD_SLACK   256u
+/* One request's span, in bus frames (ms). Also the completion cadence, which
+ * sets how finely the schedule advances and how often the clock re-anchors. */
+#define REQUEST_MS    2
 #define MAX_ENTRIES   (REQUEST_MS * 8)
-#define SCHEDULE_MARGIN 16
+/* Requests kept in flight on the explicit feedback endpoint. Its value moves
+ * every 32 ms, so this is about keeping the pipe fed, not about latency. */
+#define FB_REQUESTS   4
+/* How far ahead of the bus clock a schedule begins, at engine start and after
+ * a rebuild. The stack needs the first frame to lie in the future; after a
+ * rebuild every millisecond here is dead air, so it is small. */
+#define SCHEDULE_LEAD_MS 4
 
 /* --- which device the plug-in is speaking for -----------------------------
  *
@@ -267,6 +343,19 @@ typedef struct {
     void*                      buffer;
     IOUSBLowLatencyIsocFrame*  frames;
     uint64_t                   frame_start;
+
+    /* The timeline allocation made at submit -- which frames this request
+     * carries, and in which packet sizes. Published to the IO thread as this
+     * request's slice of the map; entry_frames also drives the frames-played
+     * accounting at completion, for entries the bus never carried. */
+    uint64_t                   data_frame_start;
+    uint64_t                   data_frame_end;
+    uint32_t                   entry_frames[MAX_ENTRIES];
+
+    /* Which playback schedule this request was submitted into. After a
+     * rebuild, completions still draining from the old schedule carry
+     * timestamps the rebased filter must not see; their frames still count. */
+    uint64_t                   generation;
 } Request;
 
 struct Engine {
@@ -278,39 +367,379 @@ struct Engine {
 
     uint8_t  in_pipe, out_pipe;
     uint16_t in_max, out_max;
+
+    /* The explicit feedback endpoint on the playback interface. It keeps its
+     * own bInterval -- 4 on this hardware, one entry per millisecond, even at
+     * the rates whose data endpoint is serviced twice as often -- so it is
+     * queued on its own geometry rather than the data pipe's. Zero when the
+     * device has none, in which case nothing below runs. */
+    uint8_t  fb_pipe;
+    uint16_t fb_max;
+    uint8_t  fb_interval;
+    uint32_t fb_entries_per_request;
+    uint32_t fb_num_requests;
+    uint64_t next_fb_frame;
+    /* Q16.16 residue of the device-sourced planner, engine thread only. */
+    uint32_t fb_residue_q16;
+    /* What the rate and the service interval say a packet should hold, Q16.16
+     * and exact: the fractional rates cannot be checked against a truncated
+     * integer. Also the centre of the band a feedback value must land in. */
+    uint32_t fb_nominal_q16;
     uint32_t bytes_per_frame;
     uint32_t entries_per_ms;
     uint32_t entries_per_request;
     uint32_t nominal_frames;
+    uint32_t sample_rate;
+    uint64_t ticks_per_ms;
+
 
     uint64_t next_in_frame, next_out_frame;
-    Request  in_requests[NUM_REQUESTS];
-    Request  out_requests[NUM_REQUESTS];
+    Request  in_requests[MAX_REQUESTS];
+    Request  out_requests[MAX_REQUESTS];
+    /* Four milliseconds of feedback in flight is ample for a value that
+     * changes every thirty-two, and it keeps the endpoint off the schedule
+     * depth the data pipes need. */
+    Request  fb_requests[FB_REQUESTS];
+    /* Requests actually allocated and kept in flight this session: see the
+     * MAX_REQUESTS block. Never changes while streaming. */
+    uint32_t num_requests;
+
+    /* Timeline cursors: the next frame index each stream will touch on the
+     * shared sample timeline. Output allocates its slice of the timeline here
+     * at submit time; capture writes the input ring here on completion. Both count from 0 at the
+     * scheduled stream start, which is what makes Core Audio's cycle sample
+     * times land on the same slots -- and both keep bus time, not delivery;
+     * see the note above the completions. */
+    uint64_t out_cursor;
+    uint64_t in_cursor;
 
     _Alignas(16) uint8_t feedback_storage[2048];
     EmuFeedback* feedback;
 
-    /* Frames the device has actually consumed. Core Audio's timeline is
-     * anchored to this rather than to the host clock, so the two cannot drift. */
+    _Alignas(16) uint8_t ts_filter_storage[256];
+    EmuTsFilter* ts_filter;
+
+    /* Frames the device has consumed: the planned size of every completed
+     * playback entry, carried or not, plus every frame of dead bus time a
+     * rebuild skipped. Core Audio's timeline is anchored to this rather than
+     * to the host clock, so the two cannot drift. */
     _Atomic uint64_t frames_played;
+    /* Frames the input ring has been written through, silence included;
+     * always equal to in_cursor. */
     _Atomic uint64_t frames_captured;
     _Atomic uint64_t usb_errors;
+    _Atomic uint64_t ts_fallbacks;
+    _Atomic uint64_t resyncs;
+    _Atomic uint64_t dead_frames;
+    _Atomic uint64_t unfilled_playback;
+    _Atomic uint64_t empty_capture;
+    /* Playback entries the bus reported good but did not carry in full. The
+     * completion side credits the planned size whatever happened, so a packet
+     * the controller skipped leaves the timeline straight, every other counter
+     * clean, and one packet of silence in the audio -- indistinguishable from
+     * the device discarding it, unless this is counted. */
+    _Atomic uint64_t short_playback;
+    bool             schedule_clamped;
 
-    volatile bool stopping;
+    /* Mirrors of counters owned by the Rust transport objects. Those objects
+     * belong exclusively to the engine thread; property/diagnostic threads
+     * read these publications instead of racing their mutable internals. */
+    _Atomic uint32_t feedback_starved;
+    _Atomic uint32_t feedback_overflows;
+    _Atomic uint32_t ts_resets;
+
+    /* Published feedback state. Written on the engine thread from the
+     * feedback completion, read by the diagnostics path. */
+    _Atomic uint64_t fb_packets;
+    _Atomic uint64_t fb_silent;
+    _Atomic uint64_t fb_errors;
+    _Atomic uint64_t fb_rejected;
+    _Atomic uint64_t fb_changes;
+    _Atomic uint32_t fb_value_q16;
+    _Atomic uint32_t fb_min_q16;
+    _Atomic uint32_t fb_max_q16;
+
+    /* Bumped whenever the playback schedule is rebuilt. Engine thread only. */
+    uint64_t generation;
+
+    /* Where the filter's reset count stood at the last counter reset,
+     * subtracted out so a measurement window starts from zero. */
+    _Atomic uint64_t ts_resets_zero;
+
+    /* A stop request carries no payload: relaxed atomic access is sufficient,
+     * and CFRunLoopStop supplies the wakeup when the request comes externally. */
+    _Atomic bool stopping;
     CFRunLoopRef  run_loop;
 };
 
 static Engine       gEngine;
-static EmuRing      gOutputRing;
 static EmuRing      gInputRing;
 static pthread_t    gThread;
-static volatile bool gRunning = false;
+static _Atomic bool  gRunning = false;
+/* StartIO/StopIO are control-thread calls, so serialize the complete
+ * create/join lifecycle and the reuse of the singleton Engine here. */
+static pthread_mutex_t gLifecycleLock = PTHREAD_MUTEX_INITIALIZER;
+static bool            gThreadJoinable;
+/* Diagnostics are control-path work. This protects the final snapshot and
+ * the singleton Engine's transition between sessions without ever entering
+ * the Core Audio IO path. Live counters themselves remain atomic. */
+static pthread_mutex_t gStatsLock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t     gSampleRate = 48000;
+static uint32_t     gOutputSafetyUS = 10000;
+/* Whether this session opens the capture interface at all.
+ *
+ * With capture open its packet lengths size the playback packets; without it
+ * the explicit feedback endpoint does (planner_next), so playback can run
+ * alone. That is the workaround for setups on which duplex at 176.4 and
+ * 192 kHz drops playback packets while IN transactions are on the bus
+ * (FINDINGS). The timeline is unaffected either way: it is anchored to
+ * frames_played, which playback completions maintain. */
+static bool         gWithInput = true;
 
-/* Written by whichever thread handles a volume change, read on the USB
- * completion path. Plain atomic load/store; no ordering is needed beyond not
- * tearing, since a gain that lands one packet late is inaudible. */
+/* Startup handshake: emu_engine_start blocks until the engine thread has the
+ * streams scheduled and the timeline anchor published, or has failed. */
+typedef enum { ENGINE_IDLE, ENGINE_STARTING, ENGINE_STREAMING, ENGINE_FAILED } EngineStartState;
+static pthread_mutex_t   gStartLock  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t    gStartCond  = PTHREAD_COND_INITIALIZER;
+static EngineStartState  gStartState = ENGINE_IDLE;
+
+/* Written by whichever thread handles a volume change, read on the USB fill
+ * path. Plain atomic load/store; no ordering is needed beyond not tearing,
+ * since a gain that lands one packet late is inaudible. */
 static _Atomic float gOutputGain = 1.0f;
+
+/* --- the bind map: the schedule, published to the IO thread ----------------
+ *
+ * How Core Audio reaches the USB buffers. Rather than staging the mix and
+ * having the engine thread convert it shortly before transmission, Core Audio
+ * converts straight into the USB request that will carry those frames --
+ * which is what the original kext did from clipOutputSamples, and why its
+ * offset could be ~1 ms: there was no second thread on the data path to be
+ * late.
+ *
+ * What makes it possible here is that a request's byte layout is *linear* in
+ * the timeline. Entries are contiguous and frReqCount is the packet's real
+ * size (emu_output_packet_bytes is frames x bytes_per_frame, nothing else), so
+ * for any frame the request covers,
+ *
+ *     byte offset = (frame - data_frame_start) x bytes_per_frame
+ *
+ * and the whole map is three numbers per request: where its slice of the
+ * timeline starts, where it ends, and the buffer. Variable packet sizes never
+ * enter it. That is the only reason this is a lookup and not a table of
+ * per-entry offsets that would have to be published in lockstep.
+ *
+ * The hazard is recycling. A slot is reused ~num_requests x REQUEST_MS
+ * after it last transmitted, for frames that far ahead of the play head, while
+ * the IO thread writes at most one buffer past the safety offset -- so in the
+ * steady state a writer and a resubmit are a dozen milliseconds apart on the
+ * timeline and cannot meet. Under a stall they can. A seqlock per slot makes
+ * that detectable rather than silent: the engine marks the slot odd before it
+ * touches anything, publishes and marks it even after the submission
+ * succeeded, and a writer whose sequence moved under it knows its bytes went
+ * into a buffer that now means something else. It cannot take them back --
+ * the damage is one packet inside a stretch that is already glitching -- but
+ * `bindRaces` says so, which is the whole difference between a known cost and
+ * an unexplained noise.
+ *
+ * Teardown is the hazard a staging buffer would not have had: these are freed
+ * while the IO thread may still be inside one. A single gate combines map
+ * liveness with its writer bit. Admission and closure therefore have one
+ * atomic modification order: the writer either enters before close and is
+ * waited for, or observes the closed bit and never touches a buffer.
+ */
+typedef struct {
+    /* Even: stable. Odd: the engine is rewriting this slot. */
+    _Atomic uint32_t seq;
+    _Atomic(uint8_t*) buffer;
+    _Atomic uint64_t  frame_start;
+    _Atomic uint64_t  frame_end;
+} BindSlot;
+
+static BindSlot         gBindMap[MAX_REQUESTS];
+/* How many slots of gBindMap are live, so the IO thread's lookup scans the
+ * schedule it actually has rather than the maximum it could have. */
+static _Atomic uint32_t gBindCount;
+/* Map liveness and writer ownership share one atomic modification order. */
+#define BIND_GATE_WRITING UINT32_C(1)
+#define BIND_GATE_CLOSED  (UINT32_C(1) << 31)
+static _Atomic uint32_t gBindGate = BIND_GATE_CLOSED;
+static _Atomic uint32_t gBindBytesPerFrame;
+/* The IO thread's own frontier: the first frame it has not written. The
+ * output lead and the unwritten-frame count are both measured against it. */
+static _Atomic uint64_t gBindFrontier;
+static _Atomic uint64_t gBindFrames;
+static _Atomic uint64_t gBindUnmapped;
+/* Of the unmapped, those past the far end of the queue: frames Core Audio
+ * wrote for bus time the engine has not scheduled yet. Tells the two failures
+ * apart -- a write horizon deeper than the schedule (this) from audio for an
+ * interval already written off (the rest). */
+static _Atomic uint64_t gBindUnmappedAhead;
+/* How far ahead of the play head Core Audio's writes actually reach, in
+ * frames -- the high-water mark of (cycle end - frames played). This is the
+ * number that sets how deep the request queue has to be for the direct path:
+ * a map of submitted requests has no buffer at all for a frame no request
+ * covers, so the schedule has to reach past where Core Audio writes. Nothing else in the driver knows it, because nothing else
+ * needed to. */
+static _Atomic uint64_t gBindWriteLead;
+static _Atomic uint64_t gBindRaces;
+static _Atomic uint64_t gBindMissing;         /* frames that transmitted unwritten */
+
+static void bind_reset(void)
+{
+    /* The preceding teardown drained the admitted writer. Keep admission
+     * closed until the new session's complete map has been published. */
+    atomic_store_explicit(&gBindGate, BIND_GATE_CLOSED, memory_order_relaxed);
+    atomic_store_explicit(&gBindCount, 0, memory_order_relaxed);
+    for (int i = 0; i < MAX_REQUESTS; i++) {
+        atomic_store_explicit(&gBindMap[i].seq, 0, memory_order_relaxed);
+        atomic_store_explicit(&gBindMap[i].buffer, NULL, memory_order_relaxed);
+        atomic_store_explicit(&gBindMap[i].frame_start, 0, memory_order_relaxed);
+        atomic_store_explicit(&gBindMap[i].frame_end, 0, memory_order_relaxed);
+    }
+    atomic_store_explicit(&gBindFrontier, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindFrames, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindUnmapped, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindUnmappedAhead, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindWriteLead, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindRaces, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindMissing, 0, memory_order_relaxed);
+}
+
+/* Engine thread: this slot no longer describes anything a writer may touch.
+ *
+ * The fence is load-bearing and easy to lose. A release *store* orders what
+ * came before it, not what comes after -- so without the fence the memset and
+ * the new range in submit_playback may become visible ahead of the odd
+ * marker, and a writer would see a clean sequence over a half-rewritten
+ * entry: exactly the tear the seqlock exists to prevent, reported as no race
+ * at all. This is the Linux write_seqlock shape: bump, then smp_wmb. */
+static void bind_retire(size_t idx)
+{
+    uint32_t seq = atomic_load_explicit(&gBindMap[idx].seq, memory_order_relaxed);
+    if (seq & 1u) return;
+    atomic_store_explicit(&gBindMap[idx].seq, seq + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+}
+
+/* Engine thread: this request is on the bus and its buffer is zeroed; here is
+ * the slice of the timeline it carries. */
+static void bind_publish(size_t idx, uint8_t* buffer, uint64_t start, uint64_t end)
+{
+    BindSlot* s = &gBindMap[idx];
+    uint32_t seq = atomic_load_explicit(&s->seq, memory_order_relaxed);
+    if (!(seq & 1u)) {                       /* retire first, always */
+        atomic_store_explicit(&s->seq, ++seq, memory_order_relaxed);
+        atomic_thread_fence(memory_order_release);   /* see bind_retire */
+    }
+    atomic_store_explicit(&s->buffer, buffer, memory_order_relaxed);
+    atomic_store_explicit(&s->frame_start, start, memory_order_relaxed);
+    atomic_store_explicit(&s->frame_end, end, memory_order_relaxed);
+    atomic_store_explicit(&s->seq, seq + 1, memory_order_release);
+}
+
+/*
+ * Core Audio's IO thread: convert this cycle's mix into whichever submitted
+ * requests carry it.
+ *
+ * The range spans several requests -- a 512-frame cycle is ~11 ms against a
+ * 2 ms request -- so this walks it in pieces. A frame no slot covers is not
+ * an error to hide: before the first request of a rebuilt schedule it is
+ * audio for bus time that has already been written off as dead (reschedule),
+ * and past the end of the queue it is a cycle further ahead than the driver
+ * has scheduled. Either way the frames have nowhere to go; they are counted
+ * and dropped, and the walk skips to the next slot that does begin ahead of
+ * here rather than probing frame by frame.
+ */
+static void write_output_bind(const float* src, uint32_t count, uint64_t pos)
+{
+    uint32_t bpf  = atomic_load_explicit(&gBindBytesPerFrame, memory_order_relaxed);
+    float    gain = atomic_load_explicit(&gOutputGain, memory_order_relaxed);
+    if (bpf == 0) return;
+
+    uint64_t played = atomic_load_explicit(&gEngine.frames_played, memory_order_relaxed);
+    if (pos + count > played) {
+        uint64_t lead = pos + count - played;
+        uint64_t seen = atomic_load_explicit(&gBindWriteLead, memory_order_relaxed);
+        if (lead > seen) atomic_store_explicit(&gBindWriteLead, lead, memory_order_relaxed);
+    }
+
+    /* Constant for the session. The outer gate keeps teardown/restart from
+     * changing the map while this callback is admitted, so load it once per
+     * IO cycle rather than once per request-sized slice. */
+    uint32_t slots = atomic_load_explicit(&gBindCount, memory_order_acquire);
+    uint64_t bound = 0, unmapped = 0, unmapped_ahead = 0, races = 0;
+    uint32_t done = 0;
+    while (done < count) {
+        uint64_t frame = pos + done;
+
+        int      hit = -1;
+        uint32_t seq0 = 0;
+        uint8_t* buffer = NULL;
+        uint64_t start = 0, end = 0, next_start = UINT64_MAX, queue_end = 0;
+
+        for (uint32_t i = 0; i < slots; i++) {
+            uint32_t s = atomic_load_explicit(&gBindMap[i].seq, memory_order_acquire);
+            if (s & 1u) continue;                      /* being rewritten */
+            uint64_t st = atomic_load_explicit(&gBindMap[i].frame_start, memory_order_relaxed);
+            uint64_t en = atomic_load_explicit(&gBindMap[i].frame_end, memory_order_relaxed);
+            if (frame >= st && frame < en) {
+                hit = i; seq0 = s; start = st; end = en;
+                buffer = atomic_load_explicit(&gBindMap[i].buffer, memory_order_relaxed);
+                break;
+            }
+            if (st > frame && st < next_start) next_start = st;
+            if (en > queue_end) queue_end = en;
+        }
+
+        if (hit < 0 || !buffer) {
+            uint64_t skip = count - done;
+            if (next_start != UINT64_MAX && next_start - frame < skip) skip = next_start - frame;
+            unmapped += skip;
+            if (frame >= queue_end) {
+                unmapped_ahead += skip;
+            }
+            done += (uint32_t)skip;
+            continue;
+        }
+
+        uint32_t n = (uint32_t)(end - frame);
+        if (n > count - done) n = count - done;
+
+        emu_pack_s24(buffer + (size_t)(frame - start) * bpf,
+                     src + (size_t)done * EMU_RING_CHANNELS, n, gain);
+
+        /* Recycled under us: the bytes just written belong to a slice of the
+         * timeline this request no longer carries. This is diagnostics only:
+         * in normal operation the schedule keeps the two accesses far apart;
+         * after a schedule-sized stall the surrounding interval is already a
+         * dropout. A compiler barrier keeps the check after the pack without
+         * putting a full hardware fence on every request slice. The CPU may
+         * still miss a pathological overlap, which is acceptable for a
+         * best-effort counter that has no bearing on recovery or safety. */
+        atomic_signal_fence(memory_order_seq_cst);
+        if (atomic_load_explicit(&gBindMap[hit].seq, memory_order_relaxed) != seq0) {
+            races++;
+        } else {
+            bound += n;
+        }
+        done += n;
+    }
+
+    uint64_t frontier = atomic_load_explicit(&gBindFrontier, memory_order_relaxed);
+    if (pos + count > frontier) {
+        atomic_store_explicit(&gBindFrontier, pos + count, memory_order_release);
+    }
+    /* Diagnostics are callback-granularity observations. Aggregate locally so
+     * the normal path performs one relaxed RMW, not one per 2 ms map slice. */
+    if (bound) atomic_fetch_add_explicit(&gBindFrames, bound, memory_order_relaxed);
+    if (unmapped)
+        atomic_fetch_add_explicit(&gBindUnmapped, unmapped, memory_order_relaxed);
+    if (unmapped_ahead)
+        atomic_fetch_add_explicit(&gBindUnmappedAhead, unmapped_ahead,
+                                  memory_order_relaxed);
+    if (races) atomic_fetch_add_explicit(&gBindRaces, races, memory_order_relaxed);
+}
 
 /*
  * The device's own clock, published as a matched pair: frames it has consumed,
@@ -324,28 +753,34 @@ static _Atomic float gOutputGain = 1.0f;
  * while a write is in progress, which on this path is a handful of nanoseconds.
  */
 static _Atomic uint32_t gTimelineSeq = 0;
-static uint64_t         gTimelineFrames = 0;
-static uint64_t         gTimelineHost = 0;
+static _Atomic uint64_t gTimelineFrames = 0;
+static _Atomic uint64_t gTimelineHost = 0;
 
 static void timeline_publish(uint64_t frames, uint64_t host_time)
 {
     uint32_t seq = atomic_load_explicit(&gTimelineSeq, memory_order_relaxed);
-    atomic_store_explicit(&gTimelineSeq, seq + 1, memory_order_release);  /* odd */
-    gTimelineFrames = frames;
-    gTimelineHost = host_time;
+    atomic_store_explicit(&gTimelineSeq, seq + 1, memory_order_relaxed);  /* odd */
+    /* A release store only orders earlier accesses. The fence keeps the new
+     * pair from becoming visible before readers see the odd marker. */
+    atomic_thread_fence(memory_order_release);
+    atomic_store_explicit(&gTimelineFrames, frames, memory_order_relaxed);
+    atomic_store_explicit(&gTimelineHost, host_time, memory_order_relaxed);
     atomic_store_explicit(&gTimelineSeq, seq + 2, memory_order_release);  /* even */
 }
 
 bool emu_engine_timeline(uint64_t* frames, uint64_t* host_time)
 {
-    if (!gRunning) return false;
+    if (!atomic_load_explicit(&gRunning, memory_order_acquire)) return false;
 
     for (int attempt = 0; attempt < 8; attempt++) {
         uint32_t before = atomic_load_explicit(&gTimelineSeq, memory_order_acquire);
         if (before & 1u) continue;                 /* write in progress */
-        uint64_t f = gTimelineFrames;
-        uint64_t h = gTimelineHost;
-        uint32_t after = atomic_load_explicit(&gTimelineSeq, memory_order_acquire);
+        uint64_t f = atomic_load_explicit(&gTimelineFrames, memory_order_relaxed);
+        uint64_t h = atomic_load_explicit(&gTimelineHost, memory_order_relaxed);
+        /* Keep both pair loads ahead of the validation load. This is the read
+         * side of the seqlock; an acquire load alone orders only what follows. */
+        atomic_thread_fence(memory_order_acquire);
+        uint32_t after = atomic_load_explicit(&gTimelineSeq, memory_order_relaxed);
         if (before == after) {
             if (h == 0) return false;              /* nothing published yet */
             *frames = f;
@@ -356,11 +791,31 @@ bool emu_engine_timeline(uint64_t* frames, uint64_t* host_time)
     return false;
 }
 
+/* AbsoluteTime is mach ticks split into two 32-bit halves in host order, so the
+ * union reassembles the counter exactly -- this is what UnsignedWideToUInt64
+ * does. Used for GetBusFrameNumber's timestamp and the frame list's
+ * frTimeStamp. */
+static uint64_t abs_to_ticks(AbsoluteTime t)
+{
+    union { AbsoluteTime at; uint64_t ticks; } u = { .at = t };
+    return u.ticks;
+}
+
 /* --- public surface -------------------------------------------------------- */
 
-void emu_engine_write_output(const float* frames, uint32_t count)
+void emu_engine_write_output(const float* frames, uint32_t count, uint64_t sample_pos)
 {
-    if (gRunning) emu_ring_write(&gOutputRing, frames, count);
+    /* Core Audio serializes this device's single WriteMix stream on one IO
+     * thread, so the low bit is ownership, not a general writer count. */
+    uint32_t expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &gBindGate, &expected, BIND_GATE_WRITING,
+            memory_order_acquire, memory_order_relaxed)) {
+        return;
+    }
+
+    write_output_bind(frames, count, sample_pos);
+    atomic_fetch_and_explicit(&gBindGate, ~BIND_GATE_WRITING, memory_order_release);
 }
 
 void emu_engine_set_output_gain(float gain)
@@ -370,10 +825,13 @@ void emu_engine_set_output_gain(float gain)
     atomic_store_explicit(&gOutputGain, gain, memory_order_relaxed);
 }
 
-void emu_engine_read_input(float* frames, uint32_t count)
+void emu_engine_read_input(float* frames, uint32_t count, uint64_t sample_pos)
 {
-    if (gRunning) {
-        emu_ring_read_f32(&gInputRing, frames, count);
+    /* gWithInput, not in_intf: this runs on the IO thread and must not follow
+     * engine pointers the engine thread owns. Nothing writes the ring in this
+     * mode, so reading it would only count underruns. */
+    if (atomic_load_explicit(&gRunning, memory_order_relaxed) && gWithInput) {
+        emu_ring_read_f32(&gInputRing, sample_pos, frames, count);
     } else {
         memset(frames, 0, (size_t)count * EMU_RING_CHANNELS * sizeof(float));
     }
@@ -384,7 +842,17 @@ uint64_t emu_engine_frames_played(void)
     return atomic_load_explicit(&gEngine.frames_played, memory_order_relaxed);
 }
 
-bool emu_engine_running(void) { return gRunning; }
+bool emu_engine_running(void)
+{
+    return atomic_load_explicit(&gRunning, memory_order_acquire);
+}
+
+/* The last session's counters, captured after teardown drains the IO writer
+ * and before the next start resets the engine. Without this, a post-mortem
+ * `make check` after a bad session reads all zeros -- exactly when the
+ * counters are wanted most. */
+static EmuEngineStats gFinalStats;
+static bool           gHaveFinalStats;
 
 /*
  * Zeroes the counters that only exist to be read.
@@ -395,33 +863,122 @@ bool emu_engine_running(void) { return gRunning; }
  */
 void emu_engine_reset_counters(void)
 {
-    atomic_store_explicit(&gOutputRing.underruns, 0, memory_order_relaxed);
-    atomic_store_explicit(&gOutputRing.overruns, 0, memory_order_relaxed);
-    atomic_store_explicit(&gInputRing.underruns, 0, memory_order_relaxed);
-    atomic_store_explicit(&gInputRing.overruns, 0, memory_order_relaxed);
+    pthread_mutex_lock(&gStatsLock);
+    atomic_store_explicit(&gInputRing.missing, 0, memory_order_relaxed);
+    atomic_store_explicit(&gInputRing.discarded, 0, memory_order_relaxed);
     atomic_store_explicit(&gEngine.usb_errors, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.ts_fallbacks, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.resyncs, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.dead_frames, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.unfilled_playback, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.empty_capture, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.short_playback, 0, memory_order_relaxed);
+    /* The extremes and the change count describe a window; the last value and
+     * the nominal describe the stream, and survive a reset. */
+    atomic_store_explicit(&gEngine.fb_packets, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.fb_silent, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.fb_errors, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.fb_rejected, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.fb_changes, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.fb_min_q16, 0, memory_order_relaxed);
+    atomic_store_explicit(&gEngine.fb_max_q16, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindFrames, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindUnmapped, 0, memory_order_relaxed);
+    /* Missing these two made `unmappedAhead` outlive its own superset, so a
+     * cleared window reported a strict subset larger than the whole -- and
+     * `unmappedAhead > 0` is exactly the "schedule too short" signal the
+     * diagnostics tell the reader to trust. */
+    atomic_store_explicit(&gBindUnmappedAhead, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindWriteLead, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindRaces, 0, memory_order_relaxed);
+    atomic_store_explicit(&gBindMissing, 0, memory_order_relaxed);
+    /* The filter is engine-thread-owned. Reset the diagnostic window from its
+     * atomically published mirror rather than reading the mutable Rust object
+     * concurrently. */
+    atomic_store_explicit(
+        &gEngine.ts_resets_zero,
+        atomic_load_explicit(&gEngine.ts_resets, memory_order_relaxed),
+        memory_order_relaxed);
+    /* Asking for zeros while stopped means the last session's snapshot too,
+     * otherwise stats would keep handing back the figures just cleared. */
+    gHaveFinalStats = false;
+    pthread_mutex_unlock(&gStatsLock);
 }
 
 void emu_engine_stats(EmuEngineStats* stats)
 {
     if (!stats) return;
+    pthread_mutex_lock(&gStatsLock);
+    if (!atomic_load_explicit(&gRunning, memory_order_acquire)) {
+        if (gHaveFinalStats) {
+            *stats = gFinalStats;
+        } else {
+            memset(stats, 0, sizeof *stats);
+        }
+        pthread_mutex_unlock(&gStatsLock);
+        return;
+    }
     stats->frames_played = emu_engine_frames_played();
-    stats->underruns  = atomic_load_explicit(&gOutputRing.underruns, memory_order_relaxed);
-    stats->overruns   = atomic_load_explicit(&gOutputRing.overruns, memory_order_relaxed);
     stats->usb_errors = atomic_load_explicit(&gEngine.usb_errors, memory_order_relaxed);
-    stats->ring_depth = emu_ring_filled(&gOutputRing);
-    stats->feedback_starved = gEngine.feedback ? emu_feedback_starved(gEngine.feedback) : 0;
+    stats->timestamp_fallbacks = atomic_load_explicit(&gEngine.ts_fallbacks, memory_order_relaxed);
+    uint64_t ts_resets = atomic_load_explicit(&gEngine.ts_resets, memory_order_relaxed);
+    uint64_t ts_resets_zero =
+        atomic_load_explicit(&gEngine.ts_resets_zero, memory_order_relaxed);
+    stats->timestamp_resets = ts_resets > ts_resets_zero
+        ? ts_resets - ts_resets_zero : 0;
+    stats->resyncs = atomic_load_explicit(&gEngine.resyncs, memory_order_relaxed);
+    stats->dead_frames = atomic_load_explicit(&gEngine.dead_frames, memory_order_relaxed);
+    stats->unfilled_playback = atomic_load_explicit(&gEngine.unfilled_playback, memory_order_relaxed);
+    stats->short_playback = atomic_load_explicit(&gEngine.short_playback, memory_order_relaxed);
+    stats->feedback_starved =
+        atomic_load_explicit(&gEngine.feedback_starved, memory_order_relaxed);
+    stats->feedback_overflows =
+        atomic_load_explicit(&gEngine.feedback_overflows, memory_order_relaxed);
 
+    stats->feedback_packets  = atomic_load_explicit(&gEngine.fb_packets, memory_order_relaxed);
+    stats->feedback_silent   = atomic_load_explicit(&gEngine.fb_silent, memory_order_relaxed);
+    stats->feedback_errors   = atomic_load_explicit(&gEngine.fb_errors, memory_order_relaxed);
+    stats->feedback_rejected = atomic_load_explicit(&gEngine.fb_rejected, memory_order_relaxed);
+    stats->feedback_changes  = atomic_load_explicit(&gEngine.fb_changes, memory_order_relaxed);
+    stats->feedback_q16      = atomic_load_explicit(&gEngine.fb_value_q16, memory_order_relaxed);
+    stats->feedback_min_q16  = atomic_load_explicit(&gEngine.fb_min_q16, memory_order_relaxed);
+    stats->feedback_max_q16  = atomic_load_explicit(&gEngine.fb_max_q16, memory_order_relaxed);
+    stats->feedback_nominal_q16 = gEngine.fb_nominal_q16;
+
+    /* How far Core Audio's writes lead the play head, and how many frames
+     * transmitted before it got to them: the two questions the output path
+     * has to answer, asked of the frontier the IO thread publishes. */
+    uint64_t frontier = atomic_load_explicit(&gBindFrontier, memory_order_acquire);
+    stats->output_lead     = frontier > stats->frames_played
+                           ? (uint32_t)(frontier - stats->frames_played) : 0;
+    stats->underruns       = atomic_load_explicit(&gBindMissing, memory_order_relaxed);
+    stats->frames_bound    = atomic_load_explicit(&gBindFrames, memory_order_relaxed);
+    stats->unmapped_frames = atomic_load_explicit(&gBindUnmapped, memory_order_relaxed);
+    stats->unmapped_ahead  = atomic_load_explicit(&gBindUnmappedAhead, memory_order_relaxed);
+    stats->write_lead_max  = atomic_load_explicit(&gBindWriteLead, memory_order_relaxed);
+    stats->bind_races      = atomic_load_explicit(&gBindRaces, memory_order_relaxed);
+    stats->schedule_requests = gEngine.num_requests;
+    stats->schedule_clamped  = gEngine.schedule_clamped;
+
+    stats->input_enabled   = gWithInput;
     stats->frames_captured = atomic_load_explicit(&gEngine.frames_captured, memory_order_relaxed);
-    stats->input_depth     = emu_ring_filled(&gInputRing);
-    stats->input_underruns = atomic_load_explicit(&gInputRing.underruns, memory_order_relaxed);
-    stats->input_overruns  = atomic_load_explicit(&gInputRing.overruns, memory_order_relaxed);
+    stats->input_depth     = emu_ring_depth(&gInputRing);
+    stats->input_underruns = atomic_load_explicit(&gInputRing.missing, memory_order_relaxed);
+    stats->input_overruns  = atomic_load_explicit(&gInputRing.discarded, memory_order_relaxed);
+    stats->empty_capture   = atomic_load_explicit(&gEngine.empty_capture, memory_order_relaxed);
+    pthread_mutex_unlock(&gStatsLock);
 }
 
 /* --- transfers ------------------------------------------------------------- */
 
 static void capture_complete(void* refcon, IOReturn result, void* arg0);
 static void playback_complete(void* refcon, IOReturn result, void* arg0);
+static void reschedule(Engine* e);
+
+static uint64_t frames_in_ms(const Engine* e, uint64_t ms)
+{
+    return (ms * e->sample_rate + 500) / 1000;
+}
 
 static IOReturn submit_capture(Request* req)
 {
@@ -434,19 +991,165 @@ static IOReturn submit_capture(Request* req)
     req->frame_start = e->next_in_frame;
     e->next_in_frame += REQUEST_MS;
 
-    return (*e->in_intf)->LowLatencyReadIsochPipeAsync(
+    IOReturn result = (*e->in_intf)->LowLatencyReadIsochPipeAsync(
         e->in_intf, e->in_pipe, req->buffer, req->frame_start,
         e->entries_per_request, 1, req->frames, capture_complete, req);
+
+    /* Not on the bus, so not on the schedule: the frames stay unclaimed, for
+     * the retry or for reschedule() to measure the gap from. */
+    if (result != kIOReturnSuccess) e->next_in_frame = req->frame_start;
+    return result;
 }
 
+static void feedback_complete(void* refcon, IOReturn result, void* arg0);
+
+/* Queues one request on the explicit feedback endpoint. Four bytes per entry,
+ * on the endpoint's own bInterval. */
+static IOReturn submit_feedback(Request* req)
+{
+    Engine* e = req->engine;
+
+    for (uint32_t i = 0; i < e->fb_entries_per_request; i++) {
+        req->frames[i].frStatus   = kUSBLowLatencyIsochTransferKey;
+        req->frames[i].frReqCount = e->fb_max;
+        req->frames[i].frActCount = 0;
+    }
+
+    req->frame_start = e->next_fb_frame;
+    e->next_fb_frame += REQUEST_MS;
+
+    return (*e->out_intf)->LowLatencyReadIsochPipeAsync(
+        e->out_intf, e->fb_pipe, req->buffer, req->frame_start,
+        e->fb_entries_per_request, 1, req->frames, feedback_complete, req);
+}
+
+/*
+ * What the device asks for, as opposed to what capture says it took.
+ *
+ * Little-endian Q16.16 sample frames per playback service interval -- the
+ * reading E-MU's Windows driver uses, confirmed against this hardware at every
+ * rate: 0x00600000 at 192 kHz on a 0.5 ms endpoint is 96.0000 frames, not the
+ * 192 frames per millisecond the same vendor's macOS kext would have read out
+ * of the identical four bytes.
+ *
+ * An out-of-band value is refused rather than clamped. During the stream that
+ * follows a bInterval 3 stream -- the documented poisoning -- this endpoint
+ * returns nonsense along with everything else, and a planner that trusted it
+ * would size real packets from it.
+ */
+static void feedback_complete(void* refcon, IOReturn result, void* arg0)
+{
+    (void)arg0;
+    Request* req = (Request*)refcon;
+    Engine* e = req->engine;
+
+    if (result == kIOReturnIsoTooOld) reschedule(e);
+
+    for (uint32_t i = 0; i < e->fb_entries_per_request; i++) {
+        const IOUSBLowLatencyIsocFrame* f = &req->frames[i];
+
+        if (!emu_frame_ok(f->frStatus)) {
+            if (!atomic_load_explicit(&e->stopping, memory_order_relaxed))
+                atomic_fetch_add_explicit(&e->fb_errors, 1, memory_order_relaxed);
+            continue;
+        }
+        /* Silence from an asynchronous feedback endpoint is normal: this one
+         * speaks about thirty times a second and says nothing in between.
+         * Counted apart from errors so "quiet" and "dead" stay distinct. */
+        if (f->frActCount != 4) {
+            atomic_fetch_add_explicit(&e->fb_silent, 1, memory_order_relaxed);
+            continue;
+        }
+
+        /* Entries are laid out by frReqCount, as everywhere else. */
+        const uint8_t* p = (const uint8_t*)req->buffer + (size_t)i * e->fb_max;
+        uint32_t q16 = (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+                     | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+
+        uint32_t lo = e->fb_nominal_q16 > 65536u ? e->fb_nominal_q16 - 65536u : 0;
+        uint32_t hi = e->fb_nominal_q16 + 65536u;
+        if (q16 < lo || q16 > hi) {
+            atomic_fetch_add_explicit(&e->fb_rejected, 1, memory_order_relaxed);
+            continue;
+        }
+
+        uint32_t prev = atomic_exchange_explicit(&e->fb_value_q16, q16,
+                                                 memory_order_relaxed);
+        uint64_t seen = atomic_fetch_add_explicit(&e->fb_packets, 1,
+                                                  memory_order_relaxed);
+        if (seen == 0) {
+            atomic_store_explicit(&e->fb_min_q16, q16, memory_order_relaxed);
+            atomic_store_explicit(&e->fb_max_q16, q16, memory_order_relaxed);
+        } else {
+            if (q16 != prev)
+                atomic_fetch_add_explicit(&e->fb_changes, 1, memory_order_relaxed);
+            if (q16 < atomic_load_explicit(&e->fb_min_q16, memory_order_relaxed))
+                atomic_store_explicit(&e->fb_min_q16, q16, memory_order_relaxed);
+            if (q16 > atomic_load_explicit(&e->fb_max_q16, memory_order_relaxed))
+                atomic_store_explicit(&e->fb_max_q16, q16, memory_order_relaxed);
+        }
+    }
+
+    if (atomic_load_explicit(&e->stopping, memory_order_relaxed)) return;
+
+    if (submit_feedback(req) != kIOReturnSuccess) {
+        reschedule(e);
+        /* A feedback pipe that will not restart costs diagnostics, not audio:
+         * the planner falls back to capture on the next submit because no new
+         * value arrives, and the data pipes are untouched. */
+        if (submit_feedback(req) != kIOReturnSuccess) e->fb_pipe = 0;
+    }
+}
+
+/*
+ * How many frames the next playback entry carries.
+ *
+ * Capture's measurement while capture is open: the frame count of each
+ * capture packet sizes the next playback packet, so the two directions are
+ * locked to the same clock by construction. Without capture, the device's own
+ * demand from the explicit feedback endpoint, accumulated in Q16.16 so a
+ * fractional request comes out as the right mixture of whole packets rather
+ * than a truncation -- the same arithmetic E-MU's Windows driver does with its
+ * running fraction -- and the nominal until the first value arrives.
+ */
+static uint32_t planner_next(Engine* e)
+{
+    if (e->in_intf) return emu_feedback_next(e->feedback, e->nominal_frames);
+
+    uint32_t q16 = atomic_load_explicit(&e->fb_value_q16, memory_order_relaxed);
+    if (q16 == 0) return e->nominal_frames;
+
+    /* Corrected before it is used, never where it is reported: the raw word
+     * is what the diagnostics show. Uncorrected, the 44.1 family would be
+     * under-delivered by 53.1 ppm -- 9.4 frames a second at 176.4 kHz. */
+    q16 = emu_feedback_true_q16(q16);
+
+    uint32_t acc = e->fb_residue_q16 + q16;
+    e->fb_residue_q16 = acc & 0xffffu;
+    return acc >> 16;
+}
+
+/* Fixes the frame list -- packet count and sizes -- and queues the request.
+ * The audio bytes are NOT read here: the buffer goes out prefilled and the fill
+ * binds the data later, closer to transmission. Sizes have to be decided this
+ * early because the frame list is part of the submission; that only delays
+ * the feedback servo's response by the in-flight window, which a rate servo
+ * does not mind. */
 static IOReturn submit_playback(Request* req)
 {
     Engine* e = req->engine;
     size_t offset = 0;
+    size_t idx = (size_t)(req - e->out_requests);
+
+    /* From here until this request is back on the bus its buffer belongs to
+     * nobody: the IO thread must not be writing the old range's audio into
+     * bytes about to be zeroed for a new one. */
+    bind_retire(idx);
+
+    req->data_frame_start = e->out_cursor;
 
     for (uint32_t i = 0; i < e->entries_per_request; i++) {
-        /* Capture's measurement of the device clock sizes this packet. */
-        uint32_t frames = emu_feedback_next(e->feedback, e->nominal_frames);
+        uint32_t frames = planner_next(e);
         uint32_t bytes = emu_output_packet_bytes(frames, e->bytes_per_frame);
         while (bytes > e->out_max && frames > 0) {
             frames--;
@@ -454,32 +1157,181 @@ static IOReturn submit_playback(Request* req)
         }
 
         /* Contiguous: entry i begins where entry i-1's frReqCount ended. */
-        emu_ring_read_s24(&gOutputRing, (uint8_t*)req->buffer + offset, frames,
-                          atomic_load_explicit(&gOutputGain, memory_order_relaxed));
+        req->entry_frames[i] = frames;
+        e->out_cursor += frames;
         offset += bytes;
 
         req->frames[i].frStatus   = kUSBLowLatencyIsochTransferKey;
         req->frames[i].frReqCount = (UInt16)bytes;
         req->frames[i].frActCount = 0;
     }
+    atomic_store_explicit(&e->feedback_starved,
+                          emu_feedback_starved(e->feedback),
+                          memory_order_relaxed);
+    /* The Rust queue has counted these since it was written and nothing has
+     * ever read them: overflow means capture and playback have decoupled,
+     * which is not a state that should be inferred from its symptoms. */
+    atomic_store_explicit(&e->feedback_overflows,
+                          emu_feedback_overflows(e->feedback),
+                          memory_order_relaxed);
+    req->data_frame_end = e->out_cursor;
+
+    /* What goes out until the fill lands. Also the audible verdict on late
+     * binding itself: a stack that copied the buffer at submit would play
+     * exactly this, and nothing but this. */
+    memset(req->buffer, 0, offset);
+    req->generation = e->generation;
 
     req->frame_start = e->next_out_frame;
     e->next_out_frame += REQUEST_MS;
 
-    return (*e->out_intf)->LowLatencyWriteIsochPipeAsync(
+    IOReturn result = (*e->out_intf)->LowLatencyWriteIsochPipeAsync(
         e->out_intf, e->out_pipe, req->buffer, req->frame_start,
         e->entries_per_request, 1, req->frames, playback_complete, req);
+
+    /* A submission that never reached the bus must not keep its slice of the
+     * timeline. No bus interval was scheduled for these frames, so this is
+     * the one case the completion side will never count (see the note above
+     * the completions); left allocated, they would shear the fill cursor
+     * ahead of the write timeline by a request per failed submit, for good.
+     * The bus frames are given back too, so a rebuild measures its gap from
+     * what was actually scheduled. The feedback pops are not restored; the
+     * retry draws fresh ones, and a rate servo does not miss a couple of
+     * measurements. */
+    if (result != kIOReturnSuccess) {
+        e->out_cursor = req->data_frame_start;
+        e->next_out_frame = req->frame_start;
+        return result;
+    }
+
+    /* On the bus, buffer zeroed, slice of the timeline known: everything a
+     * writer needs. Published only now, so a failed submission leaves the slot
+     * retired rather than advertising a request that never went out. */
+    bind_publish(idx, (uint8_t*)req->buffer,
+                 req->data_frame_start, req->data_frame_end);
+    return kIOReturnSuccess;
 }
 
-static void resync(Engine* e)
+/*
+ * Accounts for what the IO thread did not get to, at the one moment it stops
+ * being able to: the request examined is the one starting to transmit now.
+ *
+ * Its frames past the IO thread's frontier are frames going out as their
+ * submit-time zeros -- silence sent because Core Audio was late, which is the
+ * only way this path can glitch. Counted in frames (`outputUnderruns`) and in
+ * requests (`unfilledPlayback`).
+ *
+ * Nothing counts before Core Audio's first cycle: the schedule legitimately
+ * runs ahead of it at every stream start, and those packets are silence by
+ * design.
+ */
+static void bind_audit(Engine* e, size_t next)
+{
+    const Request* req = &e->out_requests[next % e->num_requests];
+    uint64_t frontier = atomic_load_explicit(&gBindFrontier, memory_order_acquire);
+    if (frontier == 0 || req->data_frame_end <= frontier) return;
+
+    uint64_t base = req->data_frame_start > frontier ? req->data_frame_start : frontier;
+    atomic_fetch_add_explicit(&gBindMissing, req->data_frame_end - base,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&e->unfilled_playback, 1, memory_order_relaxed);
+}
+
+/*
+ * Rebuilds the bus schedule after a stall outlasted the in-flight window.
+ *
+ * The device's clock ran through the stall. The bus frames between the end
+ * of what was scheduled and the start of what will be were bus time like any
+ * other, merely with no packets in them; the cursors keep bus time, so each
+ * direction's cursor skips exactly that many frames, and the timeline Core
+ * Audio sees is the same straight line as before with a hole in the audio
+ * where the dropout was. That is what any DMA engine looks like when it
+ * underruns, and it is what the HAL's clock model is built for: the seed
+ * never changes, and the IO thread never has to resynchronise. (Pausing the
+ * sample clock instead needs a new seed, and the HAL answers a seed change
+ * by freezing its IO thread -- a second glitch; see FINDINGS.)
+ *
+ * Idempotent: once a direction's next frame is ahead of the bus again a later
+ * call finds nothing to rebuild. The completions of a stall drain as a burst
+ * and every one of them may arrive here. Per direction, because each keeps
+ * its own bus time -- normally both went stale together and both are
+ * rebuilt into the same frames, as at start.
+ *
+ * The timestamp filter is rebased, not reset: it keeps the rate it has
+ * learned and only moves its prediction to the new schedule's first
+ * completion. Completions still draining from the old schedule are muted by
+ * generation.
+ */
+static void reschedule(Engine* e)
 {
     UInt64 now = 0;
     AbsoluteTime at;
-    if ((*e->in_intf)->GetBusFrameNumber(e->in_intf, &now, &at) == kIOReturnSuccess) {
-        e->next_in_frame = now + SCHEDULE_MARGIN;
-        e->next_out_frame = now + SCHEDULE_MARGIN;
+    /* Through the playback interface: it is the one that is always open, and
+     * the frame number belongs to the bus rather than to either of them. */
+    if ((*e->out_intf)->GetBusFrameNumber(e->out_intf, &now, &at) != kIOReturnSuccess) {
+        return;
     }
+    uint64_t start = now + SCHEDULE_LEAD_MS;
+    bool rebuilt = false;
+
+    /* The feedback pipe carries no audio and holds no cursor, so a stale
+     * schedule on it is only a gap in the diagnostics -- rebased with the
+     * rest, but never counted as a rebuild. */
+    if (e->next_fb_frame < start) e->next_fb_frame = start;
+
+    if (e->next_out_frame < start) {
+        uint64_t gap = frames_in_ms(e, start - e->next_out_frame);
+        /* Nothing to discard on the output side: the IO thread's writes for
+         * the dead interval find no request covering them and are counted as
+         * unmapped, which is the accounting this dead interval needs. */
+        e->out_cursor += gap;
+        atomic_fetch_add_explicit(&e->frames_played, gap, memory_order_relaxed);
+        atomic_fetch_add_explicit(&e->dead_frames, gap, memory_order_relaxed);
+        e->next_out_frame = start;
+        emu_ts_filter_rebase(e->ts_filter,
+                             abs_to_ticks(at) + (SCHEDULE_LEAD_MS + REQUEST_MS) * e->ticks_per_ms);
+        atomic_store_explicit(&e->ts_resets, emu_ts_filter_resets(e->ts_filter),
+                              memory_order_relaxed);
+        e->generation++;
+        rebuilt = true;
+    }
+    /* Without capture next_in_frame is never advanced by anything, so it goes
+     * stale immediately and would report a rebuild on every call. */
+    if (e->in_intf && e->next_in_frame < start) {
+        uint64_t gap = frames_in_ms(e, start - e->next_in_frame);
+        emu_ring_write_silence(&gInputRing, e->in_cursor, (uint32_t)gap);
+        e->in_cursor += gap;
+        atomic_fetch_add_explicit(&e->frames_captured, gap, memory_order_relaxed);
+        e->next_in_frame = start;
+        rebuilt = true;
+    }
+    if (rebuilt) atomic_fetch_add_explicit(&e->resyncs, 1, memory_order_relaxed);
 }
+
+/*
+ * The cursors keep bus time, not delivery.
+ *
+ * out_cursor, frames_played and in_cursor all count the same thing: sample
+ * frames per bus interval, from the stream's first packet. Core Audio's
+ * sample time is anchored to frames_played, Core Audio writes the packets at
+ * out_cursor, capture writes the input ring at in_cursor, and the phase
+ * between them -- the safety offsets -- holds only while all three advance by
+ * the same amount for the same interval. The device does its part
+ * unconditionally: its clock runs through an interval whether the packet in
+ * it was delivered, errored, arrived empty, or was never scheduled at all.
+ * So the completions count every interval too -- the planned frames for a
+ * playback entry the bus did not carry, a nominal packet of silence for a
+ * capture entry that brought nothing -- and reschedule() counts the
+ * intervals no request covered. The lost audio is silence of exactly the
+ * lost length, which is what a timeline-indexed transport says a glitch
+ * should be.
+ * Skipping any interval instead moves one cursor and not the others, and
+ * that offset never heals: every skipped packet takes its size out of the
+ * safety margin for the rest of the stream, until the output is starving with
+ * every other counter clean. The one interval nobody counts is one that was
+ * never on the bus at all -- a failed submit -- and submit_playback gives
+ * that slice back for the same reason.
+ */
 
 static void capture_complete(void* refcon, IOReturn result, void* arg0)
 {
@@ -487,7 +1339,7 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
     Request* req = (Request*)refcon;
     Engine* e = req->engine;
 
-    if (result == kIOReturnIsoTooOld) resync(e);
+    if (result == kIOReturnIsoTooOld) reschedule(e);
 
     /* The buffer is laid out by frReqCount, not by what arrived. Reads set
      * frReqCount to wMaxPacketSize for every entry, so the stride is fixed and
@@ -502,32 +1354,60 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
 
     for (uint32_t i = 0; i < e->entries_per_request; i++) {
         const IOUSBLowLatencyIsocFrame* f = &req->frames[i];
-        if (!emu_frame_ok(f->frStatus)) {
-            if (!e->stopping) atomic_fetch_add(&e->usb_errors, 1);
-            continue;
+        uint32_t frames = 0;
+        if (emu_frame_ok(f->frStatus)) {
+            frames = emu_frames_in_packet(f->frActCount, e->bytes_per_frame);
+        } else if (!atomic_load_explicit(&e->stopping, memory_order_relaxed)) {
+            atomic_fetch_add_explicit(&e->usb_errors, 1, memory_order_relaxed);
         }
-        if (f->frActCount == 0) continue;
 
-        uint32_t frames = emu_frames_in_packet(f->frActCount, e->bytes_per_frame);
+        if (frames > 0) {
+            /* Capture is the clock reference, so this happens whether or not
+             * anyone is recording. */
+            emu_feedback_push(e->feedback, frames);
 
-        /* Capture is the clock reference, so this happens whether or not anyone
-         * is recording. */
-        emu_feedback_push(e->feedback, frames);
-
-        /* Take only whole sample frames. At bInterval 3 every packet carries 4
-         * bytes beyond them, still unexplained, and copying those would shift
-         * every frame boundary after the first. */
-        emu_ring_write_s24(&gInputRing, (const uint8_t*)req->buffer + offset, frames);
-        atomic_fetch_add(&e->frames_captured, frames);
+            /* At bInterval 3 every packet leads with 4 bytes that are not
+             * sample frames: the packet's own byte length, which E-MU's
+             * Windows driver reads and steps over (FINDINGS). Taking the
+             * frames from the first byte instead puts every sample two thirds
+             * of a frame early and scrambles all of them.
+             *
+             * The offset is taken from the packet rather than the rate, so it
+             * is zero wherever the byte count already divides, which is every
+             * rate up to 96 kHz. The read stays inside the packet either way:
+             * lead + frames x bytes_per_frame is frActCount exactly. */
+            uint32_t lead = f->frActCount % e->bytes_per_frame;
+            emu_ring_write_s24(&gInputRing, e->in_cursor,
+                               (const uint8_t*)req->buffer + offset + lead, frames);
+        } else {
+            /* Nothing usable for this interval: an error, or one of the empty
+             * packets the device sends while its ADC spins up (a couple at
+             * every start in the captured traces). The interval passed on the
+             * device's clock all the same, so the input keeps its place with
+             * a nominal packet of silence; skipped, every later capture
+             * packet would sit one packet early on the timeline for good. No
+             * feedback push: the queue holds measurements and there was none.
+             * One pop draws the nominal instead, which is within a frame of
+             * what the measurement would have said. */
+            frames = e->nominal_frames;
+            emu_ring_write_silence(&gInputRing, e->in_cursor, frames);
+            if (!atomic_load_explicit(&e->stopping, memory_order_relaxed))
+                atomic_fetch_add_explicit(&e->empty_capture, 1, memory_order_relaxed);
+        }
+        e->in_cursor += frames;
+        atomic_fetch_add_explicit(&e->frames_captured, frames, memory_order_relaxed);
 
         offset += f->frReqCount;
     }
 
-    if (e->stopping) { CFRunLoopStop(CFRunLoopGetCurrent()); return; }
+    if (atomic_load_explicit(&e->stopping, memory_order_relaxed)) {
+        CFRunLoopStop(CFRunLoopGetCurrent());
+        return;
+    }
     if (submit_capture(req) != kIOReturnSuccess) {
-        resync(e);
+        reschedule(e);
         if (submit_capture(req) != kIOReturnSuccess) {
-            e->stopping = true;
+            atomic_store_explicit(&e->stopping, true, memory_order_relaxed);
             CFRunLoopStop(CFRunLoopGetCurrent());
         }
     }
@@ -539,48 +1419,80 @@ static void playback_complete(void* refcon, IOReturn result, void* arg0)
     Request* req = (Request*)refcon;
     Engine* e = req->engine;
 
-    if (result == kIOReturnIsoTooOld) resync(e);
+    if (result == kIOReturnIsoTooOld) reschedule(e);
+
+    /* The last completed entry's hardware timestamp: the host controller
+     * stamps each low-latency frame list entry as it finishes, which is far
+     * steadier than callback timing -- the callback adds this thread's
+     * scheduling jitter, the controller does not. */
+    uint64_t stamp = 0;
 
     for (uint32_t i = 0; i < e->entries_per_request; i++) {
         const IOUSBLowLatencyIsocFrame* f = &req->frames[i];
-        if (!emu_frame_ok(f->frStatus)) {
-            if (!e->stopping) atomic_fetch_add(&e->usb_errors, 1);
-            continue;
+        if (emu_frame_ok(f->frStatus)) {
+            stamp = abs_to_ticks(f->frTimeStamp);
+            /* Good status is not delivery. On an OUT entry frActCount short of
+             * frReqCount is audio the bus did not carry, and the frames are
+             * credited below regardless -- correctly, the device's clock ran
+             * through the interval either way -- so nothing else in the driver
+             * would ever notice. Counted separately from frStatus errors so
+             * each says one thing: usbErrors is a transfer that failed,
+             * shortPlayback is one that succeeded and moved fewer bytes. */
+            if (f->frActCount != f->frReqCount &&
+                !atomic_load_explicit(&e->stopping, memory_order_relaxed)) {
+                atomic_fetch_add_explicit(&e->short_playback, 1, memory_order_relaxed);
+            }
+        } else if (!atomic_load_explicit(&e->stopping, memory_order_relaxed)) {
+            atomic_fetch_add_explicit(&e->usb_errors, 1, memory_order_relaxed);
         }
-        atomic_fetch_add(&e->frames_played,
-                         emu_frames_in_packet(f->frActCount, e->bytes_per_frame));
+        /* By the planned size, not frActCount, and for errored entries too:
+         * out_cursor took exactly these frames at submit, and the interval
+         * they were scheduled into has elapsed on the device's clock whatever
+         * the bus did with them. Counting only what the bus carried would
+         * leave the fill cursor ahead of the timeline for the rest of the
+         * stream after any errored entry. Should the last entry be the one that
+         * errored, the stamp below is from an earlier one -- a sub-request
+         * skew on a rare event, which the filter absorbs as jitter. */
+        atomic_fetch_add_explicit(&e->frames_played, req->entry_frames[i],
+                                  memory_order_relaxed);
     }
 
-    /*
-     * Timestamp from the kernel, not from this thread.
-     *
-     * mach_absolute_time() here reads the moment the completion *callback* ran,
-     * which can only ever be later than the transfer -- never earlier. That
-     * one-sided error does not average out: it biases the anchor late, which
-     * makes the device look slower than it is, which makes Core Audio deliver
-     * slower than the device consumes, which drains the ring. Measured at about
-     * 1880 ppm, with callback delays up to 29 ms.
-     *
-     * frTimeStamp is recorded by the USB stack when the frame actually
-     * completed. Using it is the whole reason the low-latency API reports it.
-     */
-    uint64_t stamp = 0;
-    for (int32_t i = (int32_t)e->entries_per_request - 1; i >= 0; i--) {
-        const IOUSBLowLatencyIsocFrame* f = &req->frames[i];
-        if (!emu_frame_ok(f->frStatus) || f->frActCount == 0) continue;
-        stamp = ((uint64_t)f->frTimeStamp.hi << 32) | (uint64_t)f->frTimeStamp.lo;
-        if (stamp) break;
-    }
+    if (!atomic_load_explicit(&e->stopping, memory_order_relaxed)) {
+        /* Audited before anything else in this callback: the request after
+         * this one is starting to transmit right now, so this is the last
+         * moment its unwritten frames can still be counted. */
+        size_t idx = (size_t)(req - e->out_requests);
+        bind_audit(e, idx + 1);
 
-    /* Fall back only if the stack left no usable stamp; a late anchor beats
-     * none, and the next request will correct it. */
-    timeline_publish(atomic_load_explicit(&e->frames_played, memory_order_relaxed),
-                     stamp ? stamp : mach_absolute_time());
+        /* Published once per request rather than per entry: the cadence the
+         * timestamp filter expects, and Core Audio only samples the anchor
+         * every ZeroTimeStampPeriod frames anyway. Fall back to the callback
+         * clock -- counted, so a stack that stops filling frTimeStamp cannot
+         * silently degrade -- and let the filter absorb either source's jitter.
+         *
+         * Only for requests of the current schedule: after a rebuild, the
+         * filter has been rebased to the new schedule and completions still
+         * draining from the old one would pull it back across the gap. They
+         * keep their frames and their resubmission; the clock ignores them. */
+        if (req->generation == e->generation) {
+            uint64_t now = mach_absolute_time();
+            uint64_t skew = stamp > now ? stamp - now : now - stamp;
+            if (stamp == 0 || skew > e->ticks_per_ms * 1000) {
+                stamp = now;
+                atomic_fetch_add_explicit(&e->ts_fallbacks, 1, memory_order_relaxed);
+            }
+            uint64_t filtered = emu_ts_filter_apply(e->ts_filter, stamp);
+            atomic_store_explicit(&e->ts_resets, emu_ts_filter_resets(e->ts_filter),
+                                  memory_order_relaxed);
+            timeline_publish(
+                atomic_load_explicit(&e->frames_played, memory_order_relaxed), filtered);
+        }
 
-    if (e->stopping) return;
-    if (submit_playback(req) != kIOReturnSuccess) {
-        resync(e);
-        if (submit_playback(req) != kIOReturnSuccess) e->stopping = true;
+        if (submit_playback(req) != kIOReturnSuccess) {
+            reschedule(e);
+            if (submit_playback(req) != kIOReturnSuccess)
+                atomic_store_explicit(&e->stopping, true, memory_order_relaxed);
+        }
     }
 }
 
@@ -691,7 +1603,22 @@ static bool select_alt(IOUSBInterfaceInterface500** intf, const EmuDeviceModel* 
 
 static void teardown(Engine* e)
 {
-    for (int i = 0; i < NUM_REQUESTS; i++) {
+    /* The direct path hands the IO thread pointers into buffers this function
+     * frees, so a writer can be inside one right now. Closing the shared gate
+     * atomically excludes a new writer and records one already admitted;
+     * retire every slot, then wait for that bounded real-time routine to
+     * leave before destroying anything. There is deliberately no unsafe
+     * timeout: once admission is closed a healthy writer cannot block, and
+     * freeing beneath an unhealthy one would turn a stuck daemon into memory
+     * corruption. */
+    atomic_fetch_or_explicit(&gBindGate, BIND_GATE_CLOSED, memory_order_acq_rel);
+    for (int i = 0; i < MAX_REQUESTS; i++) bind_retire((size_t)i);
+    while ((atomic_load_explicit(&gBindGate, memory_order_acquire) &
+            BIND_GATE_WRITING) != 0) {
+        usleep(1000);
+    }
+
+    for (int i = 0; i < MAX_REQUESTS; i++) {
         if (e->in_requests[i].buffer && e->in_intf)
             (*e->in_intf)->LowLatencyDestroyBuffer(e->in_intf, e->in_requests[i].buffer);
         if (e->in_requests[i].frames && e->in_intf)
@@ -700,6 +1627,12 @@ static void teardown(Engine* e)
             (*e->out_intf)->LowLatencyDestroyBuffer(e->out_intf, e->out_requests[i].buffer);
         if (e->out_requests[i].frames && e->out_intf)
             (*e->out_intf)->LowLatencyDestroyBuffer(e->out_intf, e->out_requests[i].frames);
+    }
+    for (int i = 0; i < FB_REQUESTS; i++) {
+        if (e->fb_requests[i].buffer && e->out_intf)
+            (*e->out_intf)->LowLatencyDestroyBuffer(e->out_intf, e->fb_requests[i].buffer);
+        if (e->fb_requests[i].frames && e->out_intf)
+            (*e->out_intf)->LowLatencyDestroyBuffer(e->out_intf, e->fb_requests[i].frames);
     }
     if (e->out_intf) {
         (*e->out_intf)->SetAlternateInterface(e->out_intf, 0);
@@ -714,54 +1647,194 @@ static void teardown(Engine* e)
     if (e->device) (*e->device)->Release(e->device);
     if (e->service) IOObjectRelease(e->service);
     if (e->identity) set_running_identity(NULL);
-    memset(e, 0, sizeof *e);
+}
+
+/*
+ * With only num_requests x REQUEST_MS in flight, an engine thread that loses
+ * the CPU for a few milliseconds drops audio, so it declares its cadence to
+ * the scheduler. Failure is survivable -- the thread still runs, just without
+ * the guarantee -- which is why the result is not checked.
+ *
+ * One arrival per REQUEST_MS, and it carries *both* directions: capture and
+ * playback requests are submitted into identical bus frames, so their
+ * completions land together and this one budget covers the pair.
+ *
+ * The numbers are not the obvious ones, because thread_policy.h forces
+ * computation up to constraint/2 whenever it is declared smaller:
+ *
+ *   - constraint is 1 ms, half the completion period. Declaring the full
+ *     2 ms would drag computation up to 1 ms with it and reserve half a core
+ *     every period; 1 ms holds the reservation at 500 us while asking for
+ *     more urgency than the cadence strictly needs.
+ *   - computation is therefore written as the 500 us the clamp produces, not
+ *     as a smaller figure the kernel would silently discard. It is far more
+ *     than the work -- a completion is two IOKit submits, the frames-played
+ *     accounting and one clock re-anchor, with no audio conversion on this
+ *     thread at all -- but it is the floor this constraint implies, so it is
+ *     what the declaration should say.
+ *   - preemptible is documented as IGNORED; it is assigned only so the whole
+ *     struct is initialised.
+ *
+ * None of this covers the hop before the arrival. A thread policy bounds when
+ * a runnable thread gets the CPU, not how promptly the USB stack delivers the
+ * completion that wakes it, so a stall longer than the in-flight window is not
+ * something widening these values can fix.
+ */
+static void set_engine_thread_policy(void)
+{
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    double ticks_per_ns = (double)tb.denom / (double)tb.numer;
+
+    thread_time_constraint_policy_data_t policy;
+    policy.period      = (uint32_t)(REQUEST_MS * 1000000.0 * ticks_per_ns);
+    policy.computation = (uint32_t)(500000.0 * ticks_per_ns);
+    policy.constraint  = (uint32_t)(1000000.0 * ticks_per_ns);
+    policy.preemptible = TRUE;
+
+    /* mach_thread_self() hands out a send right per call, so it is dropped
+     * again here; leaking one per stream start would accumulate in the host
+     * daemon across a session's worth of StartIO. */
+    thread_port_t thread = mach_thread_self();
+    thread_policy_set(thread, THREAD_TIME_CONSTRAINT_POLICY,
+                      (thread_policy_t)&policy, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    mach_port_deallocate(mach_task_self(), thread);
+}
+
+/* Back to timeshare before the slow half of teardown. Aborting the pipes,
+ * draining the last completions and unwiring the low-latency buffers is
+ * multi-millisecond kernel work with no deadline behind it, and real-time
+ * priority is the wrong band to do it in. */
+static void clear_engine_thread_policy(void)
+{
+    thread_extended_policy_data_t policy;
+    policy.timeshare = TRUE;
+
+    thread_port_t thread = mach_thread_self();
+    thread_policy_set(thread, THREAD_EXTENDED_POLICY,
+                      (thread_policy_t)&policy, THREAD_EXTENDED_POLICY_COUNT);
+    mach_port_deallocate(mach_task_self(), thread);
+}
+
+static void signal_start_state(EngineStartState state)
+{
+    pthread_mutex_lock(&gStartLock);
+    gStartState = state;
+    pthread_cond_broadcast(&gStartCond);
+    pthread_mutex_unlock(&gStartLock);
+}
+
+/*
+ * How deep the schedule has to be for the direct bind, in requests.
+ *
+ * Core Audio does not write at the safety offset; it writes at
+ *
+ *     writeLead ~ 2 x bufferFrames + safetyOffset + ~208 frames
+ *
+ * (the HAL computes a cycle's output time one buffer period ahead of
+ * presentation and then hands over a buffer-length range, so the far end
+ * lands at offset + 2 x buffer; FINDINGS has the sweep this was fitted to).
+ * A frame no submitted request covers has nowhere to go on this path, so the
+ * schedule must reach past that -- for the *largest* buffer the HAL will
+ * grant, not the one in use, because a client may change it mid-stream and
+ * the schedule cannot be rebuilt underneath it.
+ *
+ * Derived rather than tuned, so raising the safety offset, changing the
+ * zero-timestamp period or running at a rate with fewer frames per request
+ * moves it on its own instead of silently overrunning a hard-coded depth.
+ */
+static uint32_t schedule_depth(Engine* e, uint32_t safety_us)
+{
+    uint32_t per_request = e->nominal_frames * e->entries_per_request;
+    if (per_request == 0) { e->schedule_clamped = true; return MAX_REQUESTS; }
+
+    /* The ceiling, not `safety_us`: the write lead follows the offset
+     * coreaudiod cached, which a runtime 'emuS' change does not touch. See
+     * EMU_OUTPUT_SAFETY_MAX_US. `safety_us` only ever raises it. */
+    if (safety_us < EMU_OUTPUT_SAFETY_MAX_US) safety_us = EMU_OUTPUT_SAFETY_MAX_US;
+    uint64_t offset_frames = (uint64_t)e->sample_rate * safety_us / 1000000u;
+    uint64_t lead = 2ull * HAL_MAX_IO_BUFFER + offset_frames + WRITE_LEAD_SLACK;
+    uint64_t need = (lead + per_request - 1) / per_request + 4;  /* +4 margin */
+
+    if (need < MIN_REQUESTS) need = MIN_REQUESTS;
+    /* Clamping here means the schedule may not reach the write lead, which
+     * shows up only as `unmappedAhead` climbing -- so it is reported rather
+     * than absorbed. Unreachable as the constants stand; that is the point. */
+    if (need > MAX_REQUESTS) { need = MAX_REQUESTS; e->schedule_clamped = true; }
+    return (uint32_t)need;
 }
 
 static void* engine_thread(void* arg)
 {
     (void)arg;
     Engine* e = &gEngine;
+    pthread_mutex_lock(&gStatsLock);
     memset(e, 0, sizeof *e);
-    emu_ring_reset(&gOutputRing);
+    atomic_init(&e->stopping, false);
+    pthread_mutex_unlock(&gStatsLock);
     emu_ring_reset(&gInputRing);
 
-    e->feedback = emu_feedback_init(e->feedback_storage);
-    if (!e->feedback) { gRunning = false; return NULL; }
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    e->ticks_per_ms = (uint64_t)(1000000.0 * (double)tb.denom / (double)tb.numer);
+    e->sample_rate = gSampleRate;
+    bind_reset();
 
-    if (!open_device(e)) { teardown(e); gRunning = false; return NULL; }
+#define ENGINE_FAIL() do { teardown(e); signal_start_state(ENGINE_FAILED); return NULL; } while (0)
+
+    e->feedback = emu_feedback_init(e->feedback_storage);
+    if (!e->feedback) ENGINE_FAIL();
+
+    if (!open_device(e)) ENGINE_FAIL();
 
     IOUSBConfigurationDescriptorPtr cfg = NULL;
     EmuDeviceModel model;
     if ((*e->device)->GetConfigurationDescriptorPtr(e->device, 0, &cfg) != kIOReturnSuccess ||
         emu_parse_config_descriptor((const uint8_t*)cfg,
                                     OSSwapLittleToHostInt16(cfg->wTotalLength), &model) != 0) {
-        teardown(e); gRunning = false; return NULL;
+        ENGINE_FAIL();
     }
 
-    if (!set_clock_rate(e, &model, gSampleRate)) { teardown(e); gRunning = false; return NULL; }
+    if (!set_clock_rate(e, &model, gSampleRate)) ENGINE_FAIL();
 
-    if (!emu_find_interface(e->device, 1, &e->out_intf) ||
-        !emu_find_interface(e->device, 2, &e->in_intf)) {
-        teardown(e); gRunning = false; return NULL;
+    if (!emu_find_interface(e->device, 1, &e->out_intf)) ENGINE_FAIL();
+    if (gWithInput && !emu_find_interface(e->device, 2, &e->in_intf)) ENGINE_FAIL();
+
+    if ((*e->out_intf)->USBInterfaceOpen(e->out_intf) != kIOReturnSuccess) {
+        ENGINE_FAIL();
     }
-    if ((*e->out_intf)->USBInterfaceOpen(e->out_intf) != kIOReturnSuccess ||
-        (*e->in_intf)->USBInterfaceOpen(e->in_intf) != kIOReturnSuccess) {
-        teardown(e); gRunning = false; return NULL;
+    if (e->in_intf && (*e->in_intf)->USBInterfaceOpen(e->in_intf) != kIOReturnSuccess) {
+        ENGINE_FAIL();
     }
 
+    /* Interface 2 stays at alternate setting 0 when it is not opened: no
+     * bandwidth reserved for it, and no IN transaction on the bus. */
     const EmuAltSetting *out_alt = NULL, *in_alt = NULL;
-    if (!select_alt(e->out_intf, &model, 1, gSampleRate, &out_alt) ||
-        !select_alt(e->in_intf, &model, 2, gSampleRate, &in_alt)) {
-        teardown(e); gRunning = false; return NULL;
+    if (!select_alt(e->out_intf, &model, 1, gSampleRate, &out_alt)) ENGINE_FAIL();
+    if (e->in_intf && !select_alt(e->in_intf, &model, 2, gSampleRate, &in_alt)) {
+        ENGINE_FAIL();
     }
 
-    if (!emu_find_isoc_pipe(e->out_intf, kUSBOut, &e->out_pipe, &e->out_max) ||
+    if (!emu_find_isoc_pipe(e->out_intf, kUSBOut, &e->out_pipe, &e->out_max)) {
+        ENGINE_FAIL();
+    }
+    if (e->in_intf &&
         !emu_find_isoc_pipe(e->in_intf, kUSBIn, &e->in_pipe, &e->in_max)) {
-        teardown(e); gRunning = false; return NULL;
+        ENGINE_FAIL();
+    }
+    /* The only isochronous IN pipe on the playback interface is the explicit
+     * feedback endpoint. Its absence is not a failure: the transport does not
+     * depend on it, so a device without one simply reports nothing. */
+    if (!emu_find_isoc_pipe_full(e->out_intf, kUSBIn, &e->fb_pipe,
+                                 &e->fb_max, &e->fb_interval)) {
+        e->fb_pipe = 0;
     }
 
     e->bytes_per_frame = out_alt->channels * out_alt->subframe_size;
     if (e->bytes_per_frame == 0) e->bytes_per_frame = 6;
+    /* The direct path's whole map, besides the per-request ranges: a
+     * request's byte layout is linear in this. */
+    atomic_store_explicit(&gBindBytesPerFrame, e->bytes_per_frame, memory_order_relaxed);
 
     uint32_t period = 1u << (out_alt->interval - 1);
     e->entries_per_ms = period >= 8 ? 1 : (8 / period);
@@ -770,94 +1843,240 @@ static void* engine_thread(void* arg)
 
     double interval_ms = (double)period * 0.125;
     e->nominal_frames = (uint32_t)(gSampleRate * interval_ms / 1000.0);
+    /* Exact, in Q16.16: at 176.4 kHz a 0.5 ms interval holds 88.2 frames, and
+     * a feedback value has to be judged against that rather than against the
+     * 88 the truncation above leaves. */
+    e->fb_nominal_q16 = (uint32_t)(((uint64_t)gSampleRate << 16) * period / 8000u);
+    if (e->fb_pipe) {
+        uint32_t fb_period = 1u << (e->fb_interval - 1);
+        uint32_t fb_per_ms = fb_period >= 8 ? 1 : (8 / fb_period);
+        e->fb_entries_per_request = REQUEST_MS * fb_per_ms;
+        if (e->fb_entries_per_request > MAX_ENTRIES)
+            e->fb_entries_per_request = MAX_ENTRIES;
+        e->fb_num_requests = FB_REQUESTS;
+    }
+    /* Now that frames-per-request is known. Before any buffer is allocated. */
+    e->num_requests = schedule_depth(e, gOutputSafetyUS);
     emu_feedback_set_nominal(e->feedback, gSampleRate, (uint64_t)(interval_ms * 1e6));
 
     CFRunLoopSourceRef in_source = NULL, out_source = NULL;
-    if ((*e->in_intf)->CreateInterfaceAsyncEventSource(e->in_intf, &in_source) != kIOReturnSuccess ||
-        (*e->out_intf)->CreateInterfaceAsyncEventSource(e->out_intf, &out_source) != kIOReturnSuccess) {
-        teardown(e); gRunning = false; return NULL;
+    if ((*e->out_intf)->CreateInterfaceAsyncEventSource(e->out_intf, &out_source) != kIOReturnSuccess) {
+        ENGINE_FAIL();
+    }
+    if (e->in_intf &&
+        (*e->in_intf)->CreateInterfaceAsyncEventSource(e->in_intf, &in_source) != kIOReturnSuccess) {
+        ENGINE_FAIL();
     }
     e->run_loop = CFRunLoopGetCurrent();
-    CFRunLoopAddSource(e->run_loop, in_source, kCFRunLoopDefaultMode);
+    if (in_source) CFRunLoopAddSource(e->run_loop, in_source, kCFRunLoopDefaultMode);
     CFRunLoopAddSource(e->run_loop, out_source, kCFRunLoopDefaultMode);
 
     UInt32 list_bytes = e->entries_per_request * sizeof(IOUSBLowLatencyIsocFrame);
-    for (int i = 0; i < NUM_REQUESTS; i++) {
+    for (uint32_t i = 0; i < e->num_requests; i++) {
         e->in_requests[i].engine = e;
         e->out_requests[i].engine = e;
-        if ((*e->in_intf)->LowLatencyCreateBuffer(e->in_intf, &e->in_requests[i].buffer,
-                (UInt32)e->entries_per_request * e->in_max, kUSBLowLatencyReadBuffer) != kIOReturnSuccess ||
-            (*e->in_intf)->LowLatencyCreateBuffer(e->in_intf, (void**)&e->in_requests[i].frames,
-                list_bytes, kUSBLowLatencyFrameListBuffer) != kIOReturnSuccess ||
-            (*e->out_intf)->LowLatencyCreateBuffer(e->out_intf, &e->out_requests[i].buffer,
+        if ((*e->out_intf)->LowLatencyCreateBuffer(e->out_intf, &e->out_requests[i].buffer,
                 (UInt32)e->entries_per_request * e->out_max, kUSBLowLatencyWriteBuffer) != kIOReturnSuccess ||
             (*e->out_intf)->LowLatencyCreateBuffer(e->out_intf, (void**)&e->out_requests[i].frames,
                 list_bytes, kUSBLowLatencyFrameListBuffer) != kIOReturnSuccess) {
-            teardown(e); gRunning = false; return NULL;
+            ENGINE_FAIL();
+        }
+        if (e->in_intf &&
+            ((*e->in_intf)->LowLatencyCreateBuffer(e->in_intf, &e->in_requests[i].buffer,
+                (UInt32)e->entries_per_request * e->in_max, kUSBLowLatencyReadBuffer) != kIOReturnSuccess ||
+             (*e->in_intf)->LowLatencyCreateBuffer(e->in_intf, (void**)&e->in_requests[i].frames,
+                list_bytes, kUSBLowLatencyFrameListBuffer) != kIOReturnSuccess)) {
+            ENGINE_FAIL();
+        }
+    }
+    for (uint32_t i = 0; i < e->fb_num_requests; i++) {
+        UInt32 fb_list_bytes =
+            e->fb_entries_per_request * sizeof(IOUSBLowLatencyIsocFrame);
+        e->fb_requests[i].engine = e;
+        if ((*e->out_intf)->LowLatencyCreateBuffer(e->out_intf, &e->fb_requests[i].buffer,
+                (UInt32)e->fb_entries_per_request * e->fb_max,
+                kUSBLowLatencyReadBuffer) != kIOReturnSuccess ||
+            (*e->out_intf)->LowLatencyCreateBuffer(e->out_intf, (void**)&e->fb_requests[i].frames,
+                fb_list_bytes, kUSBLowLatencyFrameListBuffer) != kIOReturnSuccess) {
+            /* Diagnostics, not audio: give the endpoint up rather than the
+             * stream. Whatever was allocated is freed by teardown. */
+            e->fb_num_requests = i;
+            e->fb_pipe = 0;
+            break;
         }
     }
 
     UInt64 now = 0;
     AbsoluteTime at;
-    if ((*e->in_intf)->GetBusFrameNumber(e->in_intf, &now, &at) != kIOReturnSuccess) {
-        teardown(e); gRunning = false; return NULL;
+    if ((*e->out_intf)->GetBusFrameNumber(e->out_intf, &now, &at) != kIOReturnSuccess) {
+        ENGINE_FAIL();
     }
-    e->next_in_frame = now + SCHEDULE_MARGIN;
-    e->next_out_frame = now + SCHEDULE_MARGIN;
+    e->next_in_frame = now + SCHEDULE_LEAD_MS;
+    e->next_out_frame = now + SCHEDULE_LEAD_MS;
+    e->next_fb_frame = now + SCHEDULE_LEAD_MS;
+
+    /* The timeline starts here, and it starts *known*: sample 0 is the first
+     * frame of the first packet, scheduled SCHEDULE_LEAD_MS bus frames ahead
+     * of the (frame number, host time) pair the controller just gave us.
+     * Anchoring from the schedule instead of waiting for the first completion
+     * means Core Audio's very first GetZeroTimeStamp is already on the
+     * device's timeline -- there is no host-clock placeholder to splice away
+     * from later, and a splice stalls the IO thread (FINDINGS). */
+    uint64_t start_host = abs_to_ticks(at) + SCHEDULE_LEAD_MS * e->ticks_per_ms;
+    e->ts_filter = emu_ts_filter_init(e->ts_filter_storage, start_host,
+                                      REQUEST_MS * e->ticks_per_ms);
+    if (!e->ts_filter) ENGINE_FAIL();
+    timeline_publish(0, start_host);
+
+#undef ENGINE_FAIL
+
+    set_engine_thread_policy();
 
     /* Capture first, so playback has measurements waiting instead of starving
-     * through its whole first request. */
-    for (int i = 0; i < NUM_REQUESTS; i++) {
-        if (submit_capture(&e->in_requests[i]) != kIOReturnSuccess) {
-            teardown(e); gRunning = false; return NULL;
-        }
+     * through its whole first request. The first playback request is bound
+     * by its submit; the rest are bound by the completion sweep as Core Audio
+     * starts writing -- until then they are silence either way. */
+    bool submitted = true;
+    for (uint32_t i = 0; i < e->num_requests && submitted && e->in_intf; i++) {
+        submitted = submit_capture(&e->in_requests[i]) == kIOReturnSuccess;
     }
-    for (int i = 0; i < NUM_REQUESTS; i++) {
-        if (submit_playback(&e->out_requests[i]) != kIOReturnSuccess) {
-            teardown(e); gRunning = false; return NULL;
+    for (uint32_t i = 0; i < e->num_requests && submitted; i++) {
+        submitted = submit_playback(&e->out_requests[i]) == kIOReturnSuccess;
+    }
+    if (!submitted) {
+        teardown(e);
+        signal_start_state(ENGINE_FAILED);
+        return NULL;
+    }
+    /* Last, and never fatal. Reading the device's stated demand is a
+     * measurement placed alongside the stream, not a part of it. */
+    for (uint32_t i = 0; i < e->fb_num_requests && e->fb_pipe; i++) {
+        if (submit_feedback(&e->fb_requests[i]) != kIOReturnSuccess) {
+            e->fb_pipe = 0;
         }
     }
 
-    while (!e->stopping) {
+    atomic_store_explicit(&gBindCount, e->num_requests, memory_order_release);
+
+    /* The map describes the whole queue now, so writers may use it. Opening
+     * the gate publishes every preceding map write before StartIO returns. */
+    atomic_store_explicit(&gBindGate, 0, memory_order_release);
+
+    atomic_store_explicit(&gRunning, true, memory_order_release);
+    signal_start_state(ENGINE_STREAMING);
+
+    while (!atomic_load_explicit(&e->stopping, memory_order_relaxed)) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
     }
 
+    clear_engine_thread_policy();
+
     (*e->out_intf)->AbortPipe(e->out_intf, e->out_pipe);
-    (*e->in_intf)->AbortPipe(e->in_intf, e->in_pipe);
+    if (e->in_intf) (*e->in_intf)->AbortPipe(e->in_intf, e->in_pipe);
+    if (e->fb_pipe) (*e->out_intf)->AbortPipe(e->out_intf, e->fb_pipe);
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.3, false);
 
-    CFRunLoopRemoveSource(e->run_loop, in_source, kCFRunLoopDefaultMode);
+    if (in_source) {
+        CFRunLoopRemoveSource(e->run_loop, in_source, kCFRunLoopDefaultMode);
+        CFRelease(in_source);
+    }
     CFRunLoopRemoveSource(e->run_loop, out_source, kCFRunLoopDefaultMode);
-    CFRelease(in_source);
     CFRelease(out_source);
 
+    /* Closing the gate drains the last IO callback, so take the post-mortem
+     * only after teardown: every callback-local diagnostic has landed and no
+     * live counter can still change. Engine storage is reset at the next
+     * start, under gStatsLock, rather than while diagnostics may read it. */
     teardown(e);
-    gRunning = false;
+    emu_engine_stats(&gFinalStats);
+    pthread_mutex_lock(&gStatsLock);
+    gHaveFinalStats = true;
+    pthread_mutex_unlock(&gStatsLock);
+
+    atomic_store_explicit(&gRunning, false, memory_order_release);
     return NULL;
 }
 
-bool emu_engine_start(uint32_t sample_rate)
+bool emu_engine_start(uint32_t sample_rate, uint32_t output_safety_us,
+                      bool with_input)
 {
-    if (gRunning) return true;
+    pthread_mutex_lock(&gLifecycleLock);
+    if (atomic_load_explicit(&gRunning, memory_order_acquire)) {
+        pthread_mutex_unlock(&gLifecycleLock);
+        return true;
+    }
+    /* A transport may have stopped itself after a runtime USB failure. Reap
+     * that finished session before reusing its singleton Engine storage. */
+    if (gThreadJoinable) {
+        pthread_join(gThread, NULL);
+        gThreadJoinable = false;
+    }
     gSampleRate = sample_rate;
-    emu_ring_reset(&gOutputRing);
-    emu_ring_reset(&gInputRing);
-    gTimelineFrames = 0;
-    gTimelineHost = 0;
-    gRunning = true;
+    gOutputSafetyUS = output_safety_us;
+    gWithInput = with_input;
+    atomic_store_explicit(&gTimelineFrames, 0, memory_order_relaxed);
+    atomic_store_explicit(&gTimelineHost, 0, memory_order_relaxed);
+
+    pthread_mutex_lock(&gStartLock);
+    gStartState = ENGINE_STARTING;
+    pthread_mutex_unlock(&gStartLock);
 
     if (pthread_create(&gThread, NULL, engine_thread, NULL) != 0) {
-        gRunning = false;
+        pthread_mutex_lock(&gStartLock);
+        gStartState = ENGINE_IDLE;
+        pthread_mutex_unlock(&gStartLock);
+        pthread_mutex_unlock(&gLifecycleLock);
         return false;
     }
+    gThreadJoinable = true;
+
+    /* Wait for the streams to be on the bus. Normal bring-up is tens of
+     * milliseconds; the bound exists so a wedged control transfer surfaces as
+     * a failed start rather than a hung coreaudiod. StartIO is not on the IO
+     * path, so blocking here is the sanctioned way to start slowly -- and it
+     * is what guarantees the timeline anchor exists before the first
+     * GetZeroTimeStamp. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 8;
+
+    pthread_mutex_lock(&gStartLock);
+    while (gStartState == ENGINE_STARTING) {
+        if (pthread_cond_timedwait(&gStartCond, &gStartLock, &deadline) == ETIMEDOUT) break;
+    }
+    bool ok = (gStartState == ENGINE_STREAMING);
+    pthread_mutex_unlock(&gStartLock);
+
+    if (!ok) {
+        atomic_store_explicit(&gEngine.stopping, true, memory_order_relaxed);
+        pthread_join(gThread, NULL);
+        gThreadJoinable = false;
+        pthread_mutex_lock(&gStartLock);
+        gStartState = ENGINE_IDLE;
+        pthread_mutex_unlock(&gStartLock);
+        pthread_mutex_unlock(&gLifecycleLock);
+        return false;
+    }
+
+    pthread_mutex_unlock(&gLifecycleLock);
     return true;
 }
 
 void emu_engine_stop(void)
 {
-    if (!gRunning) return;
-    gEngine.stopping = true;
-    if (gEngine.run_loop) CFRunLoopStop(gEngine.run_loop);
+    pthread_mutex_lock(&gLifecycleLock);
+    if (!gThreadJoinable) {
+        pthread_mutex_unlock(&gLifecycleLock);
+        return;
+    }
+    bool was_running = atomic_load_explicit(&gRunning, memory_order_acquire);
+    atomic_store_explicit(&gEngine.stopping, true, memory_order_relaxed);
+    if (was_running && gEngine.run_loop) CFRunLoopStop(gEngine.run_loop);
     pthread_join(gThread, NULL);
-    gRunning = false;
+    gThreadJoinable = false;
+    atomic_store_explicit(&gRunning, false, memory_order_release);
+    pthread_mutex_lock(&gStartLock);
+    gStartState = ENGINE_IDLE;
+    pthread_mutex_unlock(&gStartLock);
+    pthread_mutex_unlock(&gLifecycleLock);
 }

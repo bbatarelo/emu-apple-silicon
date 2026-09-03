@@ -633,9 +633,24 @@ static void usage(void)
         "  clock-set <hz>       set one rate and verify it          (WRITES to device)\n"
         "  capture <hz> [ms] [trace.csv]\n"
         "                       record isochronous capture packets   (streams audio in)\n"
-        "  play <hz> [ms] [tone_hz] [amplitude_pct]\n"
+        "  play <hz> [ms] [tone_hz] [amplitude_pct] [opts]\n"
         "                       duplex engine: capture clocks playback of a sine\n"
-        "                       tone. Connect headphones to hear it.\n"
+        "                       tone. Connect headphones to hear it. 'short' picks\n"
+        "                       the 0.5 ms endpoint where the rate offers both,\n"
+        "                       'delay=<ms>' starts playback that far after capture,\n"
+        "                       'duty=<n>' polls capture on 1 interval in n,\n"
+        "                       'fbtrace=<f.csv>' logs 0x81 against host time,\n"
+        "                       'plan=device' sizes packets from 0x81 in full duplex,\n"
+        "                       'req=<ms>' audio queued per request (1 to 8, default 8),\n"
+        "                       'fbraw' follows 0x81 without correcting its scaling.\n"
+        "  play-only <hz> [ms] [tone_hz] [amplitude_pct] [short]\n"
+        "                       the same with the capture interface never opened:\n"
+        "                       the feedback endpoint sizes the packets and half\n"
+        "                       the traffic leaves the bus. Judge it by ear.\n"
+        "  play-idle <hz> [ms] [tone_hz] [amplitude_pct] [short]\n"
+        "                       capture claimed and streaming but never read: the\n"
+        "                       device's converter runs, nothing of it reaches the\n"
+        "                       bus. Splits 'the traffic' from 'the ADC'.\n"
         "  lltest [hz]          diagnostic: low-latency isoc frame granularity\n"
         "  clock-stress <from_hz> <to_hz> [iters] [delay_ms]\n"
         "                       repeat one transition to characterise\n"
@@ -695,7 +710,8 @@ int main(int argc, char** argv)
                 rc = emu_capture_run(dev, &model, &cfg);
             }
         }
-    } else if (strcmp(cmd, "play") == 0) {
+    } else if (strcmp(cmd, "play") == 0 || strcmp(cmd, "play-only") == 0
+               || strcmp(cmd, "play-idle") == 0) {
         if (argc < 3) { usage(); rc = 2; }
         else {
             uint32_t hz = (uint32_t)strtoul(argv[2], NULL, 10);
@@ -710,7 +726,26 @@ int main(int argc, char** argv)
                     .duration_ms = (argc > 3) ? (uint32_t)strtoul(argv[3], NULL, 10) : 5000,
                     .tone_hz     = (argc > 4) ? (uint32_t)strtoul(argv[4], NULL, 10) : 440,
                     .amplitude   = (argc > 5) ? strtod(argv[5], NULL) / 100.0 : 0.15,
+                    .playback_only  = strcmp(cmd, "play-only") == 0,
+                    .capture_idle   = strcmp(cmd, "play-idle") == 0,
                 };
+                /* Trailing options, in any order: 'short' and 'delay=<ms>'. */
+                for (int i = 6; i < argc; i++) {
+                    if (strcmp(argv[i], "short") == 0) cfg.short_interval = true;
+                    else if (strcmp(argv[i], "plan=device") == 0)
+                        cfg.plan_from_device = true;
+                    else if (strncmp(argv[i], "fbtrace=", 8) == 0)
+                        cfg.feedback_trace = argv[i] + 8;
+                    else if (strncmp(argv[i], "duty=", 5) == 0)
+                        cfg.capture_duty = (uint32_t)strtoul(argv[i] + 5, NULL, 10);
+                    else if (strncmp(argv[i], "delay=", 6) == 0)
+                        cfg.sync_delay_ms = (uint32_t)strtoul(argv[i] + 6, NULL, 10);
+                    else if (strncmp(argv[i], "req=", 4) == 0)
+                        cfg.request_ms = (uint32_t)strtoul(argv[i] + 4, NULL, 10);
+                    else if (strcmp(argv[i], "fbraw") == 0)
+                        cfg.feedback_raw = true;
+                    else fprintf(stderr, "warning: ignoring '%s'\n", argv[i]);
+                }
                 rc = emu_duplex_run(dev, &model, &cfg);
             }
         }
