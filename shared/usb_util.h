@@ -39,6 +39,17 @@ bool emu_find_isoc_pipe(IOUSBInterfaceInterface500** intf,
                         uint8_t* out_pipe,
                         uint16_t* out_max_packet);
 
+/* As above, and also reports the pipe's bInterval. The explicit feedback
+ * endpoint is polled on its own schedule -- `bInterval` 4 on this device, one
+ * entry per millisecond, while the data endpoint it belongs to may be serviced
+ * twice as often -- so a caller that queues both needs each pipe's own period
+ * rather than the interface's. `out_interval` and `out_max_packet` may be NULL. */
+bool emu_find_isoc_pipe_full(IOUSBInterfaceInterface500** intf,
+                             uint8_t direction,
+                             uint8_t* out_pipe,
+                             uint16_t* out_max_packet,
+                             uint8_t* out_interval);
+
 const char* emu_isoc_status_name(int32_t status);
 
 /* An isochronous frame that moved fewer bytes than requested reports underrun.

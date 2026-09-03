@@ -96,10 +96,11 @@ bool emu_find_interface(IOUSBDeviceInterface500** dev,
     return false;
 }
 
-bool emu_find_isoc_pipe(IOUSBInterfaceInterface500** intf,
-                        uint8_t direction,
-                        uint8_t* out_pipe,
-                        uint16_t* out_max_packet)
+bool emu_find_isoc_pipe_full(IOUSBInterfaceInterface500** intf,
+                             uint8_t direction,
+                             uint8_t* out_pipe,
+                             uint16_t* out_max_packet,
+                             uint8_t* out_interval)
 {
     UInt8 num_endpoints = 0;
     if ((*intf)->GetNumEndpoints(intf, &num_endpoints) != kIOReturnSuccess) {
@@ -117,11 +118,20 @@ bool emu_find_isoc_pipe(IOUSBInterfaceInterface500** intf,
         }
         if (transfer_type == kUSBIsoc && pipe_direction == direction) {
             *out_pipe = i;
-            *out_max_packet = max_packet;
+            if (out_max_packet) *out_max_packet = max_packet;
+            if (out_interval)   *out_interval = interval;
             return true;
         }
     }
     return false;
+}
+
+bool emu_find_isoc_pipe(IOUSBInterfaceInterface500** intf,
+                        uint8_t direction,
+                        uint8_t* out_pipe,
+                        uint16_t* out_max_packet)
+{
+    return emu_find_isoc_pipe_full(intf, direction, out_pipe, out_max_packet, NULL);
 }
 
 const char* emu_isoc_status_name(int32_t status)
