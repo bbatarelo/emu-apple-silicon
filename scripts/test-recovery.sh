@@ -24,6 +24,38 @@ counter() { "$CHECK" 2>/dev/null | awk -v k="$1" '$1 == k { print $2 }'; }
 settle()  { python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$1"; }
 
 FAILURES=0
+
+# Audio actually moving, not merely counters that look plausible.
+#
+# This exists because a refactor once left the engine streaming, recovering and
+# reporting every health counter correctly while playing pure silence: Core
+# Audio's writes and the USB requests were on different timelines, so every
+# frame was dropped as unmapped. The whole suite passed. framesBound is the
+# frames that reached a request, and it has to keep up with what Core Audio
+# handed over and keep moving.
+expect_audio() {
+    local label="$1" a b u0 u1
+    a="$(counter framesBound)";     a="${a:-0}"
+    u0="$(counter unmappedFrames)"; u0="${u0:-0}"
+    settle 1.5
+    b="$(counter framesBound)";     b="${b:-0}"
+    u1="$(counter unmappedFrames)"; u1="${u1:-0}"
+
+    # Both figures are deltas over the window, deliberately. unmappedFrames is
+    # cumulative and a rebuild legitimately adds to it: Core Audio keeps writing
+    # across the gap where no request exists to carry the audio, so those frames
+    # have nowhere to go and are counted. Requiring a lifetime zero would fail a
+    # correct recovery. What must be true afterwards is that it stops growing.
+    if [[ "$b" -gt "$a" ]] && [[ "$((u1 - u0))" -eq 0 ]]; then
+        printf "  \033[32mPASS\033[0m  %-34s framesBound +%s, unmapped +%s\n" \
+               "$label" "$((b - a))" "$((u1 - u0))"
+    else
+        printf "  \033[31mFAIL\033[0m  %-34s framesBound +%s (want >0), unmapped +%s (want +0)\n" \
+               "$label" "$((b - a))" "$((u1 - u0))"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 expect() {                       # expect <label> <key> <op> <value>
     local label="$1" key="$2" op="$3" want="$4" got
     got="$(counter "$key")"; got="${got:-0}"
@@ -54,6 +86,7 @@ echo "Preconditions"
 expect "engine is streaming"      engineStreaming eq 1
 expect "device is alive"          engineAlive     eq 1
 expect "no recoveries yet"        recoveries      eq 0
+expect_audio "audio is reaching the device"
 
 echo
 echo "1. Transient fault: the stream should rebuild itself"
@@ -61,6 +94,7 @@ echo "1. Transient fault: the stream should rebuild itself"
 expect "rebuilt at least once"    recoveries      ge 1
 expect "streaming again"          engineStreaming eq 1
 expect "still alive"              engineAlive     eq 1
+expect_audio "audio is flowing again"
 
 echo
 echo "2. Persistent fault: the engine should give up and say so"

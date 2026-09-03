@@ -232,6 +232,11 @@ static pthread_mutex_t   gStateMutex     = PTHREAD_MUTEX_INITIALIZER;
 static UInt32            gRefCount       = 0;
 static AudioServerPlugInHostRef gHost    = NULL;
 
+/* The transport for the one device this plug-in currently publishes. Stage 2
+ * replaces it with a registry keyed by AudioObjectID, at which point nothing
+ * else here has to change: every call already goes through the handle. */
+static EmuEngine* gEngine = NULL;
+
 /*
  * Whether the transport is still there.
  *
@@ -362,7 +367,7 @@ static Float32 volume_db_to_scalar(Float32 db)
 /* Gain the engine should apply, accounting for mute. Caller holds the lock. */
 static void push_gain_to_engine(void)
 {
-    emu_engine_set_output_gain(gMuted ? 0.0f : volume_scalar_to_gain(gVolumeScalar));
+    emu_engine_set_output_gain(gEngine, gMuted ? 0.0f : volume_scalar_to_gain(gVolumeScalar));
 }
 
 static void fill_stream_format(AudioStreamBasicDescription* format)
@@ -495,7 +500,13 @@ static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
         gHost = NULL;
         return kAudioHardwareUnspecifiedError;
     }
-    emu_engine_set_failure_handler(engine_failed);
+    gEngine = emu_engine_create();
+    if (!gEngine) {
+        EMU_LOG("initialize failed: could not create the USB transport");
+        gHost = NULL;
+        return kAudioHardwareUnspecifiedError;
+    }
+    emu_engine_set_failure_handler(gEngine, engine_failed);
     if (emu_engine_device_attached()) {
         EMU_LOG("initialized, publishing %{public}s at %{public}.0f Hz",
                 emu_engine_device_name(), gSampleRate);
@@ -1126,7 +1137,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kEMUProperty_FaultInject: {
                 if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
                 EmuEngineStats st;
-                emu_engine_stats(&st);
+                emu_engine_stats(gEngine, &st);
                 *(CFStringRef*)outData =
                     st.fault_mode == EMU_FAULT_TRANSIENT  ? CFSTR("transient")  :
                     st.fault_mode == EMU_FAULT_PERSISTENT ? CFSTR("persistent") : CFSTR("none");
@@ -1145,14 +1156,14 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
 
                 EmuEngineStats engine;
                 memset(&engine, 0, sizeof engine);
-                emu_engine_stats(&engine);
+                emu_engine_stats(gEngine, &engine);
 
                 struct { CFStringRef key; uint64_t value; } entries[] = {
                     { CFSTR("startIOCalls"),   atomic_load_explicit(&gStartIOCount, memory_order_relaxed) },
                     { CFSTR("ioCycles"),       atomic_load_explicit(&gIOCycles, memory_order_relaxed)     },
                     { CFSTR("framesToOutput"), atomic_load_explicit(&gFramesOut, memory_order_relaxed)    },
                     { CFSTR("ioClients"),      (uint64_t)gIOClients        },
-                    { CFSTR("engineRunning"),  emu_engine_running() ? 1u : 0u },
+                    { CFSTR("engineRunning"),  emu_engine_running(gEngine) ? 1u : 0u },
                     { CFSTR("framesPlayed"),   engine.frames_played        },
                     { CFSTR("outputLead"),     engine.output_lead          },
                     { CFSTR("outputUnderruns"), engine.underruns           },
@@ -1508,11 +1519,11 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
     }
 
     if (object == kObjectID_Device && address->mSelector == kEMUProperty_ResetCounters) {
-        emu_engine_reset_counters();
+        emu_engine_reset_counters(gEngine);
 
         EmuEngineStats engine;
         memset(&engine, 0, sizeof engine);
-        emu_engine_stats(&engine);
+        emu_engine_stats(gEngine, &engine);
 
         pthread_mutex_lock(&gStateMutex);
         gAnchorJitterNs = 0;
@@ -1595,7 +1606,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         if (mode == EMU_FAULT_NONE && !atomic_load(&gDeviceAlive)) {
             device_set_alive(true);
         }
-        emu_engine_inject_fault(mode);
+        emu_engine_inject_fault(gEngine, mode);
         EMU_LOG("fault injection set to %{public}s",
                 mode == EMU_FAULT_TRANSIENT  ? "transient" :
                 mode == EMU_FAULT_PERSISTENT ? "persistent" : "none");
@@ -1724,7 +1735,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
          * thread for the length of the discrepancy (FINDINGS). */
         /* gStateMutex is held here, so the effective answer is read against
          * the same rate the engine is about to be started at. */
-        if (!emu_engine_start((uint32_t)gSampleRate, gOutputSafetyUS,
+        if (!emu_engine_start(gEngine, (uint32_t)gSampleRate, gOutputSafetyUS,
                               input_wanted_locked())) {
             pthread_mutex_unlock(&gStateMutex);
             EMU_LOG("IO start failed: USB engine did not come up");
@@ -1735,7 +1746,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
          * diagnostic "host" clock source starts on the device's timeline
          * rather than at whatever mach_absolute_time StartIO ran at. */
         uint64_t frames = 0, host = 0;
-        gAnchorHostTime = emu_engine_timeline(&frames, &host) ? host : mach_absolute_time();
+        gAnchorHostTime = emu_engine_timeline(gEngine, &frames, &host) ? host : mach_absolute_time();
         gPeriodCount = 0;
         /* The one legitimate new timeline: a new session. Mid-stream the
          * engine keeps its line continuous through anything the bus does,
@@ -1766,7 +1777,7 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 cl
         /* Keep the client-count transition and the join indivisible from a
          * new StartIO. The engine does not acquire plug-in state, and StopIO
          * is already the control-thread operation that joins it. */
-        emu_engine_stop();
+        emu_engine_stop(gEngine);
     }
     pthread_mutex_unlock(&gStateMutex);
     if (last) EMU_LOG("IO stopped");
@@ -1813,7 +1824,7 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
     pthread_mutex_unlock(&gStateMutex);
 
     uint64_t deviceFrames = 0, deviceHost = 0;
-    if (followDevice && emu_engine_timeline(&deviceFrames, &deviceHost)) {
+    if (followDevice && emu_engine_timeline(gEngine, &deviceFrames, &deviceHost)) {
         pthread_mutex_lock(&gStateMutex);
 
         Float64 ticksPerFrame = host_ticks_per_second() / gSampleRate;
@@ -1948,7 +1959,7 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id,
     if (operation == kAudioServerPlugInIOOperationReadInput && mainBuffer) {
         Float64 pos = cycle ? cycle->mInputTime.mSampleTime : -1.0;
         if (pos >= 0.0) {
-            emu_engine_read_input((float*)mainBuffer, frameCount, (uint64_t)(pos + 0.5));
+            emu_engine_read_input(gEngine, (float*)mainBuffer, frameCount, (uint64_t)(pos + 0.5));
         } else {
             memset(mainBuffer, 0, (size_t)frameCount * CHANNELS * sizeof(float));
         }
@@ -1956,7 +1967,7 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id,
         Float64 pos = cycle ? cycle->mOutputTime.mSampleTime : -1.0;
         if (pos >= 0.0) {
             atomic_fetch_add_explicit(&gFramesOut, frameCount, memory_order_relaxed);
-            emu_engine_write_output((const float*)mainBuffer, frameCount,
+            emu_engine_write_output(gEngine, (const float*)mainBuffer, frameCount,
                                     (uint64_t)(pos + 0.5));
         }
     }

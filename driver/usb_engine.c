@@ -376,6 +376,16 @@ typedef struct {
     uint64_t                   generation;
 } Request;
 
+typedef enum { ENGINE_IDLE, ENGINE_STARTING, ENGINE_STREAMING, ENGINE_FAILED } EngineStartState;
+
+typedef struct {
+    /* Even: stable. Odd: the engine is rewriting this slot. */
+    _Atomic uint32_t seq;
+    _Atomic(uint8_t*) buffer;
+    _Atomic uint64_t  frame_start;
+    _Atomic uint64_t  frame_end;
+} BindSlot;
+
 struct Engine {
     const EmuDeviceIdentity*     identity;   /* what this opened; pinned while set */
     IOUSBDeviceInterface500**    device;
@@ -490,6 +500,43 @@ struct Engine {
      * the thread should exit. Faulted is the transport failing underneath it,
      * which is not a reason to exit -- it is a reason to rebuild. Conflating
      * the two is what turned one bad submission into a day of silence. */
+
+    /* ---- was file-scope state; per device now, so a second engine is a
+     * second instance rather than a second copy of the driver. ---- */
+    EmuRing input_ring;
+    pthread_t thread;
+    _Atomic bool running;
+    bool thread_joinable;
+    pthread_mutex_t lifecycle_lock;
+    pthread_mutex_t stats_lock;
+    EmuEngineStats final_stats;
+    bool have_final_stats;
+    uint32_t requested_rate;
+    uint32_t safety_us;
+    bool with_input;
+    _Atomic bool streaming;
+    _Atomic uint32_t fault_mode;
+    _Atomic uint32_t fault_countdown;
+    pthread_mutex_t start_lock;
+    pthread_cond_t start_cond;
+    EngineStartState start_state;
+    _Atomic float output_gain;
+    BindSlot bind_map[MAX_REQUESTS];
+    _Atomic uint32_t bind_count;
+    _Atomic uint32_t bind_gate;
+    _Atomic uint32_t bind_bpf;
+    _Atomic uint64_t bind_frontier;
+    _Atomic uint64_t bind_frames;
+    _Atomic uint64_t bind_unmapped;
+    _Atomic uint64_t bind_unmapped_ahead;
+    _Atomic uint64_t bind_write_lead;
+    _Atomic uint64_t bind_races;
+    _Atomic uint64_t bind_missing;
+    _Atomic uint32_t timeline_seq;
+    _Atomic uint64_t timeline_frames;
+    _Atomic uint64_t timeline_host;
+
+    void (* _Atomic failure_handler)(void);
     _Atomic bool stopping;
     _Atomic bool faulted;
 
@@ -499,20 +546,11 @@ struct Engine {
     CFRunLoopRef  run_loop;
 };
 
-static Engine       gEngine;
-static EmuRing      gInputRing;
-static pthread_t    gThread;
-static _Atomic bool  gRunning = false;
 /* StartIO/StopIO are control-thread calls, so serialize the complete
  * create/join lifecycle and the reuse of the singleton Engine here. */
-static pthread_mutex_t gLifecycleLock = PTHREAD_MUTEX_INITIALIZER;
-static bool            gThreadJoinable;
 /* Diagnostics are control-path work. This protects the final snapshot and
  * the singleton Engine's transition between sessions without ever entering
  * the Core Audio IO path. Live counters themselves remain atomic. */
-static pthread_mutex_t gStatsLock = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t     gSampleRate = 48000;
-static uint32_t     gOutputSafetyUS = 10000;
 /* Whether this session opens the capture interface at all.
  *
  * With capture open its packet lengths size the playback packets; without it
@@ -521,7 +559,6 @@ static uint32_t     gOutputSafetyUS = 10000;
  * 192 kHz drops playback packets while IN transactions are on the bus
  * (FINDINGS). The timeline is unaffected either way: it is anchored to
  * frames_played, which playback completions maintain. */
-static bool         gWithInput = true;
 
 /* Startup handshake: emu_engine_start blocks until the engine thread has the
  * streams scheduled and the timeline anchor published, or has failed. */
@@ -565,52 +602,44 @@ static os_log_t engine_log(void)
  * "persistent", which is the distinction this knob exists for. */
 #define TRANSIENT_FAULT_SUBMITS 3
 
-/* Transfers actually on the bus, as opposed to gRunning's "a start was
+/* Transfers actually on the bus, as opposed to e->running's "a start was
  * requested and no stop has arrived yet". */
-static _Atomic bool gStreaming = false;
 /* Invoked once when the engine gives up for good. */
-static void (* _Atomic gFailureHandler)(void) = NULL;
 
-static _Atomic uint32_t gFaultMode;
-static _Atomic uint32_t gFaultCountdown;
 
-void emu_engine_inject_fault(EmuFaultMode mode)
+void emu_engine_inject_fault(EmuEngine* e, EmuFaultMode mode)
 {
-    atomic_store_explicit(&gFaultCountdown,
+    if (!e) return;
+    atomic_store_explicit(&e->fault_countdown,
                           mode == EMU_FAULT_TRANSIENT ? TRANSIENT_FAULT_SUBMITS : 0,
                           memory_order_relaxed);
-    atomic_store_explicit(&gFaultMode, (uint32_t)mode, memory_order_relaxed);
+    atomic_store_explicit(&e->fault_mode, (uint32_t)mode, memory_order_relaxed);
     ENG_LOG("fault injection set to %u", (unsigned)mode);
 }
 
 /* True when this submission should be failed on purpose. */
-static bool fault_should_fail(void)
+static bool fault_should_fail(Engine* e)
 {
-    uint32_t mode = atomic_load_explicit(&gFaultMode, memory_order_relaxed);
+    uint32_t mode = atomic_load_explicit(&e->fault_mode, memory_order_relaxed);
     if (mode == EMU_FAULT_NONE) return false;
     if (mode == EMU_FAULT_PERSISTENT) return true;
 
-    uint32_t left = atomic_load_explicit(&gFaultCountdown, memory_order_relaxed);
+    uint32_t left = atomic_load_explicit(&e->fault_countdown, memory_order_relaxed);
     while (left > 0) {
-        if (atomic_compare_exchange_weak_explicit(&gFaultCountdown, &left, left - 1,
+        if (atomic_compare_exchange_weak_explicit(&e->fault_countdown, &left, left - 1,
                                                   memory_order_relaxed,
                                                   memory_order_relaxed)) {
             return true;
         }
     }
-    atomic_store_explicit(&gFaultMode, EMU_FAULT_NONE, memory_order_relaxed);
+    atomic_store_explicit(&e->fault_mode, EMU_FAULT_NONE, memory_order_relaxed);
     return false;
 }
 
-typedef enum { ENGINE_IDLE, ENGINE_STARTING, ENGINE_STREAMING, ENGINE_FAILED } EngineStartState;
-static pthread_mutex_t   gStartLock  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t    gStartCond  = PTHREAD_COND_INITIALIZER;
-static EngineStartState  gStartState = ENGINE_IDLE;
 
 /* Written by whichever thread handles a volume change, read on the USB fill
  * path. Plain atomic load/store; no ordering is needed beyond not tearing,
  * since a gain that lands one packet late is inaudible. */
-static _Atomic float gOutputGain = 1.0f;
 
 /* --- the bind map: the schedule, published to the IO thread ----------------
  *
@@ -652,62 +681,84 @@ static _Atomic float gOutputGain = 1.0f;
  * atomic modification order: the writer either enters before close and is
  * waited for, or observes the closed bit and never touches a buffer.
  */
-typedef struct {
-    /* Even: stable. Odd: the engine is rewriting this slot. */
-    _Atomic uint32_t seq;
-    _Atomic(uint8_t*) buffer;
-    _Atomic uint64_t  frame_start;
-    _Atomic uint64_t  frame_end;
-} BindSlot;
 
-static BindSlot         gBindMap[MAX_REQUESTS];
-/* How many slots of gBindMap are live, so the IO thread's lookup scans the
+/* How many slots of e->bind_map are live, so the IO thread's lookup scans the
  * schedule it actually has rather than the maximum it could have. */
-static _Atomic uint32_t gBindCount;
 /* Map liveness and writer ownership share one atomic modification order. */
 #define BIND_GATE_WRITING UINT32_C(1)
 #define BIND_GATE_CLOSED  (UINT32_C(1) << 31)
-static _Atomic uint32_t gBindGate = BIND_GATE_CLOSED;
-static _Atomic uint32_t gBindBytesPerFrame;
 /* The IO thread's own frontier: the first frame it has not written. The
  * output lead and the unwritten-frame count are both measured against it. */
-static _Atomic uint64_t gBindFrontier;
-static _Atomic uint64_t gBindFrames;
-static _Atomic uint64_t gBindUnmapped;
 /* Of the unmapped, those past the far end of the queue: frames Core Audio
  * wrote for bus time the engine has not scheduled yet. Tells the two failures
  * apart -- a write horizon deeper than the schedule (this) from audio for an
  * interval already written off (the rest). */
-static _Atomic uint64_t gBindUnmappedAhead;
 /* How far ahead of the play head Core Audio's writes actually reach, in
  * frames -- the high-water mark of (cycle end - frames played). This is the
  * number that sets how deep the request queue has to be for the direct path:
  * a map of submitted requests has no buffer at all for a frame no request
  * covers, so the schedule has to reach past where Core Audio writes. Nothing else in the driver knows it, because nothing else
  * needed to. */
-static _Atomic uint64_t gBindWriteLead;
-static _Atomic uint64_t gBindRaces;
-static _Atomic uint64_t gBindMissing;         /* frames that transmitted unwritten */
 
-static void bind_reset(void)
+
+/* Stage 1 keeps exactly one instance, but it is reached only through a handle
+ * and owns all of its own state, so a second device is a second create() call
+ * rather than a second copy of the driver. */
+static Engine gTheEngine;
+static bool   gTheEngineTaken;
+
+EmuEngine* emu_engine_create(void)
+{
+    if (gTheEngineTaken) return NULL;
+    Engine* e = &gTheEngine;
+    memset(e, 0, sizeof *e);
+    pthread_mutex_init(&e->lifecycle_lock, NULL);
+    pthread_mutex_init(&e->stats_lock, NULL);
+    pthread_mutex_init(&e->start_lock, NULL);
+    pthread_cond_init(&e->start_cond, NULL);
+    atomic_init(&e->running, false);
+    atomic_init(&e->streaming, false);
+    atomic_init(&e->stopping, false);
+    atomic_init(&e->faulted, false);
+    atomic_init(&e->output_gain, 1.0f);
+    atomic_init(&e->bind_gate, BIND_GATE_CLOSED);
+    e->start_state = ENGINE_IDLE;
+    e->requested_rate = 48000;
+    e->safety_us = 10000;
+    e->with_input = true;
+    gTheEngineTaken = true;
+    return e;
+}
+
+void emu_engine_destroy(EmuEngine* e)
+{
+    if (!e) return;
+    emu_engine_stop(e);
+    pthread_mutex_destroy(&e->lifecycle_lock);
+    pthread_mutex_destroy(&e->stats_lock);
+    pthread_mutex_destroy(&e->start_lock);
+    pthread_cond_destroy(&e->start_cond);
+    gTheEngineTaken = false;
+}
+static void bind_reset(Engine* e)
 {
     /* The preceding teardown drained the admitted writer. Keep admission
      * closed until the new session's complete map has been published. */
-    atomic_store_explicit(&gBindGate, BIND_GATE_CLOSED, memory_order_relaxed);
-    atomic_store_explicit(&gBindCount, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_gate, BIND_GATE_CLOSED, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_count, 0, memory_order_relaxed);
     for (int i = 0; i < MAX_REQUESTS; i++) {
-        atomic_store_explicit(&gBindMap[i].seq, 0, memory_order_relaxed);
-        atomic_store_explicit(&gBindMap[i].buffer, NULL, memory_order_relaxed);
-        atomic_store_explicit(&gBindMap[i].frame_start, 0, memory_order_relaxed);
-        atomic_store_explicit(&gBindMap[i].frame_end, 0, memory_order_relaxed);
+        atomic_store_explicit(&e->bind_map[i].seq, 0, memory_order_relaxed);
+        atomic_store_explicit(&e->bind_map[i].buffer, NULL, memory_order_relaxed);
+        atomic_store_explicit(&e->bind_map[i].frame_start, 0, memory_order_relaxed);
+        atomic_store_explicit(&e->bind_map[i].frame_end, 0, memory_order_relaxed);
     }
-    atomic_store_explicit(&gBindFrontier, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindFrames, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindUnmapped, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindUnmappedAhead, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindWriteLead, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindRaces, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindMissing, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_frontier, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_frames, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_unmapped, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_unmapped_ahead, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_write_lead, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_races, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_missing, 0, memory_order_relaxed);
 }
 
 /* Engine thread: this slot no longer describes anything a writer may touch.
@@ -718,19 +769,19 @@ static void bind_reset(void)
  * marker, and a writer would see a clean sequence over a half-rewritten
  * entry: exactly the tear the seqlock exists to prevent, reported as no race
  * at all. This is the Linux write_seqlock shape: bump, then smp_wmb. */
-static void bind_retire(size_t idx)
+static void bind_retire(Engine* e, size_t idx)
 {
-    uint32_t seq = atomic_load_explicit(&gBindMap[idx].seq, memory_order_relaxed);
+    uint32_t seq = atomic_load_explicit(&e->bind_map[idx].seq, memory_order_relaxed);
     if (seq & 1u) return;
-    atomic_store_explicit(&gBindMap[idx].seq, seq + 1, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_map[idx].seq, seq + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
 }
 
 /* Engine thread: this request is on the bus and its buffer is zeroed; here is
  * the slice of the timeline it carries. */
-static void bind_publish(size_t idx, uint8_t* buffer, uint64_t start, uint64_t end)
+static void bind_publish(Engine* e, size_t idx, uint8_t* buffer, uint64_t start, uint64_t end)
 {
-    BindSlot* s = &gBindMap[idx];
+    BindSlot* s = &e->bind_map[idx];
     uint32_t seq = atomic_load_explicit(&s->seq, memory_order_relaxed);
     if (!(seq & 1u)) {                       /* retire first, always */
         atomic_store_explicit(&s->seq, ++seq, memory_order_relaxed);
@@ -755,23 +806,23 @@ static void bind_publish(size_t idx, uint8_t* buffer, uint64_t start, uint64_t e
  * and dropped, and the walk skips to the next slot that does begin ahead of
  * here rather than probing frame by frame.
  */
-static void write_output_bind(const float* src, uint32_t count, uint64_t pos)
+static void write_output_bind(Engine* e, const float* src, uint32_t count, uint64_t pos)
 {
-    uint32_t bpf  = atomic_load_explicit(&gBindBytesPerFrame, memory_order_relaxed);
-    float    gain = atomic_load_explicit(&gOutputGain, memory_order_relaxed);
+    uint32_t bpf  = atomic_load_explicit(&e->bind_bpf, memory_order_relaxed);
+    float    gain = atomic_load_explicit(&e->output_gain, memory_order_relaxed);
     if (bpf == 0) return;
 
-    uint64_t played = atomic_load_explicit(&gEngine.frames_played, memory_order_relaxed);
+    uint64_t played = atomic_load_explicit(&e->frames_played, memory_order_relaxed);
     if (pos + count > played) {
         uint64_t lead = pos + count - played;
-        uint64_t seen = atomic_load_explicit(&gBindWriteLead, memory_order_relaxed);
-        if (lead > seen) atomic_store_explicit(&gBindWriteLead, lead, memory_order_relaxed);
+        uint64_t seen = atomic_load_explicit(&e->bind_write_lead, memory_order_relaxed);
+        if (lead > seen) atomic_store_explicit(&e->bind_write_lead, lead, memory_order_relaxed);
     }
 
     /* Constant for the session. The outer gate keeps teardown/restart from
      * changing the map while this callback is admitted, so load it once per
      * IO cycle rather than once per request-sized slice. */
-    uint32_t slots = atomic_load_explicit(&gBindCount, memory_order_acquire);
+    uint32_t slots = atomic_load_explicit(&e->bind_count, memory_order_acquire);
     uint64_t bound = 0, unmapped = 0, unmapped_ahead = 0, races = 0;
     uint32_t done = 0;
     while (done < count) {
@@ -783,13 +834,13 @@ static void write_output_bind(const float* src, uint32_t count, uint64_t pos)
         uint64_t start = 0, end = 0, next_start = UINT64_MAX, queue_end = 0;
 
         for (uint32_t i = 0; i < slots; i++) {
-            uint32_t s = atomic_load_explicit(&gBindMap[i].seq, memory_order_acquire);
+            uint32_t s = atomic_load_explicit(&e->bind_map[i].seq, memory_order_acquire);
             if (s & 1u) continue;                      /* being rewritten */
-            uint64_t st = atomic_load_explicit(&gBindMap[i].frame_start, memory_order_relaxed);
-            uint64_t en = atomic_load_explicit(&gBindMap[i].frame_end, memory_order_relaxed);
+            uint64_t st = atomic_load_explicit(&e->bind_map[i].frame_start, memory_order_relaxed);
+            uint64_t en = atomic_load_explicit(&e->bind_map[i].frame_end, memory_order_relaxed);
             if (frame >= st && frame < en) {
                 hit = i; seq0 = s; start = st; end = en;
-                buffer = atomic_load_explicit(&gBindMap[i].buffer, memory_order_relaxed);
+                buffer = atomic_load_explicit(&e->bind_map[i].buffer, memory_order_relaxed);
                 break;
             }
             if (st > frame && st < next_start) next_start = st;
@@ -822,7 +873,7 @@ static void write_output_bind(const float* src, uint32_t count, uint64_t pos)
          * still miss a pathological overlap, which is acceptable for a
          * best-effort counter that has no bearing on recovery or safety. */
         atomic_signal_fence(memory_order_seq_cst);
-        if (atomic_load_explicit(&gBindMap[hit].seq, memory_order_relaxed) != seq0) {
+        if (atomic_load_explicit(&e->bind_map[hit].seq, memory_order_relaxed) != seq0) {
             races++;
         } else {
             bound += n;
@@ -830,19 +881,19 @@ static void write_output_bind(const float* src, uint32_t count, uint64_t pos)
         done += n;
     }
 
-    uint64_t frontier = atomic_load_explicit(&gBindFrontier, memory_order_relaxed);
+    uint64_t frontier = atomic_load_explicit(&e->bind_frontier, memory_order_relaxed);
     if (pos + count > frontier) {
-        atomic_store_explicit(&gBindFrontier, pos + count, memory_order_release);
+        atomic_store_explicit(&e->bind_frontier, pos + count, memory_order_release);
     }
     /* Diagnostics are callback-granularity observations. Aggregate locally so
      * the normal path performs one relaxed RMW, not one per 2 ms map slice. */
-    if (bound) atomic_fetch_add_explicit(&gBindFrames, bound, memory_order_relaxed);
+    if (bound) atomic_fetch_add_explicit(&e->bind_frames, bound, memory_order_relaxed);
     if (unmapped)
-        atomic_fetch_add_explicit(&gBindUnmapped, unmapped, memory_order_relaxed);
+        atomic_fetch_add_explicit(&e->bind_unmapped, unmapped, memory_order_relaxed);
     if (unmapped_ahead)
-        atomic_fetch_add_explicit(&gBindUnmappedAhead, unmapped_ahead,
+        atomic_fetch_add_explicit(&e->bind_unmapped_ahead, unmapped_ahead,
                                   memory_order_relaxed);
-    if (races) atomic_fetch_add_explicit(&gBindRaces, races, memory_order_relaxed);
+    if (races) atomic_fetch_add_explicit(&e->bind_races, races, memory_order_relaxed);
 }
 
 /*
@@ -856,35 +907,33 @@ static void write_output_bind(const float* src, uint32_t count, uint64_t pos)
  * than useless. The writer is the single USB completion thread; readers retry
  * while a write is in progress, which on this path is a handful of nanoseconds.
  */
-static _Atomic uint32_t gTimelineSeq = 0;
-static _Atomic uint64_t gTimelineFrames = 0;
-static _Atomic uint64_t gTimelineHost = 0;
 
-static void timeline_publish(uint64_t frames, uint64_t host_time)
+static void timeline_publish(Engine* e, uint64_t frames, uint64_t host_time)
 {
-    uint32_t seq = atomic_load_explicit(&gTimelineSeq, memory_order_relaxed);
-    atomic_store_explicit(&gTimelineSeq, seq + 1, memory_order_relaxed);  /* odd */
+    uint32_t seq = atomic_load_explicit(&e->timeline_seq, memory_order_relaxed);
+    atomic_store_explicit(&e->timeline_seq, seq + 1, memory_order_relaxed);  /* odd */
     /* A release store only orders earlier accesses. The fence keeps the new
      * pair from becoming visible before readers see the odd marker. */
     atomic_thread_fence(memory_order_release);
-    atomic_store_explicit(&gTimelineFrames, frames, memory_order_relaxed);
-    atomic_store_explicit(&gTimelineHost, host_time, memory_order_relaxed);
-    atomic_store_explicit(&gTimelineSeq, seq + 2, memory_order_release);  /* even */
+    atomic_store_explicit(&e->timeline_frames, frames, memory_order_relaxed);
+    atomic_store_explicit(&e->timeline_host, host_time, memory_order_relaxed);
+    atomic_store_explicit(&e->timeline_seq, seq + 2, memory_order_release);  /* even */
 }
 
-bool emu_engine_timeline(uint64_t* frames, uint64_t* host_time)
+bool emu_engine_timeline(EmuEngine* e, uint64_t* frames, uint64_t* host_time)
 {
-    if (!atomic_load_explicit(&gRunning, memory_order_acquire)) return false;
+    if (!e) return false;
+    if (!atomic_load_explicit(&e->running, memory_order_acquire)) return false;
 
     for (int attempt = 0; attempt < 8; attempt++) {
-        uint32_t before = atomic_load_explicit(&gTimelineSeq, memory_order_acquire);
+        uint32_t before = atomic_load_explicit(&e->timeline_seq, memory_order_acquire);
         if (before & 1u) continue;                 /* write in progress */
-        uint64_t f = atomic_load_explicit(&gTimelineFrames, memory_order_relaxed);
-        uint64_t h = atomic_load_explicit(&gTimelineHost, memory_order_relaxed);
+        uint64_t f = atomic_load_explicit(&e->timeline_frames, memory_order_relaxed);
+        uint64_t h = atomic_load_explicit(&e->timeline_host, memory_order_relaxed);
         /* Keep both pair loads ahead of the validation load. This is the read
          * side of the seqlock; an acquire load alone orders only what follows. */
         atomic_thread_fence(memory_order_acquire);
-        uint32_t after = atomic_load_explicit(&gTimelineSeq, memory_order_relaxed);
+        uint32_t after = atomic_load_explicit(&e->timeline_seq, memory_order_relaxed);
         if (before == after) {
             if (h == 0) return false;              /* nothing published yet */
             *frames = f;
@@ -907,66 +956,71 @@ static uint64_t abs_to_ticks(AbsoluteTime t)
 
 /* --- public surface -------------------------------------------------------- */
 
-void emu_engine_write_output(const float* frames, uint32_t count, uint64_t sample_pos)
+void emu_engine_write_output(EmuEngine* e, const float* frames, uint32_t count, uint64_t sample_pos)
 {
+    if (!e) return;
     /* Core Audio serializes this device's single WriteMix stream on one IO
      * thread, so the low bit is ownership, not a general writer count. */
     uint32_t expected = 0;
     if (!atomic_compare_exchange_strong_explicit(
-            &gBindGate, &expected, BIND_GATE_WRITING,
+            &e->bind_gate, &expected, BIND_GATE_WRITING,
             memory_order_acquire, memory_order_relaxed)) {
         return;
     }
 
-    write_output_bind(frames, count, sample_pos);
-    atomic_fetch_and_explicit(&gBindGate, ~BIND_GATE_WRITING, memory_order_release);
+    write_output_bind(e, frames, count, sample_pos);
+    atomic_fetch_and_explicit(&e->bind_gate, ~BIND_GATE_WRITING, memory_order_release);
 }
 
-void emu_engine_set_output_gain(float gain)
+void emu_engine_set_output_gain(EmuEngine* e, float gain)
 {
+    if (!e) return;
     if (gain < 0.0f) gain = 0.0f;
     if (gain > 1.0f) gain = 1.0f;
-    atomic_store_explicit(&gOutputGain, gain, memory_order_relaxed);
+    atomic_store_explicit(&e->output_gain, gain, memory_order_relaxed);
 }
 
-void emu_engine_read_input(float* frames, uint32_t count, uint64_t sample_pos)
+void emu_engine_read_input(EmuEngine* e, float* frames, uint32_t count, uint64_t sample_pos)
 {
-    /* gWithInput, not in_intf: this runs on the IO thread and must not follow
+    if (!e) { memset(frames, 0, (size_t)count * EMU_RING_CHANNELS * sizeof(float)); return; }
+    /* e->with_input, not in_intf: this runs on the IO thread and must not follow
      * engine pointers the engine thread owns. Nothing writes the ring in this
      * mode, so reading it would only count underruns. */
-    if (atomic_load_explicit(&gRunning, memory_order_relaxed) && gWithInput) {
-        emu_ring_read_f32(&gInputRing, sample_pos, frames, count);
+    if (atomic_load_explicit(&e->running, memory_order_relaxed) && e->with_input) {
+        emu_ring_read_f32(&e->input_ring, sample_pos, frames, count);
     } else {
         memset(frames, 0, (size_t)count * EMU_RING_CHANNELS * sizeof(float));
     }
 }
 
-uint64_t emu_engine_frames_played(void)
+uint64_t emu_engine_frames_played(EmuEngine* e)
 {
-    return atomic_load_explicit(&gEngine.frames_played, memory_order_relaxed);
+    if (!e) return 0;
+    return atomic_load_explicit(&e->frames_played, memory_order_relaxed);
 }
 
-bool emu_engine_running(void)
+bool emu_engine_running(EmuEngine* e)
 {
-    return atomic_load_explicit(&gRunning, memory_order_acquire);
+    if (!e) return false;
+    return atomic_load_explicit(&e->running, memory_order_acquire);
 }
 
-bool emu_engine_streaming(void)
+bool emu_engine_streaming(EmuEngine* e)
 {
-    return atomic_load_explicit(&gStreaming, memory_order_acquire);
+    if (!e) return false;
+    return atomic_load_explicit(&e->streaming, memory_order_acquire);
 }
 
-void emu_engine_set_failure_handler(void (*handler)(void))
+void emu_engine_set_failure_handler(EmuEngine* e, void (*handler)(void))
 {
-    atomic_store_explicit(&gFailureHandler, handler, memory_order_relaxed);
+    if (!e) return;
+    atomic_store_explicit(&e->failure_handler, handler, memory_order_relaxed);
 }
 
 /* The last session's counters, captured after teardown drains the IO writer
  * and before the next start resets the engine. Without this, a post-mortem
  * `make check` after a bad session reads all zeros -- exactly when the
  * counters are wanted most. */
-static EmuEngineStats gFinalStats;
-static bool           gHaveFinalStats;
 
 /*
  * Zeroes the counters that only exist to be read.
@@ -975,116 +1029,124 @@ static bool           gHaveFinalStats;
  * derives its period from frames_played, so resetting it would send Core Audio's
  * sample time backwards, which it treats as a fault.
  */
-void emu_engine_reset_counters(void)
+void emu_engine_reset_counters(EmuEngine* e)
 {
-    pthread_mutex_lock(&gStatsLock);
-    atomic_store_explicit(&gInputRing.missing, 0, memory_order_relaxed);
-    atomic_store_explicit(&gInputRing.discarded, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.usb_errors, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.ts_fallbacks, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.resyncs, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.dead_frames, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.unfilled_playback, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.empty_capture, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.short_playback, 0, memory_order_relaxed);
+    if (!e) return;
+    pthread_mutex_lock(&e->stats_lock);
+    atomic_store_explicit(&e->input_ring.missing, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->input_ring.discarded, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->usb_errors, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->ts_fallbacks, 0, memory_order_relaxed);
+    /* Recovery history is diagnostics like the rest: without this a second
+     * measurement in the same coreaudiod session starts with the first one's
+     * faults already counted, and any test asserting a clean baseline can
+     * only ever pass once. */
+    atomic_store_explicit(&e->recoveries, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->recovery_failures, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->resyncs, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->dead_frames, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->unfilled_playback, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->empty_capture, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->short_playback, 0, memory_order_relaxed);
     /* The extremes and the change count describe a window; the last value and
      * the nominal describe the stream, and survive a reset. */
-    atomic_store_explicit(&gEngine.fb_packets, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.fb_silent, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.fb_errors, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.fb_rejected, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.fb_changes, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.fb_min_q16, 0, memory_order_relaxed);
-    atomic_store_explicit(&gEngine.fb_max_q16, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindFrames, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindUnmapped, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->fb_packets, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->fb_silent, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->fb_errors, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->fb_rejected, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->fb_changes, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->fb_min_q16, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->fb_max_q16, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_frames, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_unmapped, 0, memory_order_relaxed);
     /* Missing these two made `unmappedAhead` outlive its own superset, so a
      * cleared window reported a strict subset larger than the whole -- and
      * `unmappedAhead > 0` is exactly the "schedule too short" signal the
      * diagnostics tell the reader to trust. */
-    atomic_store_explicit(&gBindUnmappedAhead, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindWriteLead, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindRaces, 0, memory_order_relaxed);
-    atomic_store_explicit(&gBindMissing, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_unmapped_ahead, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_write_lead, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_races, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_missing, 0, memory_order_relaxed);
     /* The filter is engine-thread-owned. Reset the diagnostic window from its
      * atomically published mirror rather than reading the mutable Rust object
      * concurrently. */
     atomic_store_explicit(
-        &gEngine.ts_resets_zero,
-        atomic_load_explicit(&gEngine.ts_resets, memory_order_relaxed),
+        &e->ts_resets_zero,
+        atomic_load_explicit(&e->ts_resets, memory_order_relaxed),
         memory_order_relaxed);
     /* Asking for zeros while stopped means the last session's snapshot too,
      * otherwise stats would keep handing back the figures just cleared. */
-    gHaveFinalStats = false;
-    pthread_mutex_unlock(&gStatsLock);
+    e->have_final_stats = false;
+    pthread_mutex_unlock(&e->stats_lock);
 }
 
-void emu_engine_stats(EmuEngineStats* stats)
+void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
 {
+    if (!e || !stats) return;
     if (!stats) return;
-    pthread_mutex_lock(&gStatsLock);
-    if (!atomic_load_explicit(&gRunning, memory_order_acquire)) {
-        if (gHaveFinalStats) {
-            *stats = gFinalStats;
+    pthread_mutex_lock(&e->stats_lock);
+    if (!atomic_load_explicit(&e->running, memory_order_acquire)) {
+        if (e->have_final_stats) {
+            *stats = e->final_stats;
         } else {
             memset(stats, 0, sizeof *stats);
         }
-        pthread_mutex_unlock(&gStatsLock);
+        pthread_mutex_unlock(&e->stats_lock);
         return;
     }
-    stats->frames_played = emu_engine_frames_played();
-    stats->usb_errors = atomic_load_explicit(&gEngine.usb_errors, memory_order_relaxed);
-    stats->timestamp_fallbacks = atomic_load_explicit(&gEngine.ts_fallbacks, memory_order_relaxed);
-    uint64_t ts_resets = atomic_load_explicit(&gEngine.ts_resets, memory_order_relaxed);
+    stats->frames_played = emu_engine_frames_played(e);
+    stats->usb_errors = atomic_load_explicit(&e->usb_errors, memory_order_relaxed);
+    stats->timestamp_fallbacks = atomic_load_explicit(&e->ts_fallbacks, memory_order_relaxed);
+    uint64_t ts_resets = atomic_load_explicit(&e->ts_resets, memory_order_relaxed);
     uint64_t ts_resets_zero =
-        atomic_load_explicit(&gEngine.ts_resets_zero, memory_order_relaxed);
+        atomic_load_explicit(&e->ts_resets_zero, memory_order_relaxed);
     stats->timestamp_resets = ts_resets > ts_resets_zero
         ? ts_resets - ts_resets_zero : 0;
-    stats->resyncs = atomic_load_explicit(&gEngine.resyncs, memory_order_relaxed);
-    stats->dead_frames = atomic_load_explicit(&gEngine.dead_frames, memory_order_relaxed);
-    stats->unfilled_playback = atomic_load_explicit(&gEngine.unfilled_playback, memory_order_relaxed);
-    stats->short_playback = atomic_load_explicit(&gEngine.short_playback, memory_order_relaxed);
+    stats->resyncs = atomic_load_explicit(&e->resyncs, memory_order_relaxed);
+    stats->dead_frames = atomic_load_explicit(&e->dead_frames, memory_order_relaxed);
+    stats->unfilled_playback = atomic_load_explicit(&e->unfilled_playback, memory_order_relaxed);
+    stats->short_playback = atomic_load_explicit(&e->short_playback, memory_order_relaxed);
     stats->feedback_starved =
-        atomic_load_explicit(&gEngine.feedback_starved, memory_order_relaxed);
+        atomic_load_explicit(&e->feedback_starved, memory_order_relaxed);
     stats->feedback_overflows =
-        atomic_load_explicit(&gEngine.feedback_overflows, memory_order_relaxed);
+        atomic_load_explicit(&e->feedback_overflows, memory_order_relaxed);
 
-    stats->feedback_packets  = atomic_load_explicit(&gEngine.fb_packets, memory_order_relaxed);
-    stats->feedback_silent   = atomic_load_explicit(&gEngine.fb_silent, memory_order_relaxed);
-    stats->feedback_errors   = atomic_load_explicit(&gEngine.fb_errors, memory_order_relaxed);
-    stats->feedback_rejected = atomic_load_explicit(&gEngine.fb_rejected, memory_order_relaxed);
-    stats->feedback_changes  = atomic_load_explicit(&gEngine.fb_changes, memory_order_relaxed);
-    stats->feedback_q16      = atomic_load_explicit(&gEngine.fb_value_q16, memory_order_relaxed);
-    stats->feedback_min_q16  = atomic_load_explicit(&gEngine.fb_min_q16, memory_order_relaxed);
-    stats->feedback_max_q16  = atomic_load_explicit(&gEngine.fb_max_q16, memory_order_relaxed);
-    stats->feedback_nominal_q16 = gEngine.fb_nominal_q16;
+    stats->feedback_packets  = atomic_load_explicit(&e->fb_packets, memory_order_relaxed);
+    stats->feedback_silent   = atomic_load_explicit(&e->fb_silent, memory_order_relaxed);
+    stats->feedback_errors   = atomic_load_explicit(&e->fb_errors, memory_order_relaxed);
+    stats->feedback_rejected = atomic_load_explicit(&e->fb_rejected, memory_order_relaxed);
+    stats->feedback_changes  = atomic_load_explicit(&e->fb_changes, memory_order_relaxed);
+    stats->feedback_q16      = atomic_load_explicit(&e->fb_value_q16, memory_order_relaxed);
+    stats->feedback_min_q16  = atomic_load_explicit(&e->fb_min_q16, memory_order_relaxed);
+    stats->feedback_max_q16  = atomic_load_explicit(&e->fb_max_q16, memory_order_relaxed);
+    stats->feedback_nominal_q16 = e->fb_nominal_q16;
 
     /* How far Core Audio's writes lead the play head, and how many frames
      * transmitted before it got to them: the two questions the output path
      * has to answer, asked of the frontier the IO thread publishes. */
-    uint64_t frontier = atomic_load_explicit(&gBindFrontier, memory_order_acquire);
+    uint64_t frontier = atomic_load_explicit(&e->bind_frontier, memory_order_acquire);
     stats->output_lead     = frontier > stats->frames_played
                            ? (uint32_t)(frontier - stats->frames_played) : 0;
-    stats->underruns       = atomic_load_explicit(&gBindMissing, memory_order_relaxed);
-    stats->frames_bound    = atomic_load_explicit(&gBindFrames, memory_order_relaxed);
-    stats->unmapped_frames = atomic_load_explicit(&gBindUnmapped, memory_order_relaxed);
-    stats->unmapped_ahead  = atomic_load_explicit(&gBindUnmappedAhead, memory_order_relaxed);
-    stats->write_lead_max  = atomic_load_explicit(&gBindWriteLead, memory_order_relaxed);
-    stats->bind_races      = atomic_load_explicit(&gBindRaces, memory_order_relaxed);
-    stats->schedule_requests = gEngine.num_requests;
-    stats->schedule_clamped  = gEngine.schedule_clamped;
+    stats->underruns       = atomic_load_explicit(&e->bind_missing, memory_order_relaxed);
+    stats->frames_bound    = atomic_load_explicit(&e->bind_frames, memory_order_relaxed);
+    stats->unmapped_frames = atomic_load_explicit(&e->bind_unmapped, memory_order_relaxed);
+    stats->unmapped_ahead  = atomic_load_explicit(&e->bind_unmapped_ahead, memory_order_relaxed);
+    stats->write_lead_max  = atomic_load_explicit(&e->bind_write_lead, memory_order_relaxed);
+    stats->bind_races      = atomic_load_explicit(&e->bind_races, memory_order_relaxed);
+    stats->schedule_requests = e->num_requests;
+    stats->schedule_clamped  = e->schedule_clamped;
 
-    stats->input_enabled   = gWithInput;
-    stats->frames_captured = atomic_load_explicit(&gEngine.frames_captured, memory_order_relaxed);
-    stats->input_depth     = emu_ring_depth(&gInputRing);
-    stats->input_underruns = atomic_load_explicit(&gInputRing.missing, memory_order_relaxed);
-    stats->input_overruns  = atomic_load_explicit(&gInputRing.discarded, memory_order_relaxed);
-    stats->empty_capture   = atomic_load_explicit(&gEngine.empty_capture, memory_order_relaxed);
-    pthread_mutex_unlock(&gStatsLock);
-    stats->engine_streaming   = emu_engine_streaming() ? 1u : 0u;
-    stats->recoveries         = atomic_load_explicit(&gEngine.recoveries, memory_order_relaxed);
-    stats->recovery_failures  = atomic_load_explicit(&gEngine.recovery_failures, memory_order_relaxed);
-    stats->fault_mode         = atomic_load_explicit(&gFaultMode, memory_order_relaxed);
+    stats->input_enabled   = e->with_input;
+    stats->frames_captured = atomic_load_explicit(&e->frames_captured, memory_order_relaxed);
+    stats->input_depth     = emu_ring_depth(&e->input_ring);
+    stats->input_underruns = atomic_load_explicit(&e->input_ring.missing, memory_order_relaxed);
+    stats->input_overruns  = atomic_load_explicit(&e->input_ring.discarded, memory_order_relaxed);
+    stats->empty_capture   = atomic_load_explicit(&e->empty_capture, memory_order_relaxed);
+    pthread_mutex_unlock(&e->stats_lock);
+    stats->engine_streaming   = emu_engine_streaming(e) ? 1u : 0u;
+    stats->recoveries         = atomic_load_explicit(&e->recoveries, memory_order_relaxed);
+    stats->recovery_failures  = atomic_load_explicit(&e->recovery_failures, memory_order_relaxed);
+    stats->fault_mode         = atomic_load_explicit(&e->fault_mode, memory_order_relaxed);
 }
 
 /* --- transfers ------------------------------------------------------------- */
@@ -1109,7 +1171,7 @@ static IOReturn submit_capture(Request* req)
     req->frame_start = e->next_in_frame;
     e->next_in_frame += REQUEST_MS;
 
-    if (fault_should_fail()) return kIOReturnNotResponding;
+    if (fault_should_fail(e)) return kIOReturnNotResponding;
 
     IOReturn result = (*e->in_intf)->LowLatencyReadIsochPipeAsync(
         e->in_intf, e->in_pipe, req->buffer, req->frame_start,
@@ -1264,7 +1326,7 @@ static IOReturn submit_playback(Request* req)
     /* From here until this request is back on the bus its buffer belongs to
      * nobody: the IO thread must not be writing the old range's audio into
      * bytes about to be zeroed for a new one. */
-    bind_retire(idx);
+    bind_retire(e, idx);
 
     req->data_frame_start = e->out_cursor;
 
@@ -1305,7 +1367,7 @@ static IOReturn submit_playback(Request* req)
     req->frame_start = e->next_out_frame;
     e->next_out_frame += REQUEST_MS;
 
-    IOReturn result = fault_should_fail()
+    IOReturn result = fault_should_fail(e)
         ? kIOReturnNotResponding
         : (*e->out_intf)->LowLatencyWriteIsochPipeAsync(
         e->out_intf, e->out_pipe, req->buffer, req->frame_start,
@@ -1329,7 +1391,7 @@ static IOReturn submit_playback(Request* req)
     /* On the bus, buffer zeroed, slice of the timeline known: everything a
      * writer needs. Published only now, so a failed submission leaves the slot
      * retired rather than advertising a request that never went out. */
-    bind_publish(idx, (uint8_t*)req->buffer,
+    bind_publish(e, idx, (uint8_t*)req->buffer,
                  req->data_frame_start, req->data_frame_end);
     return kIOReturnSuccess;
 }
@@ -1350,11 +1412,11 @@ static IOReturn submit_playback(Request* req)
 static void bind_audit(Engine* e, size_t next)
 {
     const Request* req = &e->out_requests[next % e->num_requests];
-    uint64_t frontier = atomic_load_explicit(&gBindFrontier, memory_order_acquire);
+    uint64_t frontier = atomic_load_explicit(&e->bind_frontier, memory_order_acquire);
     if (frontier == 0 || req->data_frame_end <= frontier) return;
 
     uint64_t base = req->data_frame_start > frontier ? req->data_frame_start : frontier;
-    atomic_fetch_add_explicit(&gBindMissing, req->data_frame_end - base,
+    atomic_fetch_add_explicit(&e->bind_missing, req->data_frame_end - base,
                               memory_order_relaxed);
     atomic_fetch_add_explicit(&e->unfilled_playback, 1, memory_order_relaxed);
 }
@@ -1421,7 +1483,7 @@ static void reschedule(Engine* e)
      * stale immediately and would report a rebuild on every call. */
     if (e->in_intf && e->next_in_frame < start) {
         uint64_t gap = frames_in_ms(e, start - e->next_in_frame);
-        emu_ring_write_silence(&gInputRing, e->in_cursor, (uint32_t)gap);
+        emu_ring_write_silence(&e->input_ring, e->in_cursor, (uint32_t)gap);
         e->in_cursor += gap;
         atomic_fetch_add_explicit(&e->frames_captured, gap, memory_order_relaxed);
         e->next_in_frame = start;
@@ -1499,7 +1561,7 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
              * rate up to 96 kHz. The read stays inside the packet either way:
              * lead + frames x bytes_per_frame is frActCount exactly. */
             uint32_t lead = f->frActCount % e->bytes_per_frame;
-            emu_ring_write_s24(&gInputRing, e->in_cursor,
+            emu_ring_write_s24(&e->input_ring, e->in_cursor,
                                (const uint8_t*)req->buffer + offset + lead, frames);
         } else {
             /* Nothing usable for this interval: an error, or one of the empty
@@ -1512,7 +1574,7 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
              * One pop draws the nominal instead, which is within a frame of
              * what the measurement would have said. */
             frames = e->nominal_frames;
-            emu_ring_write_silence(&gInputRing, e->in_cursor, frames);
+            emu_ring_write_silence(&e->input_ring, e->in_cursor, frames);
             if (!atomic_load_explicit(&e->stopping, memory_order_relaxed))
                 atomic_fetch_add_explicit(&e->empty_capture, 1, memory_order_relaxed);
         }
@@ -1614,7 +1676,7 @@ static void playback_complete(void* refcon, IOReturn result, void* arg0)
             uint64_t filtered = emu_ts_filter_apply(e->ts_filter, stamp);
             atomic_store_explicit(&e->ts_resets, emu_ts_filter_resets(e->ts_filter),
                                   memory_order_relaxed);
-            timeline_publish(
+            timeline_publish(e, 
                 atomic_load_explicit(&e->frames_played, memory_order_relaxed), filtered);
         }
 
@@ -1773,9 +1835,9 @@ static void teardown(Engine* e)
      * timeout: once admission is closed a healthy writer cannot block, and
      * freeing beneath an unhealthy one would turn a stuck daemon into memory
      * corruption. */
-    atomic_fetch_or_explicit(&gBindGate, BIND_GATE_CLOSED, memory_order_acq_rel);
-    for (int i = 0; i < MAX_REQUESTS; i++) bind_retire((size_t)i);
-    while ((atomic_load_explicit(&gBindGate, memory_order_acquire) &
+    atomic_fetch_or_explicit(&e->bind_gate, BIND_GATE_CLOSED, memory_order_acq_rel);
+    for (int i = 0; i < MAX_REQUESTS; i++) bind_retire(e, (size_t)i);
+    while ((atomic_load_explicit(&e->bind_gate, memory_order_acquire) &
             BIND_GATE_WRITING) != 0) {
         usleep(1000);
     }
@@ -1878,12 +1940,12 @@ static void clear_engine_thread_policy(void)
     mach_port_deallocate(mach_task_self(), thread);
 }
 
-static void signal_start_state(EngineStartState state)
+static void signal_start_state(Engine* e, EngineStartState state)
 {
-    pthread_mutex_lock(&gStartLock);
-    gStartState = state;
-    pthread_cond_broadcast(&gStartCond);
-    pthread_mutex_unlock(&gStartLock);
+    pthread_mutex_lock(&e->start_lock);
+    e->start_state = state;
+    pthread_cond_broadcast(&e->start_cond);
+    pthread_mutex_unlock(&e->start_lock);
 }
 
 /*
@@ -1932,13 +1994,13 @@ typedef enum { kSessionSetupFailed = -1, kSessionStopped = 0, kSessionFaulted = 
 
 static SessionEnd stream_session(Engine* e, bool announced)
 {
-    emu_ring_reset(&gInputRing);
+    emu_ring_reset(&e->input_ring);
 
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);
     e->ticks_per_ms = (uint64_t)(1000000.0 * (double)tb.denom / (double)tb.numer);
-    e->sample_rate = gSampleRate;
-    bind_reset();
+    e->sample_rate = e->requested_rate;
+    bind_reset(e);
 
 #define ENGINE_FAIL() do { teardown(e); return kSessionSetupFailed; } while (0)
 
@@ -1955,10 +2017,10 @@ static SessionEnd stream_session(Engine* e, bool announced)
         ENGINE_FAIL();
     }
 
-    if (!set_clock_rate(e, &model, gSampleRate)) ENGINE_FAIL();
+    if (!set_clock_rate(e, &model, e->requested_rate)) ENGINE_FAIL();
 
     if (!emu_find_interface(e->device, 1, &e->out_intf)) ENGINE_FAIL();
-    if (gWithInput && !emu_find_interface(e->device, 2, &e->in_intf)) ENGINE_FAIL();
+    if (e->with_input && !emu_find_interface(e->device, 2, &e->in_intf)) ENGINE_FAIL();
 
     if ((*e->out_intf)->USBInterfaceOpen(e->out_intf) != kIOReturnSuccess) {
         ENGINE_FAIL();
@@ -1970,8 +2032,8 @@ static SessionEnd stream_session(Engine* e, bool announced)
     /* Interface 2 stays at alternate setting 0 when it is not opened: no
      * bandwidth reserved for it, and no IN transaction on the bus. */
     const EmuAltSetting *out_alt = NULL, *in_alt = NULL;
-    if (!select_alt(e->out_intf, &model, 1, gSampleRate, &out_alt)) ENGINE_FAIL();
-    if (e->in_intf && !select_alt(e->in_intf, &model, 2, gSampleRate, &in_alt)) {
+    if (!select_alt(e->out_intf, &model, 1, e->requested_rate, &out_alt)) ENGINE_FAIL();
+    if (e->in_intf && !select_alt(e->in_intf, &model, 2, e->requested_rate, &in_alt)) {
         ENGINE_FAIL();
     }
 
@@ -1994,7 +2056,7 @@ static SessionEnd stream_session(Engine* e, bool announced)
     if (e->bytes_per_frame == 0) e->bytes_per_frame = 6;
     /* The direct path's whole map, besides the per-request ranges: a
      * request's byte layout is linear in this. */
-    atomic_store_explicit(&gBindBytesPerFrame, e->bytes_per_frame, memory_order_relaxed);
+    atomic_store_explicit(&e->bind_bpf, e->bytes_per_frame, memory_order_relaxed);
 
     uint32_t period = 1u << (out_alt->interval - 1);
     e->entries_per_ms = period >= 8 ? 1 : (8 / period);
@@ -2002,11 +2064,11 @@ static SessionEnd stream_session(Engine* e, bool announced)
     if (e->entries_per_request > MAX_ENTRIES) e->entries_per_request = MAX_ENTRIES;
 
     double interval_ms = (double)period * 0.125;
-    e->nominal_frames = (uint32_t)(gSampleRate * interval_ms / 1000.0);
+    e->nominal_frames = (uint32_t)(e->requested_rate * interval_ms / 1000.0);
     /* Exact, in Q16.16: at 176.4 kHz a 0.5 ms interval holds 88.2 frames, and
      * a feedback value has to be judged against that rather than against the
      * 88 the truncation above leaves. */
-    e->fb_nominal_q16 = (uint32_t)(((uint64_t)gSampleRate << 16) * period / 8000u);
+    e->fb_nominal_q16 = (uint32_t)(((uint64_t)e->requested_rate << 16) * period / 8000u);
     if (e->fb_pipe) {
         uint32_t fb_period = 1u << (e->fb_interval - 1);
         uint32_t fb_per_ms = fb_period >= 8 ? 1 : (8 / fb_period);
@@ -2016,8 +2078,8 @@ static SessionEnd stream_session(Engine* e, bool announced)
         e->fb_num_requests = FB_REQUESTS;
     }
     /* Now that frames-per-request is known. Before any buffer is allocated. */
-    e->num_requests = schedule_depth(e, gOutputSafetyUS);
-    emu_feedback_set_nominal(e->feedback, gSampleRate, (uint64_t)(interval_ms * 1e6));
+    e->num_requests = schedule_depth(e, e->safety_us);
+    emu_feedback_set_nominal(e->feedback, e->requested_rate, (uint64_t)(interval_ms * 1e6));
 
     CFRunLoopSourceRef in_source = NULL, out_source = NULL;
     if ((*e->out_intf)->CreateInterfaceAsyncEventSource(e->out_intf, &out_source) != kIOReturnSuccess) {
@@ -2086,7 +2148,27 @@ static SessionEnd stream_session(Engine* e, bool announced)
     e->ts_filter = emu_ts_filter_init(e->ts_filter_storage, start_host,
                                       REQUEST_MS * e->ticks_per_ms);
     if (!e->ts_filter) ENGINE_FAIL();
-    timeline_publish(0, start_host);
+
+    /*
+     * Resume on the timeline rather than restarting it.
+     *
+     * On a first start session_reset has already put frames_played at zero, so
+     * this is the original "sample 0 is the first packet". On a *rebuild* it is
+     * the frame the device had reached before the fault, and it has to be:
+     * Core Audio's sample time follows frames_played and does not restart mid
+     * session, so publishing zero here would leave it writing near the start of
+     * the timeline while the fresh requests carry frames from far along it --
+     * no request covering anything written, every frame dropped as unmapped,
+     * and silence with the whole transport reporting healthy.
+     *
+     * The cursors are pinned to the same value for the same reason: out_cursor
+     * survives teardown, and left alone it would resume an in-flight window
+     * ahead of where the anchor says the device is.
+     */
+    uint64_t resume = atomic_load_explicit(&e->frames_played, memory_order_relaxed);
+    e->out_cursor = resume;
+    e->in_cursor  = resume;
+    timeline_publish(e, resume, start_host);
 
 #undef ENGINE_FAIL
 
@@ -2115,23 +2197,23 @@ static SessionEnd stream_session(Engine* e, bool announced)
         }
     }
 
-    atomic_store_explicit(&gBindCount, e->num_requests, memory_order_release);
+    atomic_store_explicit(&e->bind_count, e->num_requests, memory_order_release);
 
     /* The map describes the whole queue now, so writers may use it. Opening
      * the gate publishes every preceding map write before StartIO returns. */
-    atomic_store_explicit(&gBindGate, 0, memory_order_release);
+    atomic_store_explicit(&e->bind_gate, 0, memory_order_release);
 
-    atomic_store_explicit(&gRunning, true, memory_order_release);
-    atomic_store_explicit(&gStreaming, true, memory_order_release);
+    atomic_store_explicit(&e->running, true, memory_order_release);
+    atomic_store_explicit(&e->streaming, true, memory_order_release);
     /* The start handshake is answered once, by the first session. A rebuild
      * must not signal it again: StartIO has long since returned. */
-    if (!announced) signal_start_state(ENGINE_STREAMING);
+    if (!announced) signal_start_state(e, ENGINE_STREAMING);
 
     while (!atomic_load_explicit(&e->stopping, memory_order_relaxed) &&
            !atomic_load_explicit(&e->faulted, memory_order_relaxed)) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
     }
-    atomic_store_explicit(&gStreaming, false, memory_order_release);
+    atomic_store_explicit(&e->streaming, false, memory_order_release);
 
     clear_engine_thread_policy();
 
@@ -2150,7 +2232,7 @@ static SessionEnd stream_session(Engine* e, bool announced)
     /* Closing the gate drains the last IO callback, so take the post-mortem
      * only after teardown: every callback-local diagnostic has landed and no
      * live counter can still change. Engine storage is reset at the next
-     * start, under gStatsLock, rather than while diagnostics may read it. */
+     * start, under e->stats_lock, rather than while diagnostics may read it. */
     teardown(e);
     return atomic_load_explicit(&e->faulted, memory_order_relaxed)
          ? kSessionFaulted : kSessionStopped;
@@ -2167,19 +2249,53 @@ static SessionEnd stream_session(Engine* e, bool announced)
  * exhausted retry budget ends the session -- telling the plug-in, rather than
  * going quiet.
  */
+/*
+ * Start a session's timeline from zero.
+ *
+ * Core Audio restarts its own sample time at every StartIO, so the engine has
+ * to restart with it: leave out_cursor where the last session ended and the
+ * two sides address different frames entirely -- Core Audio writes near zero,
+ * the requests cover somewhere past nine million, no request covers anything
+ * written, and every frame is dropped as unmapped. That is silence with the
+ * whole transport reporting healthy.
+ *
+ * A *rebuild* must never come here. There the timeline is mid-flight and
+ * agreed between both sides, and restarting it would send Core Audio's sample
+ * time backwards, which it treats as a fault.
+ *
+ * This replaces a memset of the whole Engine, which cannot be used any more:
+ * the locks now live in the struct and are initialised once in create(), and
+ * emu_engine_start writes the configuration before this thread runs. Zeroing
+ * either would be worse than the bug it fixes, so the fields are listed.
+ */
+static void session_reset(Engine* e)
+{
+    atomic_store_explicit(&e->frames_played, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->frames_captured, 0, memory_order_relaxed);
+    e->out_cursor = 0;
+    e->in_cursor  = 0;
+    e->generation = 0;
+
+    atomic_store_explicit(&e->timeline_seq, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->timeline_frames, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->timeline_host, 0, memory_order_relaxed);
+
+    bind_reset(e);
+    emu_engine_reset_counters(e);
+}
+
 static void* engine_thread(void* arg)
 {
-    (void)arg;
-    Engine* e = &gEngine;
+    Engine* e = (Engine*)arg;
 
     /* Once, here rather than per session: a rebuild must keep frames_played --
      * Core Audio derives sample time from it and treats a backwards step as a
      * fault -- and every counter with it. */
-    pthread_mutex_lock(&gStatsLock);
-    memset(e, 0, sizeof *e);
-    atomic_init(&e->stopping, false);
-    atomic_init(&e->faulted, false);
-    pthread_mutex_unlock(&gStatsLock);
+    /* Once per session, before the rebuild loop: the timeline starts at zero
+     * with Core Audio's, and every rebuild below keeps it. */
+    session_reset(e);
+    atomic_store_explicit(&e->stopping, false, memory_order_relaxed);
+    atomic_store_explicit(&e->faulted, false, memory_order_relaxed);
 
     bool announced = false;
     unsigned attempt = 0;
@@ -2217,8 +2333,8 @@ static void* engine_thread(void* arg)
              * retrying: StartIO is blocked on this handshake, and a device
              * that is not there when Core Audio asks is better reported than
              * waited for. */
-            ENG_ERR("stream did not come up at %u Hz", gSampleRate);
-            signal_start_state(ENGINE_FAILED);
+            ENG_ERR("stream did not come up at %u Hz", e->requested_rate);
+            signal_start_state(e, ENGINE_FAILED);
             break;
         }
         announced = true;
@@ -2262,58 +2378,59 @@ static void* engine_thread(void* arg)
         }
     }
 
-    atomic_store_explicit(&gStreaming, false, memory_order_release);
-    emu_engine_stats(&gFinalStats);
-    pthread_mutex_lock(&gStatsLock);
-    gHaveFinalStats = true;
-    pthread_mutex_unlock(&gStatsLock);
+    atomic_store_explicit(&e->streaming, false, memory_order_release);
+    emu_engine_stats(e, &e->final_stats);
+    pthread_mutex_lock(&e->stats_lock);
+    e->have_final_stats = true;
+    pthread_mutex_unlock(&e->stats_lock);
 
     bool gave_up = announced &&
                    !atomic_load_explicit(&e->stopping, memory_order_relaxed);
-    atomic_store_explicit(&gRunning, false, memory_order_release);
+    atomic_store_explicit(&e->running, false, memory_order_release);
 
     /* Last, and outside everything: the handler re-enters the plug-in, which
      * must not find the engine half torn down. */
     if (gave_up) {
         void (*handler)(void) =
-            atomic_load_explicit(&gFailureHandler, memory_order_relaxed);
+            atomic_load_explicit(&e->failure_handler, memory_order_relaxed);
         if (handler) handler();
     }
     return NULL;
 }
 
-bool emu_engine_start(uint32_t sample_rate, uint32_t output_safety_us,
+bool emu_engine_start(EmuEngine* e, uint32_t sample_rate, uint32_t output_safety_us,
                       bool with_input)
 {
-    pthread_mutex_lock(&gLifecycleLock);
-    if (atomic_load_explicit(&gRunning, memory_order_acquire)) {
-        pthread_mutex_unlock(&gLifecycleLock);
+    if (!e) return false;
+    pthread_mutex_lock(&e->lifecycle_lock);
+    if (atomic_load_explicit(&e->running, memory_order_acquire)) {
+        pthread_mutex_unlock(&e->lifecycle_lock);
         return true;
     }
     /* A transport may have stopped itself after a runtime USB failure. Reap
      * that finished session before reusing its singleton Engine storage. */
-    if (gThreadJoinable) {
-        pthread_join(gThread, NULL);
-        gThreadJoinable = false;
+    if (e->thread_joinable) {
+        pthread_join(e->thread, NULL);
+        e->thread_joinable = false;
     }
-    gSampleRate = sample_rate;
-    gOutputSafetyUS = output_safety_us;
-    gWithInput = with_input;
-    atomic_store_explicit(&gTimelineFrames, 0, memory_order_relaxed);
-    atomic_store_explicit(&gTimelineHost, 0, memory_order_relaxed);
+    e->requested_rate = sample_rate;
+    e->safety_us = output_safety_us;
+    e->with_input = with_input;
+    atomic_store_explicit(&e->timeline_frames, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->timeline_host, 0, memory_order_relaxed);
 
-    pthread_mutex_lock(&gStartLock);
-    gStartState = ENGINE_STARTING;
-    pthread_mutex_unlock(&gStartLock);
+    pthread_mutex_lock(&e->start_lock);
+    e->start_state = ENGINE_STARTING;
+    pthread_mutex_unlock(&e->start_lock);
 
-    if (pthread_create(&gThread, NULL, engine_thread, NULL) != 0) {
-        pthread_mutex_lock(&gStartLock);
-        gStartState = ENGINE_IDLE;
-        pthread_mutex_unlock(&gStartLock);
-        pthread_mutex_unlock(&gLifecycleLock);
+    if (pthread_create(&e->thread, NULL, engine_thread, e) != 0) {
+        pthread_mutex_lock(&e->start_lock);
+        e->start_state = ENGINE_IDLE;
+        pthread_mutex_unlock(&e->start_lock);
+        pthread_mutex_unlock(&e->lifecycle_lock);
         return false;
     }
-    gThreadJoinable = true;
+    e->thread_joinable = true;
 
     /* Wait for the streams to be on the bus. Normal bring-up is tens of
      * milliseconds; the bound exists so a wedged control transfer surfaces as
@@ -2325,43 +2442,44 @@ bool emu_engine_start(uint32_t sample_rate, uint32_t output_safety_us,
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += 8;
 
-    pthread_mutex_lock(&gStartLock);
-    while (gStartState == ENGINE_STARTING) {
-        if (pthread_cond_timedwait(&gStartCond, &gStartLock, &deadline) == ETIMEDOUT) break;
+    pthread_mutex_lock(&e->start_lock);
+    while (e->start_state == ENGINE_STARTING) {
+        if (pthread_cond_timedwait(&e->start_cond, &e->start_lock, &deadline) == ETIMEDOUT) break;
     }
-    bool ok = (gStartState == ENGINE_STREAMING);
-    pthread_mutex_unlock(&gStartLock);
+    bool ok = (e->start_state == ENGINE_STREAMING);
+    pthread_mutex_unlock(&e->start_lock);
 
     if (!ok) {
-        atomic_store_explicit(&gEngine.stopping, true, memory_order_relaxed);
-        pthread_join(gThread, NULL);
-        gThreadJoinable = false;
-        pthread_mutex_lock(&gStartLock);
-        gStartState = ENGINE_IDLE;
-        pthread_mutex_unlock(&gStartLock);
-        pthread_mutex_unlock(&gLifecycleLock);
+        atomic_store_explicit(&e->stopping, true, memory_order_relaxed);
+        pthread_join(e->thread, NULL);
+        e->thread_joinable = false;
+        pthread_mutex_lock(&e->start_lock);
+        e->start_state = ENGINE_IDLE;
+        pthread_mutex_unlock(&e->start_lock);
+        pthread_mutex_unlock(&e->lifecycle_lock);
         return false;
     }
 
-    pthread_mutex_unlock(&gLifecycleLock);
+    pthread_mutex_unlock(&e->lifecycle_lock);
     return true;
 }
 
-void emu_engine_stop(void)
+void emu_engine_stop(EmuEngine* e)
 {
-    pthread_mutex_lock(&gLifecycleLock);
-    if (!gThreadJoinable) {
-        pthread_mutex_unlock(&gLifecycleLock);
+    if (!e) return;
+    pthread_mutex_lock(&e->lifecycle_lock);
+    if (!e->thread_joinable) {
+        pthread_mutex_unlock(&e->lifecycle_lock);
         return;
     }
-    bool was_running = atomic_load_explicit(&gRunning, memory_order_acquire);
-    atomic_store_explicit(&gEngine.stopping, true, memory_order_relaxed);
-    if (was_running && gEngine.run_loop) CFRunLoopStop(gEngine.run_loop);
-    pthread_join(gThread, NULL);
-    gThreadJoinable = false;
-    atomic_store_explicit(&gRunning, false, memory_order_release);
-    pthread_mutex_lock(&gStartLock);
-    gStartState = ENGINE_IDLE;
-    pthread_mutex_unlock(&gStartLock);
-    pthread_mutex_unlock(&gLifecycleLock);
+    bool was_running = atomic_load_explicit(&e->running, memory_order_acquire);
+    atomic_store_explicit(&e->stopping, true, memory_order_relaxed);
+    if (was_running && e->run_loop) CFRunLoopStop(e->run_loop);
+    pthread_join(e->thread, NULL);
+    e->thread_joinable = false;
+    atomic_store_explicit(&e->running, false, memory_order_release);
+    pthread_mutex_lock(&e->start_lock);
+    e->start_state = ENGINE_IDLE;
+    pthread_mutex_unlock(&e->start_lock);
+    pthread_mutex_unlock(&e->lifecycle_lock);
 }

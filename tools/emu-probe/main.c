@@ -49,8 +49,24 @@ static UsbDevice open_device(io_service_t* out_service, bool* out_opened)
 {
     *out_opened = false;
 
+    /* EMU_PRODUCT=3f04 picks a particular model when more than one is
+     * attached. Without it the preferred product wins, which is the right
+     * default but makes the second device unreachable. */
+    uint16_t want = EMU_DEFAULT_PRODUCT_ID;
+    const char* pick = getenv("EMU_PRODUCT");
+    if (pick && *pick) {
+        want = (uint16_t)strtoul(pick, NULL, 16);
+        fprintf(stderr, "EMU_PRODUCT=%s: asking for %04x\n", pick, want);
+    }
+
     io_service_t service = IO_OBJECT_NULL;
-    gDevice = emu_find_device(EMU_DEFAULT_PRODUCT_ID, &service);
+    gDevice = emu_find_device(want, &service);
+    if (gDevice && pick && *pick && gDevice->product_id != want) {
+        fprintf(stderr, "error: %04x is not attached (found %s instead)\n",
+                want, gDevice->name);
+        IOObjectRelease(service);
+        return NULL;
+    }
     if (!gDevice) {
         fprintf(stderr,
                 "error: no known E-MU device found on the USB bus.\n"

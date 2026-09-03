@@ -17,6 +17,10 @@
  * for the USB transport). */
 #define EMU_LOG_SUBSYSTEM "net.quantum-bit.EMUTrackerPre"
 
+/* One attached device's transport. Opaque: the plug-in holds a handle per
+ * device rather than the driver holding one device. */
+typedef struct Engine EmuEngine;
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -159,25 +163,30 @@ bool emu_engine_set_identity_observer(void (*observer)(void));
  * setting 0, so no IN transaction reaches the bus, and playback is sized from
  * the explicit feedback endpoint instead of from capture (planner_next in
  * usb_engine.c). */
-bool     emu_engine_start(uint32_t sample_rate, uint32_t output_safety_us,
+/* One handle per attached device. Stage 1 permits exactly one; create returns
+ * NULL if one is already outstanding. */
+EmuEngine* emu_engine_create(void);
+void       emu_engine_destroy(EmuEngine* engine);
+
+bool     emu_engine_start(EmuEngine* engine, uint32_t sample_rate, uint32_t output_safety_us,
                           bool with_input);
 
-void     emu_engine_stop(void);
-bool     emu_engine_running(void);
+void     emu_engine_stop(EmuEngine* engine);
+bool     emu_engine_running(EmuEngine* engine);
 
 /* Called from Core Audio's real-time thread. Lock-free, never blocks.
  * `sample_pos` is the IO cycle's sample time: frames on the same timeline that
  * GetZeroTimeStamp publishes, which is the timeline the rings are indexed by. */
-void     emu_engine_write_output(const float* frames, uint32_t count, uint64_t sample_pos);
-void     emu_engine_read_input(float* frames, uint32_t count, uint64_t sample_pos);
+void     emu_engine_write_output(EmuEngine* engine, const float* frames, uint32_t count, uint64_t sample_pos);
+void     emu_engine_read_input(EmuEngine* engine, float* frames, uint32_t count, uint64_t sample_pos);
 
 /* Linear amplitude, 0.0 to 1.0. Applied to the output stream, because this
  * device has no hardware master level. */
-void     emu_engine_set_output_gain(float gain);
+void     emu_engine_set_output_gain(EmuEngine* engine, float gain);
 
 /* Frames the device has consumed. Core Audio's timeline anchors to this, so it
  * follows the device's clock rather than the host's. */
-uint64_t emu_engine_frames_played(void);
+uint64_t emu_engine_frames_played(EmuEngine* engine);
 
 /* Frames the device has consumed and the host time at which that was true, as a
  * consistent pair. Published before emu_engine_start returns — initially the
@@ -187,22 +196,22 @@ uint64_t emu_engine_frames_played(void);
  * the device consumed while no packet reached it, not as a pause of its
  * clock, so the plug-in never has to declare a new timeline. False only if the
  * engine is not running. */
-bool     emu_engine_timeline(uint64_t* frames, uint64_t* host_time);
+bool     emu_engine_timeline(EmuEngine* engine, uint64_t* frames, uint64_t* host_time);
 
 /* Zeroes read-only counters. Leaves frames_played alone, since the timeline
  * derives from it and must never go backwards. */
-void     emu_engine_reset_counters(void);
+void     emu_engine_reset_counters(EmuEngine* engine);
 
 /* While the engine runs: live counters. After it stops: the final counters of
  * the last session, kept so a post-mortem `make check` still has evidence. */
-void     emu_engine_stats(EmuEngineStats* stats);
+void     emu_engine_stats(EmuEngine* engine, EmuEngineStats* stats);
 
 /* True while transfers are actually on the bus. Distinct from
  * emu_engine_running, which only says a start was requested and no stop has
  * arrived: between a transport fault and a successful rebuild the engine is
  * running but not streaming, and that is exactly the state that used to be
  * invisible from outside. */
-bool     emu_engine_streaming(void);
+bool     emu_engine_streaming(EmuEngine* engine);
 
 /*
  * Called on the engine thread when the engine has exhausted its rebuild
@@ -211,7 +220,7 @@ bool     emu_engine_streaming(void);
  * longer there. Runs with no locks held and must not call emu_engine_stop,
  * which would join the thread it is running on.
  */
-void     emu_engine_set_failure_handler(void (*handler)(void));
+void     emu_engine_set_failure_handler(EmuEngine* engine, void (*handler)(void));
 
 /*
  * Fault injection, so the recovery path can be exercised without unplugging
@@ -227,4 +236,4 @@ typedef enum {
     EMU_FAULT_PERSISTENT = 2,
 } EmuFaultMode;
 
-void     emu_engine_inject_fault(EmuFaultMode mode);
+void     emu_engine_inject_fault(EmuEngine* engine, EmuFaultMode mode);
