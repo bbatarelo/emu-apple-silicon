@@ -300,6 +300,21 @@ The HAL will not forward a selector a plug-in has not published through
 Custom properties may only carry a `CFString` or a `CFPropertyList`. Never a raw
 integer.
 
+### coreaudiod caches the safety offset
+
+Setting `'emuS'` to 10000 and restarting the stream left
+`kAudioDevicePropertySafetyOffset` (output scope) reading 288 frames = the old
+6 ms, from a fresh client process, while the plug-in's own `safetyOffsetUS`
+diagnostic said 10000 and the engine bound data 10 ms ahead. So coreaudiod
+keeps its own copy of the device's safety offset, and neither the driver's
+`PropertiesChanged` for that selector nor `kAudioDevicePropertyDeviceHasChanged`
+(tried, backed out) nor a stream restart refreshes it; a coreaudiod restart
+does. `hal-check safety` prints the HAL's view next to the plug-in's
+and flags a disagreement. A mismatch is harmless at large IO buffers (Core
+Audio writes buffer + offset ahead, the sweep binds only written data) and
+makes the knob a silent no-op at small ones — so `make install` after
+changing the default, and treat the runtime knob as an experiment aid.
+
 ### Control objects need to appear twice
 
 A volume or mute control must be listed in `kAudioObjectPropertyControlList`
@@ -351,10 +366,155 @@ Measured after both fixes, over 3.7 minutes at 48 kHz: **zero ring underruns**,
 anchor jitter **49 µs** peak against 27 ms before, and 94 frames across 6.2
 million — which is oscillation in the pipeline, not drift.
 
+**A FIFO between Core Audio and USB has no fixed phase.** With the rings as
+FIFOs, where a frame landed depended on which side had run first: the engine's
+in-flight burst drained an empty ring at start, and every later underrun
+slipped the phase for good — a burst of crackle ~0.3 s into every stream while
+the ring "found" a workable phase, and a ratchet of exactly 8064 frames per
+session. Addressing the rings by absolute sample time (`slot = frame mod
+size`, an erase head behind the consumer) pins the phase to the published
+safety offset by construction, and an underrun becomes one silent packet.
+The output side later stopped needing a buffer at all — Core Audio writes into
+the USB request that carries the frames — but it is the same discipline: the
+map *is* the phase.
+
+**A spliced timeline freezes the IO thread.** Anchoring `GetZeroTimeStamp` to
+the host clock until the first completion and then to the device clock, same
+seed, made Core Audio absorb the discrepancy by stalling its IO thread for its
+length: `hal-trace` shows a 57 ms IO-cycle freeze and a matching burst of ring
+underruns, reliably ~0.3 s into every stream. The anchor for sample 0 now comes
+from the scheduled bus time of the first packet, published before `StartIO`
+returns.
+
+**A timestamp filter that slews through a stall oscillates for minutes.** With
+the snap threshold at 25 observation steps (50 ms), a 16–50 ms scheduling gap
+was slewed through in the filter's clamp regime, where the damping term's
+input is zeroed and the critically damped spring is nearly undamped; the
+anchor wobbled for many seconds and dragged Core Audio's write phase back and
+forth across the engine's output cursor — `outputLead 0`, hundreds of thousands
+of underruns, `usbErrors 0`, a single `tsResets`, cured only by a stream
+restart. Hardware timestamps jitter by microseconds, so the threshold is
+3 steps: anything past that is a real schedule move.
+
+**A seed change is a glitch of its own.** Measured with a schedule rebuild
+that paused the sample clock (cursors held, host time jumped, new seed) after
+one ~10 ms Exposé stall with 8 ms of schedule in flight: `unfilledPlayback 2`,
+`resyncs 1`, `anchorJitterMaxNs 24282041` (the jump: rebuild lead plus dead
+bus time, for an unchanged frame count), and `outputUnderruns 183` against an
+`outputLead` of 749 — the bus ran ~19 ms past Core Audio's writes, which is
+coreaudiod's IO thread freezing to resynchronise. Three separate glitches
+across 50 ms from one stall. With the rebuild skipping the dead bus time on
+the same timeline instead (no seed change), the same provocation reads
+`resyncs 0, outputUnderruns 0, anchorJitterMaxNs` in the microseconds, and the
+only counter that moves is `unfilledPlayback`, for stalls past the offset.
+
+**What Exposé costs the helper's threads, and why the audio does not go
+through them.** Under repeated Exposé the engine thread's
+completion-to-callback latency exceeds 4 ms a few times a minute and never
+8 ms. An earlier output path that converted a staging buffer into the USB
+requests on that thread therefore needed an 8 ms tolerance on top of its 2 ms
+fill cadence: at a 6 ms offset `unfilledPlayback` rose 8 in ~19 s, and only at
+10 ms did it stay 0 over ~37 s. Thread policy cannot widen this — it bounds
+when a runnable thread gets the CPU, not when IOUSBLib delivers the completion
+that wakes it.
+
+Binding from Core Audio's own IO thread removes that thread from the data path
+entirely, and with it the reason for the tolerance. Same 45 s Exposé
+provocation, same 4 ms offset, same schedule: `unfilledPlayback 0`,
+`framesBound` equal to `framesToOutput`, `bindRaces 0` — against 5 for the
+staged path at the same offset. The completion jitter has not gone anywhere;
+it is absorbed by schedule depth, which costs wired memory and no latency. A
+440 Hz tone was indistinguishable between the two: the counters cannot see a
+wrong byte offset, only listening can.
+
+**Core Audio writes further ahead than the safety offset, and by a
+predictable amount.** Measured with `bindWriteLead`, the high-water mark of
+(cycle end - frames played), swept across every IO buffer size the HAL will
+grant:
+
+| buffer | 64 | 128 | 256 | 512 | 1024 | 2048 | 3072 |
+|---|---|---|---|---|---|---|---|
+| `bindWriteLead` | 624 | 656 | 944 | 1424 | 2448 | 4496 | 6576 |
+| less 2 x buffer | 496 | 400 | 432 | 400 | 400 | 400 | 432 |
+
+so
+
+    writeLead ~ 2 x bufferFrames + safetyOffset + ~208 frames
+
+The offset term is exact: the same 512-frame buffer reads 1424 at a 4 ms
+offset and 1712 at 10 ms, a difference of 288 frames for 288 frames of
+offset. The `2 x` is the HAL's own structure -- it computes an IO cycle's
+output time one buffer period ahead of presentation and hands over a
+buffer-length range, so the far end lands at offset + 2 x buffer. The residual
+~208 frames (4.3 ms) is peak cycle jitter; it is a high-water mark, not a mean.
+4096 frames is refused, the HAL capping the buffer at 3072.
+
+A staging buffer never had to care -- 32768 frames long, it absorbs writes for
+bus time that has not been scheduled yet. Binding Core Audio's writes to
+*already-submitted* USB requests cannot absorb them at all: there is no buffer
+for a frame no request covers. With a 32 ms schedule this dropped 5.3% of the
+stream at a 512-frame buffer (`unmappedFrames` 7584 of 141824, every one past
+the end of the schedule) and 62% at 2048 -- silently, with zero USB errors,
+which is why `unmappedAhead` exists as its own counter.
+
+**The write lead follows coreaudiod's cached safety offset, not the driver's.**
+The two are normally equal, but `'emuS'` changes only the driver's copy --
+coreaudiod refreshes its own on a restart and nothing else (above). Since
+`writeLead ~ 2 x buffer + safetyOffset + 208` is Core Audio's arithmetic, it
+uses coreaudiod's value: lower the offset at runtime and the HAL keeps writing
+at the old, larger one. A schedule sized from the driver's copy would then be
+short by exactly the difference and drop it as `unmappedAhead`, silently and
+with no USB errors. `schedule_depth` therefore sizes from
+`EMU_OUTPUT_SAFETY_MAX_US`, which is also why that ceiling is 20 ms rather
+than something generous: it is carried as feedback-servo lag on every session.
+
+**The HAL's cap on a client's IO buffer comes from the driver's own
+zero-timestamp period.** Nothing in `AudioHardware.h` or `AudioServerPlugIn.h`
+documents how `kAudioDevicePropertyBufferFrameSizeRange` is derived for an
+`AudioServerPlugIn`, and this driver never implements the property -- the HAL
+synthesises it. Reading it off every device on a test machine:
+
+| device | ZeroTimeStampPeriod | max buffer |
+|---|---|---|
+| WH-1000XM4 | 2732 | 1024 |
+| E-MU 0404 | 8192 | 3072 |
+| DELL S2722QC | 12288 | 4096 |
+| MacBook Pro Speakers | 14553 | 4096 |
+| Teams Audio | 40960 | 4096 |
+
+    maxBufferFrames = min(4096, ZeroTimeStampPeriod * 3/8)
+
+fits all of them, and setting `RING_FRAMES` to 4096, 2048 and 16384 moved the
+published maximum to exactly 1536, 768 and 4096 as predicted. So the 3072 this
+device advertises is not a Core Audio constant -- it is our own 8192 coming
+back, and the minimum (15) has no such fit and was not chased.
+
+This matters because `ZeroTimeStampPeriod` and the output schedule depth are
+coupled: the period sets the largest buffer a client can ask
+for, the buffer sets how far ahead Core Audio writes, and the schedule has to
+reach past that. `EMU_ZERO_TIMESTAMP_PERIOD` lives in `usb_engine.h` for that
+reason, and the engine derives `HAL_MAX_IO_BUFFER` and its depth from it
+rather than from a measured constant, so changing one moves the other. It is
+also the lever for capping client buffers, should that ever be wanted: there
+is no need to publish a property the HAL would ignore.
+
+**The fix is depth, and depth is cheap.** The two laws together bound the
+worst case, so the depth is computed at stream start from the rate, the
+safety offset and `HAL_MAX_IO_BUFFER` (`schedule_depth`) rather than
+tuned: 81 requests at 48 kHz, 87 at 44.1 kHz and 31 at 192 kHz against the
+20 ms ceiling, with `MAX_REQUESTS` 128 well clear of any of them. Measured at
+64, 512, 2048 and 3072 frames it does: `unmappedFrames 0` throughout, `framesBound` equal to what
+the client delivered, `bindRaces 0`, `unfilledPlayback 0`. The cost is wired
+memory -- 2 entries x 298 bytes per request per direction at 48 kHz, ~120 KB
+for 96 requests both ways, under half a megabyte at 192 kHz where `maxpkt` is
+586 -- and feedback-servo lag, which does not show:
+`frameDeficit` stayed 0 and flat over 30 s and `feedbackStarved` froze at 194,
+a startup transient from the initial submissions drawing an empty queue, not a
+steady-state figure.
+
 **A standing offset between frames played and frames delivered is not an
-error.** It is buffer occupancy: ring depth plus everything in flight. Here that
-is ~1000 + 8 requests × 8 ms × 48 frames/ms ≈ 4072, and the measured figure sits
-at 3940–4331. What matters is whether it *grows*, not what it is.
+error.** It is what is in flight: the output lead plus every scheduled packet
+not yet transmitted. What matters is whether it *grows*, not what it is.
 
 ---
 
@@ -374,6 +534,8 @@ right bytes in the right place.
 | Measured rate exactly half nominal | Treating a 0.5 ms entry as 1 ms |
 | Measured rate hundreds of ppm fast | Averaging across the startup ramp |
 | Ring underruns growing forever, glitch every few minutes | Anchoring the timeline to a timestamp taken in the completion callback |
+| Sustained crackle after a stall, every clock counter healthy, cured by restart | A packet the bus never carried moved one timeline cursor and not the others; the shear is permanent |
+| One stall, three brief glitches spread over ~50 ms; `anchorJitterMaxNs` in the tens of ms, ring underruns with no HAL overload | The schedule rebuild paused the sample clock instead of skipping the dead bus time; the seed change made the HAL resynchronise, and the anchor jump landed inside the new seed |
 | 176.4/192 kHz only: right byte counts, the other channel's tone stronger than this one's, peak pinned at 1.0000 | Frames taken from the packet's first byte, 4 bytes before they start |
 
 Two general lessons:

@@ -1,14 +1,35 @@
 /*
- * Single-producer single-consumer ring of interleaved stereo Float32 frames.
+ * Timeline-indexed circular buffer of interleaved stereo Float32 frames: the
+ * join between the capture stream and Core Audio.
  *
- * This is the join between two clocks that do not agree. Core Audio delivers
- * fixed 512-frame buffers on the host clock; USB consumes variable packets --
- * 44 or 45 frames at 44.1 kHz -- on the device clock. Neither side may block or
- * allocate, so the ring absorbs the difference and reports when it cannot.
+ * Its defining property is that it is *not* a FIFO. Both sides address it by
+ * absolute frame index on the device's sample timeline,
+ * `slot = frame mod EMU_RING_FRAMES`: the USB engine writes at the frame it
+ * just received, Core Audio reads at the sample time its IO cycle names. The
+ * phase between the two is therefore fixed by the timeline itself -- the
+ * safety offset the driver publishes -- not by whichever side happened to
+ * start first.
  *
- * Lock-free by construction: the producer only advances the write index and the
- * consumer only advances the read index, both with release/acquire ordering.
- * Capacity is a power of two so the wrap is a mask rather than a division.
+ * A FIFO would derive the phase from arrival order instead, and every
+ * underrun would slip it permanently: unbounded latency growth after any
+ * glitch, and a burst of crackle at each stream start while the ring "found"
+ * a workable phase (see FINDINGS). Timeline indexing is how IOAudioFamily's
+ * sample buffers work; an underrun there is one silent packet, not a regime
+ * change.
+ *
+ * The consumer zeroes every slot behind it (the erase head, again from
+ * IOAudioFamily). A slot the producer never reaches therefore plays silence,
+ * not a stale lap of audio.
+ *
+ * Output does not come through here at all: Core Audio writes its mix
+ * straight into the submitted USB request buffers, so there is nothing to
+ * stage. The packing helpers below are shared with that path, which is the
+ * only reason they live in this header.
+ *
+ * Lock-free: the producer alone advances `frontier`, the consumer alone
+ * advances `consumed`, with release/acquire ordering. Under fault the two may
+ * touch the same slot; the torn frames land inside an already-glitching
+ * stretch, which is the same trade IOAudioFamily makes.
  */
 
 #pragma once
@@ -24,75 +45,64 @@
 
 typedef struct {
     float data[EMU_RING_FRAMES * EMU_RING_CHANNELS];
-    _Atomic uint64_t write;
-    _Atomic uint64_t read;
+    /* First frame index the producer has not yet written. */
+    _Atomic uint64_t frontier;
+    /* First frame index the consumer has not yet read, for depth diagnostics. */
+    _Atomic uint64_t consumed;
     /* Diagnostics, not control flow. A driver that hides these is unfixable. */
-    _Atomic uint64_t underruns;   /* consumer wanted frames that were not there */
-    _Atomic uint64_t overruns;    /* producer had frames the ring could not hold */
+    _Atomic uint64_t missing;     /* frames consumed before the producer wrote them */
+    _Atomic uint64_t discarded;   /* producer writes rejected as off-timeline */
 } EmuRing;
 
 static inline void emu_ring_reset(EmuRing* ring)
 {
-    atomic_store_explicit(&ring->write, 0, memory_order_relaxed);
-    atomic_store_explicit(&ring->read, 0, memory_order_relaxed);
-    atomic_store_explicit(&ring->underruns, 0, memory_order_relaxed);
-    atomic_store_explicit(&ring->overruns, 0, memory_order_relaxed);
+    atomic_store_explicit(&ring->frontier, 0, memory_order_relaxed);
+    atomic_store_explicit(&ring->consumed, 0, memory_order_relaxed);
+    atomic_store_explicit(&ring->missing, 0, memory_order_relaxed);
+    atomic_store_explicit(&ring->discarded, 0, memory_order_relaxed);
     memset(ring->data, 0, sizeof ring->data);
 }
 
-static inline uint32_t emu_ring_filled(const EmuRing* ring)
+/* How far the producer's writes lead the consumer's reads, in frames. The
+ * steady-state value is the driver's buffered latency; zero means the consumer
+ * is about to read slots nobody filled. */
+static inline uint32_t emu_ring_depth(const EmuRing* ring)
 {
-    uint64_t w = atomic_load_explicit(&ring->write, memory_order_acquire);
-    uint64_t r = atomic_load_explicit(&ring->read, memory_order_acquire);
-    return (uint32_t)(w - r);
+    uint64_t f = atomic_load_explicit(&ring->frontier, memory_order_acquire);
+    uint64_t c = atomic_load_explicit(&ring->consumed, memory_order_acquire);
+    return f > c ? (uint32_t)(f - c) : 0;
 }
 
-/* Producer side. Drops the oldest data rather than blocking when full: in an
- * audio path, arriving late is worse than arriving incomplete. */
-static inline void emu_ring_write(EmuRing* ring, const float* frames, uint32_t count)
+/* Sanity bound for producer positions. A position a full lap behind the
+ * frontier is not a timeline any more; writing there would corrupt audio that
+ * has not played yet. Nothing legitimate produces it — Core Audio's resync
+ * jumps are a few periods at most — so it is dropped and counted. */
+static inline bool emu_ring_pos_ok(EmuRing* ring, uint64_t pos)
 {
-    uint64_t w = atomic_load_explicit(&ring->write, memory_order_relaxed);
-    uint64_t r = atomic_load_explicit(&ring->read, memory_order_acquire);
-
-    uint32_t space = EMU_RING_FRAMES - (uint32_t)(w - r);
-    if (count > space) {
-        atomic_fetch_add_explicit(&ring->overruns, count - space, memory_order_relaxed);
-        count = space;
-    }
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t slot = (uint32_t)((w + i) & EMU_RING_MASK) * EMU_RING_CHANNELS;
-        ring->data[slot]     = frames[i * EMU_RING_CHANNELS];
-        ring->data[slot + 1] = frames[i * EMU_RING_CHANNELS + 1];
-    }
-    atomic_store_explicit(&ring->write, w + count, memory_order_release);
+    uint64_t f = atomic_load_explicit(&ring->frontier, memory_order_relaxed);
+    if (f > EMU_RING_FRAMES && pos < f - EMU_RING_FRAMES) return false;
+    return true;
 }
 
-/*
- * Capture producer: 24-bit packed little-endian in, Float32 out.
- *
- * Drops the newest frames when full, exactly like the playback direction.
- *
- * An earlier version dropped the *oldest* by advancing the read index, so that
- * an idle ring would not go stale. That is a data race: in a single-producer
- * single-consumer ring only the consumer may write `read`, and having both
- * sides move it tore the samples badly enough to read as full-scale noise on a
- * disconnected input. Staleness is the consumer's problem to solve, and
- * emu_ring_read_f32 solves it by skipping a backlog it alone owns.
- */
-static inline void emu_ring_write_s24(EmuRing* ring, const uint8_t* src, uint32_t count)
+static inline void emu_ring_advance_frontier(EmuRing* ring, uint64_t end)
 {
-    uint64_t w = atomic_load_explicit(&ring->write, memory_order_relaxed);
-    uint64_t r = atomic_load_explicit(&ring->read, memory_order_acquire);
-
-    uint32_t space = EMU_RING_FRAMES - (uint32_t)(w - r);
-    if (count > space) {
-        atomic_fetch_add_explicit(&ring->overruns, count - space, memory_order_relaxed);
-        count = space;
+    uint64_t f = atomic_load_explicit(&ring->frontier, memory_order_relaxed);
+    if (end > f) {
+        atomic_store_explicit(&ring->frontier, end, memory_order_release);
     }
+}
 
+/* Producer, 24-bit packed little-endian in: the capture stream, at the
+ * engine's capture cursor. */
+static inline void emu_ring_write_s24(EmuRing* ring, uint64_t pos,
+                                      const uint8_t* src, uint32_t count)
+{
+    if (!emu_ring_pos_ok(ring, pos)) {
+        atomic_fetch_add_explicit(&ring->discarded, count, memory_order_relaxed);
+        return;
+    }
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t slot = (uint32_t)((w + i) & EMU_RING_MASK) * EMU_RING_CHANNELS;
+        uint32_t slot = (uint32_t)((pos + i) & EMU_RING_MASK) * EMU_RING_CHANNELS;
         for (uint32_t ch = 0; ch < EMU_RING_CHANNELS; ch++) {
             const uint8_t* p = src + (i * EMU_RING_CHANNELS + ch) * 3;
             /* Sign-extend 24 bits into 32 before scaling. */
@@ -101,90 +111,80 @@ static inline void emu_ring_write_s24(EmuRing* ring, const uint8_t* src, uint32_
             ring->data[slot + ch] = (float)v / 8388608.0f;
         }
     }
-    atomic_store_explicit(&ring->write, w + count, memory_order_release);
+    emu_ring_advance_frontier(ring, pos + count);
 }
 
-/* Most input backlog worth keeping, in frames. Beyond this the consumer is
- * being handed audio that is older than the latency anyone would accept, which
- * happens whenever nothing was recording for a while. */
-#define EMU_INPUT_MAX_BACKLOG  4096u
-#define EMU_INPUT_KEEP_BACKLOG 1024u
-
-/* Capture consumer, on Core Audio's real-time thread. Missing frames become
- * silence and are counted.
- *
- * Also owns discarding stale backlog. The consumer is the only side allowed to
- * move `read`, so this is where it has to happen -- doing it in the producer is
- * what corrupted the stream before. */
-static inline uint32_t emu_ring_read_f32(EmuRing* ring, float* dst, uint32_t count)
+/* Producer, silence: a capture interval that brought nothing usable -- an
+ * errored or empty packet. Written as zeros rather than skipped so the input
+ * keeps its place on the timeline and the slot cannot hand back the previous
+ * lap: the erase head only runs while something is reading. */
+static inline void emu_ring_write_silence(EmuRing* ring, uint64_t pos, uint32_t count)
 {
-    uint64_t r = atomic_load_explicit(&ring->read, memory_order_relaxed);
-    uint64_t w = atomic_load_explicit(&ring->write, memory_order_acquire);
-
-    if ((uint32_t)(w - r) > EMU_INPUT_MAX_BACKLOG) {
-        uint64_t target = w - EMU_INPUT_KEEP_BACKLOG;
-        atomic_fetch_add_explicit(&ring->overruns, (uint32_t)(target - r),
-                                  memory_order_relaxed);
-        r = target;
+    if (!emu_ring_pos_ok(ring, pos)) {
+        atomic_fetch_add_explicit(&ring->discarded, count, memory_order_relaxed);
+        return;
     }
+    /* Beyond a lap the zeroing only repeats itself; the frontier still moves
+     * by the full count. */
+    uint32_t n = count > EMU_RING_FRAMES ? EMU_RING_FRAMES : count;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t slot = (uint32_t)((pos + i) & EMU_RING_MASK) * EMU_RING_CHANNELS;
+        ring->data[slot]     = 0.0f;
+        ring->data[slot + 1] = 0.0f;
+    }
+    emu_ring_advance_frontier(ring, pos + count);
+}
 
-    uint32_t available = (uint32_t)(w - r);
-    uint32_t taken = count < available ? count : available;
+/* Frames in [pos, pos+count) the producer has not written yet. Not counted
+ * before the producer's first write: the engine legitimately reads ahead of
+ * Core Audio's first cycle at stream start, and those slots are silence by
+ * design, not a glitch. */
+static inline void emu_ring_count_missing(EmuRing* ring, uint64_t pos, uint32_t count)
+{
+    uint64_t f = atomic_load_explicit(&ring->frontier, memory_order_acquire);
+    if (f == 0) return;
+    if (pos + count > f) {
+        uint64_t base = pos > f ? pos : f;
+        atomic_fetch_add_explicit(&ring->missing, pos + count - base,
+                                  memory_order_relaxed);
+    }
+}
 
-    for (uint32_t i = 0; i < taken; i++) {
-        uint32_t slot = (uint32_t)((r + i) & EMU_RING_MASK) * EMU_RING_CHANNELS;
+/* Consumer, Float32 out: Core Audio's ReadInput, at the cycle's sample time.
+ * Read slots are zeroed behind the erase head. */
+static inline void emu_ring_read_f32(EmuRing* ring, uint64_t pos,
+                                     float* dst, uint32_t count)
+{
+    emu_ring_count_missing(ring, pos, count);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t slot = (uint32_t)((pos + i) & EMU_RING_MASK) * EMU_RING_CHANNELS;
         dst[i * EMU_RING_CHANNELS]     = ring->data[slot];
         dst[i * EMU_RING_CHANNELS + 1] = ring->data[slot + 1];
+        ring->data[slot]     = 0.0f;
+        ring->data[slot + 1] = 0.0f;
     }
-    atomic_store_explicit(&ring->read, r + taken, memory_order_release);
-
-    if (taken < count) {
-        atomic_fetch_add_explicit(&ring->underruns, count - taken, memory_order_relaxed);
-        memset(dst + (size_t)taken * EMU_RING_CHANNELS, 0,
-               (size_t)(count - taken) * EMU_RING_CHANNELS * sizeof(float));
-    }
-    return taken;
+    atomic_store_explicit(&ring->consumed, pos + count, memory_order_release);
 }
 
-/*
- * Consumer side, writing straight out as 24-bit packed little-endian -- the
- * only format any of this device's alternate settings offer.
- *
- * Converts during the copy rather than in a staging buffer, because this runs
- * on the USB completion path where an extra pass and an extra buffer both cost
- * more than they are worth. Missing frames become silence, and are counted.
- */
-static inline uint32_t emu_ring_read_s24(EmuRing* ring, uint8_t* dst, uint32_t count,
-                                         float gain)
+/* One Float32 sample to 24-bit packed little-endian: the only output format
+ * any of this device's alternate settings offer. */
+static inline void emu_pack_sample_s24(uint8_t* p, float sample)
 {
-    uint64_t r = atomic_load_explicit(&ring->read, memory_order_relaxed);
-    uint64_t w = atomic_load_explicit(&ring->write, memory_order_acquire);
+    if (sample > 1.0f) sample = 1.0f;
+    if (sample < -1.0f) sample = -1.0f;
+    int32_t v = (int32_t)(sample * 8388607.0f);
+    p[0] = (uint8_t)(v & 0xff);
+    p[1] = (uint8_t)((v >> 8) & 0xff);
+    p[2] = (uint8_t)((v >> 16) & 0xff);
+}
 
-    uint32_t available = (uint32_t)(w - r);
-    uint32_t taken = count < available ? count : available;
-
-    for (uint32_t i = 0; i < taken; i++) {
-        uint32_t slot = (uint32_t)((r + i) & EMU_RING_MASK) * EMU_RING_CHANNELS;
-        for (uint32_t ch = 0; ch < EMU_RING_CHANNELS; ch++) {
-            /* Gain is applied here rather than when Core Audio hands us the
-             * buffer, so a volume change takes effect on the next packet
-             * instead of after everything already queued has drained. */
-            float sample = ring->data[slot + ch] * gain;
-            if (sample > 1.0f) sample = 1.0f;
-            if (sample < -1.0f) sample = -1.0f;
-            int32_t v = (int32_t)(sample * 8388607.0f);
-            uint8_t* p = dst + (i * EMU_RING_CHANNELS + ch) * 3;
-            p[0] = (uint8_t)(v & 0xff);
-            p[1] = (uint8_t)((v >> 8) & 0xff);
-            p[2] = (uint8_t)((v >> 16) & 0xff);
-        }
+/* Interleaved Float32 stereo straight to packed 24-bit, with gain and
+ * clipping: the output path, where Core Audio's own mix buffer is the source
+ * and a submitted USB request's buffer is the destination. Converted in place
+ * rather than through a staging buffer, on Core Audio's IO thread. */
+static inline void emu_pack_s24(uint8_t* dst, const float* src, uint32_t count, float gain)
+{
+    for (uint32_t i = 0; i < count * EMU_RING_CHANNELS; i++) {
+        emu_pack_sample_s24(dst + i * 3, src[i] * gain);
     }
-    atomic_store_explicit(&ring->read, r + taken, memory_order_release);
-
-    if (taken < count) {
-        atomic_fetch_add_explicit(&ring->underruns, count - taken, memory_order_relaxed);
-        memset(dst + (size_t)taken * EMU_RING_CHANNELS * 3, 0,
-               (size_t)(count - taken) * EMU_RING_CHANNELS * 3);
-    }
-    return taken;
 }

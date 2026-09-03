@@ -9,6 +9,7 @@
 
 #include <CoreAudio/CoreAudio.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define DEVICE_UID "net.quantum-bit.EMUTrackerPre"
@@ -143,13 +144,84 @@ static int reset_counters(AudioObjectID device)
     return 0;
 }
 
+/* Reads or writes the output safety offset, in microseconds. This is the one
+ * knob on the output path: Core Audio promises the data this far ahead of the
+ * play head and writes it into the USB buffers itself, so it is both the
+ * latency the driver adds and the lateness its IO thread can absorb. No other
+ * thread is on the data path. A write takes effect at the next stream start.
+ * Returns 0 on success. */
+static int safety_offset(AudioObjectID device, const char* wanted)
+{
+    AudioObjectPropertyAddress address = {
+        'emuS', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+
+    if (wanted) {
+        char* end = NULL;
+        long long us = strtoll(wanted, &end, 10);
+        if (!*wanted || *end || us <= 0) {
+            fprintf(stderr, "error: '%s' is not a microsecond count\n", wanted);
+            return 1;
+        }
+        CFNumberRef value = CFNumberCreate(NULL, kCFNumberLongLongType, &us);
+        if (!value) return 1;
+        OSStatus s = AudioObjectSetPropertyData(device, &address, 0, NULL,
+                                                sizeof(value), &value);
+        CFRelease(value);
+        if (s != noErr) {
+            fprintf(stderr, "error: could not set the safety offset (0x%x)\n", s);
+            return 1;
+        }
+    }
+
+    CFPropertyListRef current = NULL;
+    UInt32 size = sizeof(current);
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &current) != noErr
+        || !current || CFGetTypeID(current) != CFNumberGetTypeID()) {
+        if (current) CFRelease(current);
+        fprintf(stderr, "error: could not read the safety offset\n");
+        return 1;
+    }
+    long long us = 0;
+    CFNumberGetValue((CFNumberRef)current, kCFNumberLongLongType, &us);
+    CFRelease(current);
+
+    printf("output safety offset: %lld us (clamped by the driver to its range)\n", us);
+    printf("  Core Audio's IO thread may run this late before a packet plays\n"
+           "  silence; takes effect when the stream next starts\n");
+
+    /* What Core Audio itself will honour. coreaudiod caches this per device,
+     * and a cache that missed the change means the HAL writes to the old
+     * offset while the engine binds to the new one -- harmless at large IO
+     * buffers, a silent no-op of the knob at small ones. */
+    AudioObjectPropertyAddress rateAddress = {
+        kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    Float64 rate = 0;
+    UInt32 rateSize = sizeof(rate);
+    UInt32 frames = get_u32(device, kAudioDevicePropertySafetyOffset,
+                            kAudioObjectPropertyScopeOutput, NULL);
+    if (AudioObjectGetPropertyData(device, &rateAddress, 0, NULL, &rateSize, &rate) == noErr
+        && rate > 0) {
+        long long halUS = (long long)((Float64)frames * 1.0e6 / rate + 0.5);
+        printf("  core audio sees:      %u frames = %lld us at %.0f Hz%s\n",
+               frames, halUS, rate,
+               llabs(halUS - us) > 1000 ? "  <-- DISAGREES: the HAL's cache did not refresh"
+                                        : "");
+    }
+    return 0;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
         "usage: hal-check                       report what the driver is doing\n"
         "       hal-check clock                 show which clock the timeline follows\n"
         "       hal-check clock device|host     switch it, immediately\n"
-        "       hal-check reset                 zero the counters, then measure\n");
+        "       hal-check reset                 zero the counters, then measure\n"
+        "       hal-check safety                show the output safety offset (us)\n"
+        "       hal-check safety <us>           set it; effective at the next stream start\n");
 }
 
 int main(int argc, char** argv)
@@ -167,6 +239,9 @@ int main(int argc, char** argv)
         }
         if (strcmp(argv[1], "reset") == 0) {
             return reset_counters(device);
+        }
+        if (strcmp(argv[1], "safety") == 0) {
+            return safety_offset(device, argc > 2 ? argv[2] : NULL);
         }
         usage();
         return 2;

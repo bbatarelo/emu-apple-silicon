@@ -65,8 +65,10 @@ static AudioObjectID find_device(void)
 }
 
 typedef struct {
-    uint64_t ioCycles, framesToOutput, framesPlayed, ringDepth, ringUnderruns;
+    uint64_t ioCycles, framesToOutput, framesPlayed, outputLead, outputUnderruns;
     uint64_t inputUnderruns, tsFallbacks, tsResets, usbErrors, engineRunning;
+    uint64_t resyncs, deadFrames, unfilledPlayback;
+    uint64_t framesBound, unmappedFrames, unmappedAhead, bindRaces;
 } Diag;
 
 static bool read_diag(AudioObjectID device, Diag* out)
@@ -86,13 +88,20 @@ static bool read_diag(AudioObjectID device, Diag* out)
         { "ioCycles", &out->ioCycles },
         { "framesToOutput", &out->framesToOutput },
         { "framesPlayed", &out->framesPlayed },
-        { "ringDepth", &out->ringDepth },
-        { "ringUnderruns", &out->ringUnderruns },
+        { "outputLead", &out->outputLead },
+        { "outputUnderruns", &out->outputUnderruns },
         { "inputUnderruns", &out->inputUnderruns },
         { "tsFallbacks", &out->tsFallbacks },
         { "tsResets", &out->tsResets },
         { "usbErrors", &out->usbErrors },
         { "engineRunning", &out->engineRunning },
+        { "resyncs", &out->resyncs },
+        { "deadFrames", &out->deadFrames },
+        { "unfilledPlayback", &out->unfilledPlayback },
+        { "framesBound", &out->framesBound },
+        { "unmappedFrames", &out->unmappedFrames },
+        { "unmappedAhead", &out->unmappedAhead },
+        { "bindRaces", &out->bindRaces },
     };
     for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
         CFStringRef key = CFStringCreateWithCString(NULL, fields[i].key, kCFStringEncodingUTF8);
@@ -173,30 +182,46 @@ int main(void)
 
     /* Counter columns are deltas against the pre-start baseline, so a fresh
      * stream reads from zero whatever earlier sessions left behind. */
-    printf("#   t_ms  engine  ioCycles  framesOut  framesPlayed  ringDepth  underrun  inUnder  tsFall  tsReset  usbErr\n");
+    printf("#   t_ms  engine  ioCycles  framesOut  framesBound  framesPlayed  outLead"
+           "  underrun  unmapped  ahead  races  inUnder  tsFall  tsReset  resync  dead"
+           "  unfill  usbErr\n");
     Diag prev;
     memset(&prev, 0xff, sizeof prev);
     for (int i = 0; i < n; i++) {
         Diag* s = &samples[i];
         bool interesting =
             i == 0 || i == n - 1 ||
-            s->ringUnderruns != prev.ringUnderruns ||
+            s->outputUnderruns != prev.outputUnderruns ||
+            s->unmappedFrames != prev.unmappedFrames ||
+            s->bindRaces != prev.bindRaces ||
             s->inputUnderruns != prev.inputUnderruns ||
             s->tsResets != prev.tsResets ||
+            s->resyncs != prev.resyncs ||
+            s->deadFrames != prev.deadFrames ||
+            s->unfilledPlayback != prev.unfilledPlayback ||
             s->engineRunning != prev.engineRunning ||
             (i % 10 == 0);
         if (interesting) {
-            printf("%8.1f  %6llu  %8llu  %9llu  %12llu  %9llu  %8llu  %7llu  %6llu  %7llu  %6llu\n",
+            printf("%8.1f  %6llu  %8llu  %9llu  %11llu  %12llu  %7llu  %8llu"
+                   "  %8llu  %5llu  %5llu  %7llu  %6llu  %7llu  %6llu  %4llu"
+                   "  %6llu  %6llu\n",
                    t_ms[i],
                    (unsigned long long)s->engineRunning,
                    (unsigned long long)(s->ioCycles - before.ioCycles),
                    (unsigned long long)(s->framesToOutput - before.framesToOutput),
+                   (unsigned long long)(s->framesBound - before.framesBound),
                    (unsigned long long)s->framesPlayed,
-                   (unsigned long long)s->ringDepth,
-                   (unsigned long long)s->ringUnderruns,
+                   (unsigned long long)s->outputLead,
+                   (unsigned long long)s->outputUnderruns,
+                   (unsigned long long)s->unmappedFrames,
+                   (unsigned long long)s->unmappedAhead,
+                   (unsigned long long)s->bindRaces,
                    (unsigned long long)s->inputUnderruns,
                    (unsigned long long)s->tsFallbacks,
                    (unsigned long long)s->tsResets,
+                   (unsigned long long)s->resyncs,
+                   (unsigned long long)s->deadFrames,
+                   (unsigned long long)s->unfilledPlayback,
                    (unsigned long long)s->usbErrors);
         }
         prev = *s;

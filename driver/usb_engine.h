@@ -1,9 +1,13 @@
 /*
- * USB engine for the HAL plug-in: the Milestone 4 duplex transport, fed by a
- * ring that Core Audio writes into.
+ * USB engine for the HAL plug-in: the Milestone 4 duplex transport.
+ *
+ * Capture goes through a timeline-indexed ring Core Audio addresses by sample
+ * time; output needs no staging at all, because Core Audio converts its mix
+ * straight into the USB request that carries those frames.
  *
  * Runs on its own thread with its own run loop. Core Audio's real-time thread
- * only ever calls emu_engine_write_output, which is lock-free.
+ * only ever calls emu_engine_write_output / emu_engine_read_input, which are
+ * lock-free.
  */
 
 #pragma once
@@ -11,18 +15,68 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* The zero-timestamp period the plug-in publishes, and the reason it is here
+ * rather than private to plugin.c: the HAL derives the largest IO buffer it
+ * will grant a client from it, empirically
+ *
+ *     maxBufferFrames = min(4096, ZeroTimeStampPeriod * 3/8)
+ *
+ * -- undocumented, but it fits every device on a test machine and three
+ * predicted changes to this constant landed exactly (FINDINGS). The direct
+ * bind has to schedule past where Core Audio writes, and where Core Audio
+ * writes is set by that buffer size, so the two constants are coupled and
+ * must not drift apart. The engine sizes its schedule from this.
+ */
+#define EMU_ZERO_TIMESTAMP_PERIOD 8192u
+
+/* Ceiling on the output safety offset, and not merely a sanity bound: the
+ * schedule is sized against *this* rather than the offset in force, because
+ * the write lead depends on the offset coreaudiod has cached, which follows
+ * a coreaudiod restart and nothing else (FINDINGS). Lower the offset at
+ * runtime and the HAL keeps writing at the old, larger one; a schedule sized
+ * for the new value would then be too short and drop the difference. Sizing
+ * for the ceiling makes any cached value safe, at the price of carrying the
+ * ceiling's feedback-servo lag always. */
+#define EMU_OUTPUT_SAFETY_MAX_US 20000u
+
 typedef struct {
     uint64_t frames_played;      /* frames the device has actually consumed  */
-    uint64_t underruns;          /* frames the ring could not supply         */
-    uint64_t overruns;           /* frames the ring could not accept         */
     uint64_t usb_errors;
-    uint32_t ring_depth;         /* output frames currently buffered         */
+    uint64_t timestamp_fallbacks;/* completions without a usable hardware timestamp */
+    uint64_t timestamp_resets;   /* timeline discontinuities the filter snapped to */
+    uint64_t resyncs;            /* bus-schedule rebuilds after the queue went stale */
+    uint64_t dead_frames;        /* playback frames of bus time no packet covered: the
+                                    summed length of every rebuild's dropout */
+    uint64_t short_playback;     /* playback entries the bus called good and did not
+                                    carry in full: frActCount short of frReqCount */
     uint32_t feedback_starved;
+    uint32_t feedback_overflows; /* capture measurements the queue could not hold:
+                                    playback and capture have decoupled */
 
-    uint64_t frames_captured;
+    /* The output path. Core Audio writes into the submitted USB buffers
+     * itself (emu_engine_write_output), so what these measure is that
+     * thread's progress against the bus, not a staging buffer's occupancy. */
+    uint64_t frames_bound;       /* frames converted straight into a USB buffer */
+    uint64_t underruns;          /* frames that transmitted before Core Audio wrote them */
+    uint64_t unfilled_playback;  /* requests that transmitted with any such frame */
+    uint32_t output_lead;        /* how far Core Audio's writes lead the play head */
+    uint64_t unmapped_frames;    /* frames Core Audio wrote that no queued request covered:
+                                    a rebuild's dead interval, or a cycle past the
+                                    schedule -- the latter means the schedule is too short */
+    uint64_t unmapped_ahead;     /* of those, the ones past the end of the schedule */
+    uint64_t write_lead_max;     /* high-water mark of how far past the play head Core
+                                    Audio writes: what the schedule depth must exceed */
+    uint64_t bind_races;         /* writes into a request recycled underneath them */
+    uint32_t schedule_requests;  /* the schedule depth this session settled on */
+    bool     schedule_clamped;   /* ...and whether MAX_REQUESTS truncated it, which
+                                    means the schedule may be short of the write lead */
+
+    uint64_t frames_captured;    /* frames written to the input ring, silence included */
     uint32_t input_depth;
     uint32_t input_underruns;
-    uint32_t input_overruns;     /* grows while nothing is recording, by design */
+    uint32_t input_overruns;
+    uint64_t empty_capture;      /* capture intervals with nothing usable, written as silence;
+                                    a couple at every start is the ADC spinning up */
 } EmuEngineStats;
 
 /* Whether a supported device is attached right now. Cheap and safe to call
@@ -52,31 +106,51 @@ const char* emu_engine_device_name(void);
  * problem over again. The plug-in should refuse to initialize, and say why. */
 bool emu_engine_set_identity_observer(void (*observer)(void));
 
-bool     emu_engine_start(uint32_t sample_rate);
+/* Brings the device up and starts both streams. Blocks until the streams are
+ * scheduled on the bus and the timeline anchor is published — tens of
+ * milliseconds — so that the first GetZeroTimeStamp already has the device's
+ * clock and never has to guess from the host's. Returns false if the hardware
+ * did not come up.
+ *
+ * `output_safety_us` is the output safety offset the plug-in publishes for
+ * this session. The engine binds playback data exactly that far ahead of the
+ * play head -- Core Audio's definition of the offset is how far ahead of the
+ * hardware position it is safe to do IO, and the fill is this driver's
+ * hardware position -- so the same number sets how late the engine thread may
+ * run before a packet transmits silence: the offset less one request period. */
+bool     emu_engine_start(uint32_t sample_rate, uint32_t output_safety_us);
+
 void     emu_engine_stop(void);
 bool     emu_engine_running(void);
 
-/* Called from Core Audio's real-time thread. Lock-free, never blocks. */
-void     emu_engine_write_output(const float* frames, uint32_t count);
+/* Called from Core Audio's real-time thread. Lock-free, never blocks.
+ * `sample_pos` is the IO cycle's sample time: frames on the same timeline that
+ * GetZeroTimeStamp publishes, which is the timeline the rings are indexed by. */
+void     emu_engine_write_output(const float* frames, uint32_t count, uint64_t sample_pos);
+void     emu_engine_read_input(float* frames, uint32_t count, uint64_t sample_pos);
 
 /* Linear amplitude, 0.0 to 1.0. Applied to the output stream, because this
  * device has no hardware master level. */
 void     emu_engine_set_output_gain(float gain);
-
-/* Called from Core Audio's real-time thread. Fills silence when the engine is
- * not running or the ring is short. */
-void     emu_engine_read_input(float* frames, uint32_t count);
 
 /* Frames the device has consumed. Core Audio's timeline anchors to this, so it
  * follows the device's clock rather than the host's. */
 uint64_t emu_engine_frames_played(void);
 
 /* Frames the device has consumed and the host time at which that was true, as a
- * consistent pair. False until the first transfer has completed. */
+ * consistent pair. Published before emu_engine_start returns — initially the
+ * scheduled bus time of the first packet, then refreshed by every completed
+ * request. The pair stays on one straight line for the life of the session:
+ * a stall that forces the bus schedule to be rebuilt is accounted as frames
+ * the device consumed while no packet reached it, not as a pause of its
+ * clock, so the plug-in never has to declare a new timeline. False only if the
+ * engine is not running. */
 bool     emu_engine_timeline(uint64_t* frames, uint64_t* host_time);
 
 /* Zeroes read-only counters. Leaves frames_played alone, since the timeline
  * derives from it and must never go backwards. */
 void     emu_engine_reset_counters(void);
 
+/* While the engine runs: live counters. After it stops: the final counters of
+ * the last session, kept so a post-mortem `make check` still has evidence. */
 void     emu_engine_stats(EmuEngineStats* stats);
