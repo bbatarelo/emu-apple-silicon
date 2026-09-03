@@ -25,6 +25,53 @@ pub fn frames_in_packet(bytes: ByteCount, bytes_per_frame: u32) -> SampleFrames 
     SampleFrames(bytes.0 / bytes_per_frame)
 }
 
+/// The scale the device's firmware uses to build the fractional part of its
+/// feedback value, where the format calls for 65536.
+const FIRMWARE_FRACTION_SCALE: u32 = 64_000;
+
+/// The device's stated demand from the explicit feedback endpoint, with its
+/// fixed-point scaling corrected.
+///
+/// The endpoint carries Q16.16 sample frames per playback service interval,
+/// but the firmware builds the value as
+///
+/// ```text
+///     floor(frames) * 65536 + fract(frames) * 64000
+/// ```
+///
+/// so every rate with a fractional packet size reads low. The whole 44.1 kHz
+/// family is short by exactly 53.1 ppm and the 48 kHz family, whose fraction is
+/// zero, is exact -- one model that reproduces all ten published rate/interval
+/// combinations bit for bit.
+///
+/// It is the arithmetic and not the clock. A rate error would fit the same
+/// table, because `fract / nominal` is 1/441 at every 44.1-family rate, so the
+/// two are indistinguishable from the endpoint alone. The duplex stream
+/// separates them: at 176.4 kHz capture measures the device producing 88.2000
+/// frames per interval -- nominal to 0.1 ppm -- in the same stream where the
+/// endpoint says 88.1953. The converter is running at the right rate and only
+/// its report of it is wrong.
+///
+/// This matters when the endpoint is the *only* clock, which is what happens
+/// with capture switched off: following the raw value under-delivers 9.4 frames
+/// a second at 176.4 kHz, and the device's output FIFO absorbs that for well
+/// under a minute.
+///
+/// A fraction at or beyond the scale cannot come from this model, so it is
+/// passed through untouched rather than turned into a larger nonsense.
+pub fn feedback_true_q16(reported: u32) -> u32 {
+    let whole = reported & !0xffff;
+    let frac = reported & 0xffff;
+    if frac >= FIRMWARE_FRACTION_SCALE {
+        return reported;
+    }
+    // Rounded, not floored: the planner accumulates the residue, so a
+    // systematic bias of even a fraction of a Q16.16 step is a rate error.
+    let scaled = (frac as u64 * 65536 + FIRMWARE_FRACTION_SCALE as u64 / 2)
+        / FIRMWARE_FRACTION_SCALE as u64;
+    whole + scaled as u32
+}
+
 /// Bytes to request for an output packet carrying `frames`.
 ///
 /// Uses the *output* direction's `bytes_per_frame`. The two directions happen

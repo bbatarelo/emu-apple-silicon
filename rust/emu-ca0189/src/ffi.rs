@@ -201,6 +201,15 @@ pub unsafe extern "C" fn emu_feedback_set_nominal(
     }
 }
 
+/// Corrects the fixed-point scaling of a raw feedback word from endpoint 0x81.
+///
+/// Pure: no state, safe to call from anywhere. See `clock::feedback_true_q16`
+/// for why the device's value needs correcting and how that was established.
+#[no_mangle]
+pub extern "C" fn emu_feedback_true_q16(reported: u32) -> u32 {
+    crate::clock::feedback_true_q16(reported)
+}
+
 /// Records the sample frames observed on one capture service interval.
 ///
 /// # Safety

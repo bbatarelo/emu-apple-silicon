@@ -4,7 +4,9 @@
 //! Guidelines Milestone 3: "Use these captures to validate the feedback and
 //! clock-estimator model." These run with `cargo test` and need no hardware.
 
-use emu_ca0189::clock::{frames_in_packet, output_packet_bytes, ClockEstimator, FeedbackQueue};
+use emu_ca0189::clock::{
+    feedback_true_q16, frames_in_packet, output_packet_bytes, ClockEstimator, FeedbackQueue,
+};
 use emu_ca0189::types::{ByteCount, SampleFrames};
 
 const BYTES_PER_FRAME: u32 = 6; // 2 channels x 3 bytes, every alt setting
@@ -619,4 +621,78 @@ fn timestamp_filter_rebase_crosses_a_known_gap_without_resetting() {
         assert!(err < 4.0, "drifted {err} ticks from raw after rebase");
     }
     assert_eq!(f.resets(), 0);
+}
+
+/// Every rate and service interval the device publishes, with the raw feedback
+/// word read from the hardware at each. Corrected, all ten must land on the
+/// nominal frames-per-interval they claim to describe.
+///
+/// The 48 kHz family has no fraction and must come back untouched; the 44.1
+/// family is the whole point, being 53.1 ppm low as sent.
+#[test]
+fn corrects_the_feedback_scaling_at_every_published_rate() {
+    // (rate, interval in microframes, raw word, nominal frames per interval)
+    let rows: &[(u32, u32, u32, f64)] = &[
+        (44_100, 8, 0x002c_1900, 44.1),
+        (44_100, 4, 0x0016_0c80, 22.05),
+        (48_000, 8, 0x0030_0000, 48.0),
+        (48_000, 4, 0x0018_0000, 24.0),
+        (88_200, 8, 0x0058_3200, 88.2),
+        (88_200, 4, 0x002c_1900, 44.1),
+        (96_000, 8, 0x0060_0000, 96.0),
+        (96_000, 4, 0x0030_0000, 48.0),
+        (176_400, 4, 0x0058_3200, 88.2),
+        (192_000, 4, 0x0060_0000, 96.0),
+    ];
+
+    for &(rate, microframes, raw, nominal) in rows {
+        let corrected = feedback_true_q16(raw) as f64 / 65536.0;
+        let error_ppm = (corrected - nominal) / nominal * 1e6;
+        assert!(
+            error_ppm.abs() < 1.0,
+            "{rate} Hz on {microframes} microframes: {raw:#010x} corrected to \
+             {corrected} frames, wanted {nominal} ({error_ppm:.1} ppm off)"
+        );
+
+        // And the uncorrected value is wrong by the documented amount, so a
+        // regression that stopped correcting could not pass quietly.
+        let raw_ppm = (raw as f64 / 65536.0 - nominal) / nominal * 1e6;
+        if raw & 0xffff == 0 {
+            assert_eq!(feedback_true_q16(raw), raw, "integer rates must pass through");
+        } else {
+            assert!(
+                (raw_ppm + 53.1).abs() < 0.5,
+                "{rate} Hz: raw word should read -53.1 ppm, read {raw_ppm:.1}"
+            );
+        }
+    }
+}
+
+/// The device's deviation from nominal has to survive the correction --
+/// otherwise the planner would follow a constant and not a servo.
+///
+/// It also fixes the size of that deviation, which the raw word misstates. The
+/// hardware's excursion at 192 kHz is one raw step of 0x1000, which reads as
+/// 1/16 of a frame and is really 4096/64000 = 0.064 frames. Anything quoting
+/// 0.0625 is quoting the firmware's arithmetic rather than the device.
+#[test]
+fn the_correction_preserves_the_devices_own_deviation() {
+    let nominal = 0x0060_0000u32; // 96.0000 at 192 kHz, no fraction
+    let low = nominal - 0x1000; // reads as 95.9375; means 95.9600
+
+    let corrected = feedback_true_q16(low) as f64 / 65536.0;
+    assert!(
+        (corrected - 95.96).abs() < 0.001,
+        "one raw step should be 0.064 frames, got {corrected}"
+    );
+    assert!(corrected < 96.0, "an excursion below nominal must stay below");
+    assert_eq!(feedback_true_q16(nominal), nominal, "nominal must not move");
+}
+
+/// A fraction the model cannot have produced is passed through rather than
+/// scaled into something larger and wronger.
+#[test]
+fn refuses_to_correct_what_the_model_cannot_explain() {
+    let impossible = 0x0060_0000 | 0xfa00; // fraction at the scale itself
+    assert_eq!(feedback_true_q16(impossible), impossible);
 }

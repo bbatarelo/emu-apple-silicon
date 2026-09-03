@@ -120,6 +120,10 @@ uint32_t emu_feedback_next(EmuFeedback* fb, uint32_t nominal);
 uint32_t emu_feedback_depth(EmuFeedback* fb);
 uint32_t emu_feedback_overflows(EmuFeedback* fb);
 uint32_t emu_feedback_starved(EmuFeedback* fb);
+/* Corrects the fixed-point scaling of a raw Q16.16 word from endpoint 0x81:
+ * the firmware scales the fraction by 64000 where the format says 65536, so
+ * every rate with a fractional packet size reads 53.1 ppm low. Stateless. */
+uint32_t emu_feedback_true_q16(uint32_t reported);
 
 uint32_t emu_frames_in_packet(uint32_t bytes, uint32_t bytes_per_frame);
 uint32_t emu_output_packet_bytes(uint32_t frames, uint32_t output_bytes_per_frame);
