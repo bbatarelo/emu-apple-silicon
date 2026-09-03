@@ -548,6 +548,61 @@ steady-state figure.
 error.** It is what is in flight: the output lead plus every scheduled packet
 not yet transmitted. What matters is whether it *grows*, not what it is.
 
+### Round-trip latency, measured
+
+The latency published past the safety offset is the stretch USB cannot see:
+bus to DAC on the way out, ADC to bus on the way back. A cable measures it
+directly. Write a chirp into the output buffer at sample time `So`,
+cross-correlate it back out of the input buffer at sample time `Si`, and
+`Si - So` is that quantity and nothing else — both are positions on the
+timeline the driver publishes, and the safety offsets and the client's buffer
+decide *when* Core Audio hands frames over, not where on the timeline they sit.
+
+The measurement says so itself. It is repeatable to **0.00 frames** across six
+chirps in a run, identical on both channels to 0.01 frames, and **unchanged
+across IO buffers from 64 to 2048 frames** — 273 ± 2 frames throughout — while
+the output cycle's lead over the input cycle moves from 560 to 4528, exactly
+`2 × buffer + safetyIn + safetyOut`. Whatever it is measuring belongs to the
+hardware and not to the buffering above it.
+
+| rate | measured | model | residual |
+|---|---|---|---|
+| 44.1 kHz | 252.5 frames, 5.726 ms | 5.769 ms | −0.043 ms |
+| 48 kHz | 273.2 frames, 5.693 ms | 5.644 ms | +0.049 ms |
+| 88.2 kHz | 442.6 frames, 5.018 ms | 4.999 ms | +0.019 ms |
+| 96 kHz | 471.6 frames, 4.912 ms | 4.937 ms | −0.025 ms |
+
+Least squares over the four rates gives
+
+    round trip = 67.9 frames + 4.229 ms
+
+**Two terms, because the path holds two kinds of delay.** A converter's group
+delay is a filter: a fixed number of *frames* whatever the rate. The device's
+own buffering is a fixed *time*. Fit either alone and it misses by
+milliseconds at one end of the range — which is what makes the pair of them,
+rather than the pair's value at any one rate, the thing worth keeping.
+
+The frame term lands on **67.9** against the 68 the original kext derived from
+the DAC and ADC specifications (15 and 53), a tenth of a frame apart, so that
+split between the two directions is kept. The time term is halved between them
+for want of anything better: a loopback yields only the sum. The driver carries
+it as `INTERNAL_ROUND_TRIP_US` 4230 and converts at the current rate, the same
+way the safety offsets are specified.
+
+Re-measured against the driver once it carried these figures — a fresh set of
+streams, not the ones fitted — the declared latency lands within **0.10 ms** of
+the cable at every rate: +0.060 ms at 44.1 kHz, +0.102 at 48, +0.039 at 88.2,
+−0.010 at 96. The residual few frames are a per-stream-start effect: the round
+trip is exact to 0.00 frames *within* a run and moves by one to four frames
+between runs, which is the granularity at which a stream binds to the bus.
+
+The kext's own published round-trip table (`resources/…/Latency.md`, Reaper
+with a loopback cable) is an independent check on all of this. Fit
+`total = a·(N/rate) + b` to its two DAW buffer sizes and `a` comes out 1.8–2.1,
+leaving `b` as that rate's fixed round trip: 5.400 ms at 44.1 kHz, 5.400 at 48,
+4.700 at 96 — within 0.33 ms of the figures above, from a different rig, a
+different driver and a different decade.
+
 ---
 
 ## Mistakes that look like hardware faults
@@ -583,6 +638,9 @@ Two general lessons:
 
 ## Open questions
 
+- How the internal path's 4.23 ms divides between input and output. A loopback
+  yields only the sum, so the driver splits it evenly; the kext asked the same
+  question ("Can we measure one-way directly?") and did not answer it.
 - What triggers the intermittent silent `SET_CUR` failure.
 - What alt 11 is for, given it duplicates alt 3 exactly.
 - Whether `kAudioDevicePropertyDeviceIsRunning` needs a change notification; it

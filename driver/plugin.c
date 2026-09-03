@@ -111,15 +111,45 @@ enum {
 #define INPUT_SAFETY_US          5000
 
 /*
- * Presentation latency past the safety offset: the device's converter and
- * internal path, invisible to USB. Taken from the original kext, which broke
- * its loopback measurements down into DAC/ADC group delay in frames plus a
- * rate-proportional internal share ((rate/591)/2 frames each way). Estimates,
- * but measured ones, and far closer than claiming zero.
+ * Presentation latency past the safety offset: the stretch of the path USB
+ * cannot see -- bus to DAC going out, ADC to bus coming back.
+ *
+ * Measured, with a cable from the outputs to the inputs (`hal-loopback
+ * latency`). A chirp is written into the output buffer at sample time So and
+ * cross-correlated back out of the input buffer at sample time Si. Both are
+ * positions on the timeline this driver itself publishes, so Si - So is this
+ * quantity and nothing else: the safety offsets and the client's buffer decide
+ * *when* Core Audio hands frames over, not where on the timeline they sit.
+ * That shows up in the measurement -- it is repeatable to 0.00 frames within a
+ * run, identical on both channels, and unchanged across IO buffers from 64 to
+ * 2048 frames while the output cycle's lead over the input cycle moves from
+ * 560 to 4528.
+ *
+ * Over 44.1, 48, 88.2 and 96 kHz the round trip is, to within 0.05 ms,
+ *
+ *     total = 68 frames + 4.23 ms
+ *
+ * and it takes both terms because the path holds two different kinds of delay.
+ * A converter's group delay is a filter, so it is a fixed number of *frames*
+ * whatever the rate; the device's own buffering is a fixed *time*. Fit either
+ * one alone and it misses by milliseconds at one end of the range.
+ *
+ * The frame term matches the DAC and ADC figures the original kext derived
+ * from the converter specifications -- 15 + 53 -- to a tenth of a frame, so
+ * that split between the two directions is kept. The time term is halved
+ * between them for want of anything better: a loopback yields only the sum,
+ * and separating the directions needs a measurement that isolates one of them.
+ *
+ * The safety offset is deliberately absent. The HAL publishes it as its own
+ * property and adds the two together itself.
  */
 #define DAC_LATENCY_FRAMES  15
 #define ADC_LATENCY_FRAMES  53
-#define INTERNAL_LATENCY_FRAMES ((UInt32)(gSampleRate / 591.0 / 2.0))
+/* The fixed-time term, as a round trip. Specified in time and converted at the
+ * current rate, for the same reason the safety offsets above are. */
+#define INTERNAL_ROUND_TRIP_US 4230
+#define INTERNAL_LATENCY_FRAMES \
+    ((UInt32)(gSampleRate * INTERNAL_ROUND_TRIP_US / 2.0e6))
 
 /*
  * Diagnostic counters, readable as custom properties on the device object.

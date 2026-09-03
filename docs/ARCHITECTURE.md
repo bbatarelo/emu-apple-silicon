@@ -210,8 +210,9 @@ the `SafetyOffsetMicroSec` custom property (`'emuS'`, `hal-check safety`), the
 same knob the original kext exposed. The engine takes the value at the next
 stream start; coreaudiod's published copy only follows a coreaudiod restart
 (FINDINGS), which `hal-check safety` makes visible. Reported presentation
-latency past the offset is the converter path, using the kext's
-loopback-derived figures.
+latency past the offset is the converter path, measured with a loopback cable:
+68 frames of converter group delay plus 4.23 ms of device buffering, split
+between the two directions (FINDINGS).
 
 **Where Core Audio actually writes is not the offset**, and this is what sizes
 the schedule. Measured across every IO buffer the HAL will grant,

@@ -154,7 +154,8 @@ More in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 ## Status
 
 Working: playback, capture, all six sample rates, master volume and mute,
-correct channel mapping, clock tracking anchored to the device.
+correct channel mapping, clock tracking anchored to the device, latency
+reported from a loopback measurement.
 
 Not done:
 
@@ -165,7 +166,6 @@ Not done:
   0404's S/PDIF — are not exposed. The Tracker Pre advertises only one extension
   unit, so some may not be reachable; the 0404 has three more that nothing reads
   yet.
-- Latency is reported as an estimate rather than a measurement.
 - Stereo only. The 0404 also offers four-channel modes, which are ignored.
 - One device at a time, even when several are attached.
 - The 0202 USB is untested.
