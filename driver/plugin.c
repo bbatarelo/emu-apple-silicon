@@ -152,7 +152,7 @@ enum {
  * current rate, for the same reason the safety offsets above are. */
 #define INTERNAL_ROUND_TRIP_US 4230
 #define INTERNAL_LATENCY_FRAMES \
-    ((UInt32)(gSampleRate * INTERNAL_ROUND_TRIP_US / 2.0e6))
+    ((UInt32)(dev->sampleRate * INTERNAL_ROUND_TRIP_US / 2.0e6))
 
 /*
  * Diagnostic counters, readable as custom properties on the device object.
@@ -215,10 +215,6 @@ enum {
  * Switchable at runtime because which one sounds better is a question about this
  * machine and this workload, not one to answer from first principles.
  */
-typedef enum {
-    kClockSource_Device = 0,
-    kClockSource_Host   = 1,
-} ClockSource;
 
 /* Every rate the hardware supports, from the descriptors. */
 static const Float64 kSupportedRates[] = {
@@ -232,10 +228,91 @@ static pthread_mutex_t   gStateMutex     = PTHREAD_MUTEX_INITIALIZER;
 static UInt32            gRefCount       = 0;
 static AudioServerPlugInHostRef gHost    = NULL;
 
+typedef enum { kInputMode_Auto = 0, kInputMode_On, kInputMode_Off } InputMode;
+typedef enum {
+    kClockSource_Device = 0,
+    kClockSource_Host   = 1,
+} ClockSource;
+
+/*
+ * One published device.
+ *
+ * Everything here used to be file scope, which is why the driver could only
+ * ever speak for one box: a second unit had nowhere to keep its rate, its
+ * volume, its clock anchor or its client count. Object IDs are computed from
+ * `base` rather than fixed, so an incoming AudioObjectID maps back to a device
+ * and a role by arithmetic.
+ */
+#define EMU_MAX_DEVICES      4u
+#define DEVICE_OBJECT_BASE   2u
+#define DEVICE_OBJECT_STRIDE 5u
+
+typedef enum {
+    kRole_Device = 0,
+    kRole_StreamInput,
+    kRole_StreamOutput,
+    kRole_VolumeOutput,
+    kRole_MuteOutput,
+    kRole_Count
+} DeviceRole;
+
+typedef struct {
+    bool                     present;
+    unsigned                 index;
+    AudioObjectID            base;      /* first object ID of this device's block */
+    const EmuDeviceIdentity* identity;
+    EmuEngine* engine;
+    _Atomic bool deviceAlive;
+    Float64 sampleRate;
+    UInt32 iOClients;
+    Boolean inputActive;
+    Boolean outputActive;
+    InputMode inputMode;
+    Float64 policyRate;
+    ClockSource clockSource;
+    Float32 volumeScalar;
+    Boolean muted;
+    UInt32 outputSafetyUS;
+    _Atomic uint64_t startIOCount;
+    _Atomic uint64_t iOCycles;
+    _Atomic uint64_t framesOut;
+    UInt64 anchorHostTime;
+    UInt64 anchorJitterNs;
+    UInt64 anchorJitterMaxNs;
+    UInt64 anchorUpdates;
+    UInt64 deficitBaseline;
+    UInt64 resetCount;
+    UInt64 timelineSeed;
+    UInt64 periodCount;
+} Device;
+
+static Device   gDevices[EMU_MAX_DEVICES];
+static unsigned gDeviceCount;
+
+static inline AudioObjectID device_object(const Device* dev, DeviceRole role)
+{
+    return dev->base + (AudioObjectID)role;
+}
+
+/* Maps an object ID back to the device that owns it. NULL for the plug-in
+ * object and for anything out of range, which callers answer with
+ * kAudioHardwareBadObjectError exactly as they did when there was one device. */
+static Device* device_for_object(AudioObjectID id, DeviceRole* role)
+{
+    if (id < DEVICE_OBJECT_BASE) return NULL;
+    unsigned off = (unsigned)(id - DEVICE_OBJECT_BASE);
+    unsigned idx = off / DEVICE_OBJECT_STRIDE;
+    unsigned r   = off % DEVICE_OBJECT_STRIDE;
+    if (idx >= EMU_MAX_DEVICES || r >= (unsigned)kRole_Count) return NULL;
+    if (!gDevices[idx].present) return NULL;
+    if (role) *role = (DeviceRole)r;
+    return &gDevices[idx];
+}
+
+
 /* The transport for the one device this plug-in currently publishes. Stage 2
  * replaces it with a registry keyed by AudioObjectID, at which point nothing
  * else here has to change: every call already goes through the handle. */
-static EmuEngine* gEngine = NULL;
 
 /*
  * Whether the transport is still there.
@@ -246,11 +323,10 @@ static EmuEngine* gEngine = NULL;
  * nobody is transmitting. Core Audio has no other way to be told, so this is
  * the one signal that ends that state.
  */
-static _Atomic bool gDeviceAlive = true;
 
-static void device_set_alive(bool alive)
+static void device_set_alive(Device* dev, bool alive)
 {
-    bool was = atomic_exchange(&gDeviceAlive, alive);
+    bool was = atomic_exchange(&dev->deviceAlive, alive);
     if (was == alive || !gHost) return;
 
     EMU_LOG("device marked %{public}s", alive ? "alive" : "NOT alive");
@@ -266,19 +342,17 @@ static void device_set_alive(bool alive)
 /* Engine thread, once, when it has exhausted its rebuild attempts. */
 static void engine_failed(void)
 {
+    /* The engine's handler takes no context, so it can only mean the device
+     * this plug-in publishes. Stage 3 has to give the callback its engine, or
+     * two devices will report each other's failures. */
+    Device* dev = &gDevices[0];
     EMU_LOG("USB engine gave up; the device is unusable until it returns");
-    device_set_alive(false);
+    device_set_alive(dev, false);
 }
 
-static Float64           gSampleRate     = 48000.0;
-static UInt32            gIOClients      = 0;
-static Boolean           gInputActive    = true;
-static Boolean           gOutputActive   = true;
 /* Whether a stream opens the capture direction at all. See
  * kEMUProperty_InputMode. Under gStateMutex; the effective answer is
- * input_wanted_locked(), read once per StartIO. */
-typedef enum { kInputMode_Auto = 0, kInputMode_On, kInputMode_Off } InputMode;
-static InputMode         gInputMode      = kInputMode_On;
+ * input_wanted_locked(dev), read once per StartIO. */
 
 /* The rate at and above which `auto` stops opening capture: 176.4 and
  * 192 kHz, the two rates that exist only at bInterval 3 and the two at which
@@ -291,36 +365,20 @@ static InputMode         gInputMode      = kInputMode_On;
  *
  * The HAL defers PerformDeviceConfigurationChange while no IO is running -- it
  * can be minutes, or until the next stream starts -- and until it runs,
- * gSampleRate still holds the old rate. Deriving the published input direction
- * from gSampleRate therefore left the device advertising an input it was about
+ * dev->sampleRate still holds the old rate. Deriving the published input direction
+ * from dev->sampleRate therefore left the device advertising an input it was about
  * to drop, for as long as the machine stayed quiet. Audio MIDI Setup reads the
  * layout exactly then. */
-static Float64           gPolicyRate     = 48000.0;
-static ClockSource       gClockSource    = kClockSource_Device;
-static Float32           gVolumeScalar   = 1.0f;
-static Boolean           gMuted          = false;
-static UInt32            gOutputSafetyUS = OUTPUT_SAFETY_DEFAULT_US;
 
 /* Atomics, because DoIOOperation runs on the real-time thread and must not take
  * the state lock. */
-static _Atomic uint64_t  gStartIOCount   = 0;
-static _Atomic uint64_t  gIOCycles       = 0;
-static _Atomic uint64_t  gFramesOut      = 0;
 
 /* Timeline anchor. Advanced one ring period at a time so the sample clock and
  * the host clock stay tied together. */
-static UInt64            gAnchorHostTime = 0;
 /* Anchor jitter: how far each new timeline anchor lands from where the previous
  * one predicted. Diagnostics only; nothing depends on it. */
-static UInt64            gAnchorJitterNs = 0;
-static UInt64            gAnchorJitterMaxNs = 0;
-static UInt64            gAnchorUpdates = 0;
 /* Deficit at the last reset, so the reported figure is what has accumulated
  * since rather than including everything from stream start. */
-static UInt64            gDeficitBaseline = 0;
-static UInt64            gResetCount = 0;
-static UInt64            gTimelineSeed   = 1;
-static UInt64            gPeriodCount    = 0;
 
 static Float64 host_ticks_per_second(void)
 {
@@ -365,15 +423,15 @@ static Float32 volume_db_to_scalar(Float32 db)
 }
 
 /* Gain the engine should apply, accounting for mute. Caller holds the lock. */
-static void push_gain_to_engine(void)
+static void push_gain_to_engine(Device* dev)
 {
-    emu_engine_set_output_gain(gEngine, gMuted ? 0.0f : volume_scalar_to_gain(gVolumeScalar));
+    emu_engine_set_output_gain(dev->engine, dev->muted ? 0.0f : volume_scalar_to_gain(dev->volumeScalar));
 }
 
-static void fill_stream_format(AudioStreamBasicDescription* format)
+static void fill_stream_format(Device* dev, AudioStreamBasicDescription* format)
 {
     memset(format, 0, sizeof(*format));
-    format->mSampleRate       = gSampleRate;
+    format->mSampleRate       = dev->sampleRate;
     format->mFormatID         = kAudioFormatLinearPCM;
     format->mFormatFlags      = kAudioFormatFlagIsFloat
                               | kAudioFormatFlagsNativeEndian
@@ -484,6 +542,28 @@ static void device_presence_changed(void)
 
 static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef host)
 {
+    /* Register the one device this stage publishes. Its object IDs come out
+     * of the same arithmetic every device will use, so slot 0 lands on exactly
+     * the IDs the fixed enum used to name and nothing a client has cached
+     * changes. */
+    Device* dev = &gDevices[0];
+    memset(dev, 0, sizeof *dev);
+    dev->present     = true;
+    dev->index       = 0;
+    dev->base        = DEVICE_OBJECT_BASE;
+    dev->sampleRate  = 48000.0;
+    dev->policyRate  = 48000.0;
+    dev->inputActive = true;
+    dev->outputActive = true;
+    dev->inputMode   = kInputMode_On;
+    dev->clockSource = kClockSource_Device;
+    dev->volumeScalar = 1.0f;
+    dev->muted       = false;
+    dev->outputSafetyUS = OUTPUT_SAFETY_DEFAULT_US;
+    dev->timelineSeed = 1;
+    atomic_init(&dev->deviceAlive, true);
+    gDeviceCount = 1;
+
     (void)driver;
     gHost = host;
     /* Arms the hot-plug watch, which resolves what is attached right now
@@ -500,16 +580,16 @@ static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
         gHost = NULL;
         return kAudioHardwareUnspecifiedError;
     }
-    gEngine = emu_engine_create();
-    if (!gEngine) {
+    dev->engine = emu_engine_create();
+    if (!dev->engine) {
         EMU_LOG("initialize failed: could not create the USB transport");
         gHost = NULL;
         return kAudioHardwareUnspecifiedError;
     }
-    emu_engine_set_failure_handler(gEngine, engine_failed);
+    emu_engine_set_failure_handler(dev->engine, engine_failed);
     if (emu_engine_device_attached()) {
         EMU_LOG("initialized, publishing %{public}s at %{public}.0f Hz",
-                emu_engine_device_name(), gSampleRate);
+                emu_engine_device_name(), dev->sampleRate);
     } else {
         EMU_LOG("initialized, no device attached: publishing nothing until one is");
     }
@@ -549,13 +629,13 @@ static OSStatus RemoveDeviceClient(AudioServerPlugInDriverRef d, AudioObjectID i
  * Whichever mode is in force, it must not be silent: the input stream is
  * withdrawn (input_published) and reports kAudioStreamPropertyIsActive false
  * whenever this is false. */
-static Boolean input_wanted_locked(void)
+static Boolean input_wanted_locked(Device* dev)
 {
-    switch (gInputMode) {
+    switch (dev->inputMode) {
         case kInputMode_On:  return true;
         case kInputMode_Off: return false;
         case kInputMode_Auto:
-        default:             return gPolicyRate < EMU_INPUT_AUTO_OFF_HZ;
+        default:             return dev->policyRate < EMU_INPUT_AUTO_OFF_HZ;
     }
 }
 
@@ -591,6 +671,8 @@ static void notify_input_visibility_changed(void)
 static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d,
                                                  AudioObjectID id, UInt64 action, void* info)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
     (void)d; (void)info;
     if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
 
@@ -602,13 +684,13 @@ static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d,
     if (!known) return kAudioHardwareUnsupportedOperationError;
 
     pthread_mutex_lock(&gStateMutex);
-    Boolean was = input_wanted_locked();
-    gSampleRate = rate;
-    gPolicyRate = rate;   /* for a change the HAL originated, not our setter */
-    gAnchorHostTime = 0;   /* the timeline restarts with the rate */
-    gPeriodCount = 0;
-    gTimelineSeed++;
-    Boolean now = input_wanted_locked();
+    Boolean was = input_wanted_locked(dev);
+    dev->sampleRate = rate;
+    dev->policyRate = rate;   /* for a change the HAL originated, not our setter */
+    dev->anchorHostTime = 0;   /* the timeline restarts with the rate */
+    dev->periodCount = 0;
+    dev->timelineSeed++;
+    Boolean now = input_wanted_locked(dev);
     pthread_mutex_unlock(&gStateMutex);
 
     /* Under `auto` the rate decides the input direction, so crossing 176.4 kHz
@@ -668,17 +750,17 @@ static OSStatus AbortDeviceConfigurationChange(AudioServerPlugInDriverRef d,
  * input channels -- which is a thing users and applications both understand.
  *
  * Takes gStateMutex itself: the property calls that need it do not hold it. */
-static Boolean input_published(void)
+static Boolean input_published(Device* dev)
 {
     pthread_mutex_lock(&gStateMutex);
-    Boolean published = input_wanted_locked();
+    Boolean published = input_wanted_locked(dev);
     pthread_mutex_unlock(&gStateMutex);
     return published;
 }
 
-static Boolean stream_matches_scope(AudioObjectID stream, AudioObjectPropertyScope scope)
+static Boolean stream_matches_scope(Device* dev, AudioObjectID stream, AudioObjectPropertyScope scope)
 {
-    if (stream == kObjectID_Stream_Input && !input_published()) return false;
+    if (stream == kObjectID_Stream_Input && !input_published(dev)) return false;
     if (scope == kAudioObjectPropertyScopeGlobal) return true;
     if (scope == kAudioObjectPropertyScopeInput)  return stream == kObjectID_Stream_Input;
     if (scope == kAudioObjectPropertyScopeOutput) return stream == kObjectID_Stream_Output;
@@ -686,11 +768,11 @@ static Boolean stream_matches_scope(AudioObjectID stream, AudioObjectPropertySco
 }
 
 /* Number of stream objects visible in a given scope. */
-static UInt32 stream_count(AudioObjectPropertyScope scope)
+static UInt32 stream_count(Device* dev, AudioObjectPropertyScope scope)
 {
     UInt32 n = 0;
-    if (stream_matches_scope(kObjectID_Stream_Input, scope))  n++;
-    if (stream_matches_scope(kObjectID_Stream_Output, scope)) n++;
+    if (stream_matches_scope(dev, kObjectID_Stream_Input, scope))  n++;
+    if (stream_matches_scope(dev, kObjectID_Stream_Output, scope)) n++;
     return n;
 }
 
@@ -850,6 +932,8 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
                                     UInt32 qualifierSize, const void* qualifier,
                                     UInt32* outSize)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(object, &role_);
     (void)d; (void)client; (void)qualifierSize; (void)qualifier;
     if (!address || !outSize) return kAudioHardwareIllegalOperationError;
 
@@ -873,8 +957,8 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             if (object == kObjectID_PlugIn) {
                 *outSize = emu_engine_device_attached() ? sizeof(AudioObjectID) : 0;
             } else if (object == kObjectID_Device) {
-                UInt32 n = stream_count(address->mScope);
-                if (stream_matches_scope(kObjectID_Stream_Output, address->mScope)) n += 2;
+                UInt32 n = stream_count(dev, address->mScope);
+                if (stream_matches_scope(dev, kObjectID_Stream_Output, address->mScope)) n += 2;
                 *outSize = n * sizeof(AudioObjectID);
             } else { *outSize = 0; }
             return kAudioHardwareNoError;
@@ -884,7 +968,7 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             return kAudioHardwareNoError;
 
         case kAudioDevicePropertyStreams:
-            *outSize = stream_count(address->mScope) * sizeof(AudioObjectID);
+            *outSize = stream_count(dev, address->mScope) * sizeof(AudioObjectID);
             return kAudioHardwareNoError;
 
         case kAudioDevicePropertyRelatedDevices:
@@ -953,6 +1037,8 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                                 UInt32 qualifierSize, const void* qualifier,
                                 UInt32 dataSize, UInt32* outSize, void* outData)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(object, &role_);
     (void)d; (void)client;
     if (!address || !outSize || !outData) return kAudioHardwareIllegalOperationError;
 
@@ -1013,8 +1099,8 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
              * Audio stop handing audio to a transport that is gone: clients
              * are forced to re-open, and a re-open starts a fresh engine. */
             case kAudioDevicePropertyDeviceIsAlive:
-                RETURN_U32(atomic_load(&gDeviceAlive) ? 1 : 0);
-            case kAudioDevicePropertyDeviceIsRunning: RETURN_U32(gIOClients > 0 ? 1 : 0);
+                RETURN_U32(atomic_load(&dev->deviceAlive) ? 1 : 0);
+            case kAudioDevicePropertyDeviceIsRunning: RETURN_U32(dev->iOClients > 0 ? 1 : 0);
             case kAudioDevicePropertyDeviceCanBeDefaultDevice: RETURN_U32(1);
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: RETURN_U32(1);
             case kAudioDevicePropertyIsHidden: RETURN_U32(0);
@@ -1031,13 +1117,13 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kAudioDevicePropertySafetyOffset: {
                 pthread_mutex_lock(&gStateMutex);
                 UInt32 us = address->mScope == kAudioObjectPropertyScopeInput
-                          ? INPUT_SAFETY_US : gOutputSafetyUS;
-                UInt32 frames = (UInt32)(gSampleRate * (Float64)us / 1.0e6);
+                          ? INPUT_SAFETY_US : dev->outputSafetyUS;
+                UInt32 frames = (UInt32)(dev->sampleRate * (Float64)us / 1.0e6);
                 pthread_mutex_unlock(&gStateMutex);
                 RETURN_U32(frames);
             }
 
-            case kAudioDevicePropertyNominalSampleRate: RETURN_F64(gSampleRate);
+            case kAudioDevicePropertyNominalSampleRate: RETURN_F64(dev->sampleRate);
 
             case kAudioObjectPropertyCustomPropertyInfoList: {
                 AudioServerPlugInCustomPropertyInfo* info =
@@ -1087,7 +1173,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kEMUProperty_ResetCounters: {
                 if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
                 pthread_mutex_lock(&gStateMutex);
-                UInt64 count = gResetCount;
+                UInt64 count = dev->resetCount;
                 pthread_mutex_unlock(&gStateMutex);
                 CFStringRef value = CFStringCreateWithFormat(
                     NULL, NULL, CFSTR("%llu"), (unsigned long long)count);
@@ -1099,7 +1185,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kEMUProperty_SafetyOffset: {
                 if (dataSize < sizeof(CFPropertyListRef)) return kAudioHardwareBadPropertySizeError;
                 pthread_mutex_lock(&gStateMutex);
-                long long us = gOutputSafetyUS;
+                long long us = dev->outputSafetyUS;
                 pthread_mutex_unlock(&gStateMutex);
                 /* The caller owns the returned reference. */
                 CFNumberRef n = CFNumberCreate(NULL, kCFNumberLongLongType, &us);
@@ -1112,7 +1198,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kEMUProperty_ClockSource: {
                 if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
                 pthread_mutex_lock(&gStateMutex);
-                ClockSource source = gClockSource;
+                ClockSource source = dev->clockSource;
                 pthread_mutex_unlock(&gStateMutex);
                 *(CFStringRef*)outData = (source == kClockSource_Host)
                     ? CFSTR("host") : CFSTR("device");
@@ -1123,7 +1209,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kEMUProperty_InputMode: {
                 if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
                 pthread_mutex_lock(&gStateMutex);
-                InputMode mode = gInputMode;
+                InputMode mode = dev->inputMode;
                 pthread_mutex_unlock(&gStateMutex);
                 /* The mode, not the effect: what `auto` currently resolves to
                  * is the input stream's kAudioStreamPropertyIsActive. */
@@ -1137,7 +1223,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kEMUProperty_FaultInject: {
                 if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
                 EmuEngineStats st;
-                emu_engine_stats(gEngine, &st);
+                emu_engine_stats(dev->engine, &st);
                 *(CFStringRef*)outData =
                     st.fault_mode == EMU_FAULT_TRANSIENT  ? CFSTR("transient")  :
                     st.fault_mode == EMU_FAULT_PERSISTENT ? CFSTR("persistent") : CFSTR("none");
@@ -1156,14 +1242,14 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
 
                 EmuEngineStats engine;
                 memset(&engine, 0, sizeof engine);
-                emu_engine_stats(gEngine, &engine);
+                emu_engine_stats(dev->engine, &engine);
 
                 struct { CFStringRef key; uint64_t value; } entries[] = {
-                    { CFSTR("startIOCalls"),   atomic_load_explicit(&gStartIOCount, memory_order_relaxed) },
-                    { CFSTR("ioCycles"),       atomic_load_explicit(&gIOCycles, memory_order_relaxed)     },
-                    { CFSTR("framesToOutput"), atomic_load_explicit(&gFramesOut, memory_order_relaxed)    },
-                    { CFSTR("ioClients"),      (uint64_t)gIOClients        },
-                    { CFSTR("engineRunning"),  emu_engine_running(gEngine) ? 1u : 0u },
+                    { CFSTR("startIOCalls"),   atomic_load_explicit(&dev->startIOCount, memory_order_relaxed) },
+                    { CFSTR("ioCycles"),       atomic_load_explicit(&dev->iOCycles, memory_order_relaxed)     },
+                    { CFSTR("framesToOutput"), atomic_load_explicit(&dev->framesOut, memory_order_relaxed)    },
+                    { CFSTR("ioClients"),      (uint64_t)dev->iOClients        },
+                    { CFSTR("engineRunning"),  emu_engine_running(dev->engine) ? 1u : 0u },
                     { CFSTR("framesPlayed"),   engine.frames_played        },
                     { CFSTR("outputLead"),     engine.output_lead          },
                     { CFSTR("outputUnderruns"), engine.underruns           },
@@ -1193,7 +1279,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     { CFSTR("deadFrames"),     engine.dead_frames          },
                     { CFSTR("unfilledPlayback"), engine.unfilled_playback  },
                     { CFSTR("shortPlayback"),  engine.short_playback       },
-                    { CFSTR("safetyOffsetUS"), (uint64_t)gOutputSafetyUS   },
+                    { CFSTR("safetyOffsetUS"), (uint64_t)dev->outputSafetyUS   },
                     /* The output path's own accounting. `framesBound` should
                      * track framesToOutput exactly; `unmappedFrames` is audio
                      * no queued request covered (a rebuild's dead interval,
@@ -1217,10 +1303,10 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     { CFSTR("inputUnderruns"), engine.input_underruns      },
                     { CFSTR("inputOverruns"),  engine.input_overruns       },
                     { CFSTR("emptyCapture"),   engine.empty_capture        },
-                    { CFSTR("clockSourceIsHost"), (uint64_t)(gClockSource == kClockSource_Host) },
-                    { CFSTR("anchorUpdates"),     gAnchorUpdates      },
-                    { CFSTR("anchorJitterNs"),    gAnchorJitterNs     },
-                    { CFSTR("anchorJitterMaxNs"), gAnchorJitterMaxNs  },
+                    { CFSTR("clockSourceIsHost"), (uint64_t)(dev->clockSource == kClockSource_Host) },
+                    { CFSTR("anchorUpdates"),     dev->anchorUpdates      },
+                    { CFSTR("anchorJitterNs"),    dev->anchorJitterNs     },
+                    { CFSTR("anchorJitterMaxNs"), dev->anchorJitterMaxNs  },
                     /* Frames the device consumed beyond what Core Audio handed
                      * over. The clearest health check there is: if it grows, the
                      * reported timeline is slower than the hardware and the ring
@@ -1228,15 +1314,15 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     /* Since the last reset, so a startup transient does not sit
                      * in the figure for the rest of the session. */
                     { CFSTR("frameDeficit"), (uint64_t)({
-                          uint64_t out = atomic_load_explicit(&gFramesOut, memory_order_relaxed);
+                          uint64_t out = atomic_load_explicit(&dev->framesOut, memory_order_relaxed);
                           uint64_t raw = engine.frames_played > out
                                        ? engine.frames_played - out : 0;
-                          raw > gDeficitBaseline ? raw - gDeficitBaseline : 0; }) },
-                    { CFSTR("counterResets"), gResetCount },
+                          raw > dev->deficitBaseline ? raw - dev->deficitBaseline : 0; }) },
+                    { CFSTR("counterResets"), dev->resetCount },
                     /* The counter whose absence cost a day and a half: with the
                      * engine dead every other figure here keeps advancing. */
                     { CFSTR("engineStreaming"), (uint64_t)engine.engine_streaming },
-                    { CFSTR("engineAlive"),     (uint64_t)(atomic_load(&gDeviceAlive) ? 1 : 0) },
+                    { CFSTR("engineAlive"),     (uint64_t)(atomic_load(&dev->deviceAlive) ? 1 : 0) },
                     { CFSTR("recoveries"),        engine.recoveries        },
                     { CFSTR("recoveryFailures"),  engine.recovery_failures },
                     { CFSTR("faultInjected"),     (uint64_t)engine.fault_mode },
@@ -1270,15 +1356,15 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 AudioObjectID* ids = (AudioObjectID*)outData;
                 UInt32 capacity = dataSize / sizeof(AudioObjectID);
                 UInt32 n = 0;
-                if (stream_matches_scope(kObjectID_Stream_Input, address->mScope) && n < capacity) {
+                if (stream_matches_scope(dev, kObjectID_Stream_Input, address->mScope) && n < capacity) {
                     ids[n++] = kObjectID_Stream_Input;
                 }
-                if (stream_matches_scope(kObjectID_Stream_Output, address->mScope) && n < capacity) {
+                if (stream_matches_scope(dev, kObjectID_Stream_Output, address->mScope) && n < capacity) {
                     ids[n++] = kObjectID_Stream_Output;
                 }
                 /* Controls are owned objects too, but they are not streams. */
                 if (address->mSelector == kAudioObjectPropertyOwnedObjects &&
-                    stream_matches_scope(kObjectID_Stream_Output, address->mScope)) {
+                    stream_matches_scope(dev, kObjectID_Stream_Output, address->mScope)) {
                     if (n < capacity) ids[n++] = kObjectID_Volume_Output;
                     if (n < capacity) ids[n++] = kObjectID_Mute_Output;
                 }
@@ -1331,8 +1417,8 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                  */
                 pthread_mutex_lock(&gStateMutex);
                 UInt32 active = (object == kObjectID_Stream_Input)
-                              ? (gInputActive && input_wanted_locked())
-                              : gOutputActive;
+                              ? (dev->inputActive && input_wanted_locked(dev))
+                              : dev->outputActive;
                 pthread_mutex_unlock(&gStateMutex);
                 RETURN_U32(active);
             }
@@ -1342,7 +1428,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 if (dataSize < sizeof(AudioStreamBasicDescription)) {
                     return kAudioHardwareBadPropertySizeError;
                 }
-                fill_stream_format((AudioStreamBasicDescription*)outData);
+                fill_stream_format(dev, (AudioStreamBasicDescription*)outData);
                 *outSize = sizeof(AudioStreamBasicDescription);
                 return kAudioHardwareNoError;
             }
@@ -1353,7 +1439,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 UInt32 capacity = dataSize / sizeof(AudioStreamRangedDescription);
                 UInt32 n = 0;
                 for (size_t i = 0; i < NUM_RATES && n < capacity; i++, n++) {
-                    fill_stream_format(&formats[n].mFormat);
+                    fill_stream_format(dev, &formats[n].mFormat);
                     formats[n].mFormat.mSampleRate = kSupportedRates[i];
                     formats[n].mSampleRateRange.mMinimum = kSupportedRates[i];
                     formats[n].mSampleRateRange.mMaximum = kSupportedRates[i];
@@ -1377,7 +1463,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kAudioLevelControlPropertyScalarValue: {
                 if (dataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
                 pthread_mutex_lock(&gStateMutex);
-                *(Float32*)outData = gVolumeScalar;
+                *(Float32*)outData = dev->volumeScalar;
                 pthread_mutex_unlock(&gStateMutex);
                 *outSize = sizeof(Float32);
                 return kAudioHardwareNoError;
@@ -1385,7 +1471,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kAudioLevelControlPropertyDecibelValue: {
                 if (dataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
                 pthread_mutex_lock(&gStateMutex);
-                *(Float32*)outData = volume_scalar_to_db(gVolumeScalar);
+                *(Float32*)outData = volume_scalar_to_db(dev->volumeScalar);
                 pthread_mutex_unlock(&gStateMutex);
                 *outSize = sizeof(Float32);
                 return kAudioHardwareNoError;
@@ -1423,7 +1509,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kAudioControlPropertyElement:  RETURN_U32(kAudioObjectPropertyElementMain);
             case kAudioBooleanControlPropertyValue: {
                 pthread_mutex_lock(&gStateMutex);
-                UInt32 muted = gMuted ? 1 : 0;
+                UInt32 muted = dev->muted ? 1 : 0;
                 pthread_mutex_unlock(&gStateMutex);
                 RETURN_U32(muted);
             }
@@ -1442,6 +1528,8 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                                 UInt32 qualifierSize, const void* qualifier,
                                 UInt32 dataSize, const void* data)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(object, &role_);
     (void)d; (void)client; (void)qualifierSize; (void)qualifier;
     if (!address || !data) return kAudioHardwareIllegalOperationError;
 
@@ -1459,9 +1547,9 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
              * exactly when a user is in Audio MIDI Setup looking at the
              * device. */
             pthread_mutex_lock(&gStateMutex);
-            Boolean was = input_wanted_locked();
-            gPolicyRate = requested;
-            Boolean now = input_wanted_locked();
+            Boolean was = input_wanted_locked(dev);
+            dev->policyRate = requested;
+            Boolean now = input_wanted_locked(dev);
             pthread_mutex_unlock(&gStateMutex);
             if (was != now) notify_input_visibility_changed();
 
@@ -1482,8 +1570,8 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         if (dataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
         Boolean active = *(const UInt32*)data != 0;
         pthread_mutex_lock(&gStateMutex);
-        if (object == kObjectID_Stream_Input) gInputActive = active;
-        else                                  gOutputActive = active;
+        if (object == kObjectID_Stream_Input) dev->inputActive = active;
+        else                                  dev->outputActive = active;
         pthread_mutex_unlock(&gStateMutex);
         return kAudioHardwareNoError;
     }
@@ -1500,8 +1588,8 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         if (scalar > 1.0f) scalar = 1.0f;
 
         pthread_mutex_lock(&gStateMutex);
-        gVolumeScalar = scalar;
-        push_gain_to_engine();
+        dev->volumeScalar = scalar;
+        push_gain_to_engine(dev);
         pthread_mutex_unlock(&gStateMutex);
 
         /* Both representations changed, whichever one was written. Without this
@@ -1519,17 +1607,17 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
     }
 
     if (object == kObjectID_Device && address->mSelector == kEMUProperty_ResetCounters) {
-        emu_engine_reset_counters(gEngine);
+        emu_engine_reset_counters(dev->engine);
 
         EmuEngineStats engine;
         memset(&engine, 0, sizeof engine);
-        emu_engine_stats(gEngine, &engine);
+        emu_engine_stats(dev->engine, &engine);
 
         pthread_mutex_lock(&gStateMutex);
-        gAnchorJitterNs = 0;
-        gAnchorJitterMaxNs = 0;
-        gAnchorUpdates = 0;
-        atomic_store_explicit(&gIOCycles, 0, memory_order_relaxed);
+        dev->anchorJitterNs = 0;
+        dev->anchorJitterMaxNs = 0;
+        dev->anchorUpdates = 0;
+        atomic_store_explicit(&dev->iOCycles, 0, memory_order_relaxed);
         /* Rebase rather than zero: frames_played cannot be reset without
          * breaking the timeline, so record where the deficit stands now. */
         /* framesToOutput is zeroed with framesBound, not left running: the
@@ -1537,9 +1625,9 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
          * framesToOutput, and windowing one side of it and not the other made
          * that comparison false for the rest of the session. The deficit
          * rebases onto the same instant, so it still reads as a delta. */
-        atomic_store_explicit(&gFramesOut, 0, memory_order_relaxed);
-        gDeficitBaseline = engine.frames_played;
-        gResetCount++;
+        atomic_store_explicit(&dev->framesOut, 0, memory_order_relaxed);
+        dev->deficitBaseline = engine.frames_played;
+        dev->resetCount++;
         pthread_mutex_unlock(&gStateMutex);
 
         EMU_LOG("counters reset");
@@ -1563,17 +1651,17 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         }
 
         pthread_mutex_lock(&gStateMutex);
-        if (gClockSource != source) {
-            gClockSource = source;
+        if (dev->clockSource != source) {
+            dev->clockSource = source;
             /* Bump the seed so Core Audio discards whatever it had extrapolated
              * from the previous anchor rather than splicing two timelines, and
              * restart the anchor so the incoming path does not inherit one the
              * other path derived. */
-            gTimelineSeed++;
-            gAnchorHostTime = 0;
-            gAnchorJitterNs = 0;
-            gAnchorJitterMaxNs = 0;
-            gAnchorUpdates = 0;
+            dev->timelineSeed++;
+            dev->anchorHostTime = 0;
+            dev->anchorJitterNs = 0;
+            dev->anchorJitterMaxNs = 0;
+            dev->anchorUpdates = 0;
         }
         pthread_mutex_unlock(&gStateMutex);
 
@@ -1603,10 +1691,10 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
 
         /* Clearing a fault also revives a device the engine gave up on, so a
          * test can put the driver back without restarting coreaudiod. */
-        if (mode == EMU_FAULT_NONE && !atomic_load(&gDeviceAlive)) {
-            device_set_alive(true);
+        if (mode == EMU_FAULT_NONE && !atomic_load(&dev->deviceAlive)) {
+            device_set_alive(dev, true);
         }
-        emu_engine_inject_fault(gEngine, mode);
+        emu_engine_inject_fault(dev->engine, mode);
         EMU_LOG("fault injection set to %{public}s",
                 mode == EMU_FAULT_TRANSIENT  ? "transient" :
                 mode == EMU_FAULT_PERSISTENT ? "persistent" : "none");
@@ -1633,10 +1721,10 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         }
 
         pthread_mutex_lock(&gStateMutex);
-        Boolean was = input_wanted_locked();
-        gInputMode = mode;
-        Boolean now = input_wanted_locked();
-        Float64 rate = gSampleRate;
+        Boolean was = input_wanted_locked(dev);
+        dev->inputMode = mode;
+        Boolean now = input_wanted_locked(dev);
+        Float64 rate = dev->sampleRate;
         pthread_mutex_unlock(&gStateMutex);
 
         if (was != now) {
@@ -1670,7 +1758,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         if (us > OUTPUT_SAFETY_MAX_US) us = OUTPUT_SAFETY_MAX_US;
 
         pthread_mutex_lock(&gStateMutex);
-        gOutputSafetyUS = (UInt32)us;
+        dev->outputSafetyUS = (UInt32)us;
         pthread_mutex_unlock(&gStateMutex);
 
         /* The value Core Audio actually consumes changed with it. Note that
@@ -1697,8 +1785,8 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         if (dataSize != sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
 
         pthread_mutex_lock(&gStateMutex);
-        gMuted = *(const UInt32*)data != 0;
-        push_gain_to_engine();
+        dev->muted = *(const UInt32*)data != 0;
+        push_gain_to_engine(dev);
         pthread_mutex_unlock(&gStateMutex);
 
         if (gHost) {
@@ -1718,14 +1806,16 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
 
 static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
     (void)d; (void)client;
     if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
 
-    atomic_fetch_add_explicit(&gStartIOCount, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dev->startIOCount, 1, memory_order_relaxed);
 
     bool revived = false;
     pthread_mutex_lock(&gStateMutex);
-    if (gIOClients == 0) {
+    if (dev->iOClients == 0) {
         /* Blocks -- tens of milliseconds -- until the streams are scheduled on
          * the bus and the engine has published the timeline anchor for sample
          * 0. StartIO is off the IO path, so a slow start here is the sanctioned
@@ -1735,8 +1825,8 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
          * thread for the length of the discrepancy (FINDINGS). */
         /* gStateMutex is held here, so the effective answer is read against
          * the same rate the engine is about to be started at. */
-        if (!emu_engine_start(gEngine, (uint32_t)gSampleRate, gOutputSafetyUS,
-                              input_wanted_locked())) {
+        if (!emu_engine_start(dev->engine, (uint32_t)dev->sampleRate, dev->outputSafetyUS,
+                              input_wanted_locked(dev))) {
             pthread_mutex_unlock(&gStateMutex);
             EMU_LOG("IO start failed: USB engine did not come up");
             return kAudioHardwareNotRunningError;
@@ -1746,38 +1836,40 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
          * diagnostic "host" clock source starts on the device's timeline
          * rather than at whatever mach_absolute_time StartIO ran at. */
         uint64_t frames = 0, host = 0;
-        gAnchorHostTime = emu_engine_timeline(gEngine, &frames, &host) ? host : mach_absolute_time();
-        gPeriodCount = 0;
+        dev->anchorHostTime = emu_engine_timeline(dev->engine, &frames, &host) ? host : mach_absolute_time();
+        dev->periodCount = 0;
         /* The one legitimate new timeline: a new session. Mid-stream the
          * engine keeps its line continuous through anything the bus does,
          * so nothing else ever changes the seed. */
-        gTimelineSeed++;
-        push_gain_to_engine();
-        EMU_LOG("IO started at %{public}.0f Hz", gSampleRate);
+        dev->timelineSeed++;
+        push_gain_to_engine(dev);
+        EMU_LOG("IO started at %{public}.0f Hz", dev->sampleRate);
         revived = true;
     }
-    gIOClients++;
+    dev->iOClients++;
     pthread_mutex_unlock(&gStateMutex);
 
     /* Outside the lock: PropertiesChanged re-enters the plug-in. A device the
      * engine gave up on is alive again the moment a fresh engine is on the
      * bus, which is what makes a client re-open the way back. */
-    if (revived) device_set_alive(true);
+    if (revived) device_set_alive(dev, true);
     return kAudioHardwareNoError;
 }
 
 static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
     (void)d; (void)client;
     if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
 
     pthread_mutex_lock(&gStateMutex);
-    bool last = (gIOClients > 0 && --gIOClients == 0);
+    bool last = (dev->iOClients > 0 && --dev->iOClients == 0);
     if (last) {
         /* Keep the client-count transition and the join indivisible from a
          * new StartIO. The engine does not acquire plug-in state, and StopIO
          * is already the control-thread operation that joins it. */
-        emu_engine_stop(gEngine);
+        emu_engine_stop(dev->engine);
     }
     pthread_mutex_unlock(&gStateMutex);
     if (last) EMU_LOG("IO stopped");
@@ -1815,19 +1907,21 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
                                  UInt32 client, Float64* sampleTime, UInt64* hostTime,
                                  UInt64* seed)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
     (void)d; (void)client;
     if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
     if (!sampleTime || !hostTime || !seed) return kAudioHardwareIllegalOperationError;
 
     pthread_mutex_lock(&gStateMutex);
-    bool followDevice = (gClockSource == kClockSource_Device);
+    bool followDevice = (dev->clockSource == kClockSource_Device);
     pthread_mutex_unlock(&gStateMutex);
 
     uint64_t deviceFrames = 0, deviceHost = 0;
-    if (followDevice && emu_engine_timeline(gEngine, &deviceFrames, &deviceHost)) {
+    if (followDevice && emu_engine_timeline(dev->engine, &deviceFrames, &deviceHost)) {
         pthread_mutex_lock(&gStateMutex);
 
-        Float64 ticksPerFrame = host_ticks_per_second() / gSampleRate;
+        Float64 ticksPerFrame = host_ticks_per_second() / dev->sampleRate;
 
         UInt64 period = deviceFrames / RING_FRAMES;
         UInt64 boundaryFrames = period * RING_FRAMES;
@@ -1849,35 +1943,35 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
          * occasional glitch every few minutes, when a wobble grew large enough
          * to survive Core Audio's own smoothing.
          */
-        if (period > gPeriodCount) {
+        if (period > dev->periodCount) {
             /* How far the new anchor sits from where the previous one predicted
              * it would. This is the anchor jitter, and it is the thing that
              * shows up as a glitch, so it is worth being able to see. */
-            if (gAnchorHostTime != 0) {
+            if (dev->anchorHostTime != 0) {
                 UInt64 ticksPerPeriod = (UInt64)(ticksPerFrame * (Float64)RING_FRAMES);
-                UInt64 predicted = gAnchorHostTime
-                                 + ticksPerPeriod * (period - gPeriodCount);
+                UInt64 predicted = dev->anchorHostTime
+                                 + ticksPerPeriod * (period - dev->periodCount);
                 UInt64 delta = boundaryHost > predicted
                              ? boundaryHost - predicted : predicted - boundaryHost;
                 Float64 ns = (Float64)delta * 1.0e9 / host_ticks_per_second();
-                gAnchorJitterNs = (UInt64)ns;
-                if (gAnchorJitterNs > gAnchorJitterMaxNs) {
-                    gAnchorJitterMaxNs = gAnchorJitterNs;
+                dev->anchorJitterNs = (UInt64)ns;
+                if (dev->anchorJitterNs > dev->anchorJitterMaxNs) {
+                    dev->anchorJitterMaxNs = dev->anchorJitterNs;
                 }
-                gAnchorUpdates++;
+                dev->anchorUpdates++;
             }
 
             /* Host time only ever ratchets forward: sample time has just
              * advanced, so an anchor that moved backwards would report a
              * negative rate, which Core Audio treats as a fault. Nothing
              * legitimate produces one, so anything earlier is noise. */
-            gPeriodCount = period;
-            if (boundaryHost > gAnchorHostTime) gAnchorHostTime = boundaryHost;
+            dev->periodCount = period;
+            if (boundaryHost > dev->anchorHostTime) dev->anchorHostTime = boundaryHost;
         }
 
-        *sampleTime = (Float64)(gPeriodCount * RING_FRAMES);
-        *hostTime   = gAnchorHostTime;
-        *seed       = gTimelineSeed;
+        *sampleTime = (Float64)(dev->periodCount * RING_FRAMES);
+        *hostTime   = dev->anchorHostTime;
+        *seed       = dev->timelineSeed;
         pthread_mutex_unlock(&gStateMutex);
         return kAudioHardwareNoError;
     }
@@ -1888,22 +1982,22 @@ static OSStatus GetZeroTimeStamp(AudioServerPlugInDriverRef d, AudioObjectID id,
      * moment it takes over; from there it drifts at the crystals' difference,
      * which is the documented cost of choosing it. */
     pthread_mutex_lock(&gStateMutex);
-    Float64 ticksPerFrame = host_ticks_per_second() / gSampleRate;
+    Float64 ticksPerFrame = host_ticks_per_second() / dev->sampleRate;
     UInt64  ticksPerPeriod = (UInt64)(ticksPerFrame * (Float64)RING_FRAMES);
     UInt64  now = mach_absolute_time();
 
-    if (gAnchorHostTime == 0) {
-        gAnchorHostTime = now;   /* first call, or just switched source */
+    if (dev->anchorHostTime == 0) {
+        dev->anchorHostTime = now;   /* first call, or just switched source */
     } else if (ticksPerPeriod > 0) {
-        while (now >= gAnchorHostTime + ticksPerPeriod) {
-            gAnchorHostTime += ticksPerPeriod;
-            gPeriodCount++;
+        while (now >= dev->anchorHostTime + ticksPerPeriod) {
+            dev->anchorHostTime += ticksPerPeriod;
+            dev->periodCount++;
         }
     }
 
-    *sampleTime = (Float64)(gPeriodCount * RING_FRAMES);
-    *hostTime   = gAnchorHostTime;
-    *seed       = gTimelineSeed;
+    *sampleTime = (Float64)(dev->periodCount * RING_FRAMES);
+    *hostTime   = dev->anchorHostTime;
+    *seed       = dev->timelineSeed;
     pthread_mutex_unlock(&gStateMutex);
     return kAudioHardwareNoError;
 }
@@ -1951,23 +2045,25 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID id,
                               UInt32 frameCount, const AudioServerPlugInIOCycleInfo* cycle,
                               void* mainBuffer, void* secondaryBuffer)
 {
+    DeviceRole role_ = kRole_Device;
+    Device* dev = device_for_object(id, &role_);
     (void)d; (void)stream; (void)client; (void)secondaryBuffer;
     if (id != kObjectID_Device) return kAudioHardwareBadObjectError;
 
-    atomic_fetch_add_explicit(&gIOCycles, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&dev->iOCycles, 1, memory_order_relaxed);
 
     if (operation == kAudioServerPlugInIOOperationReadInput && mainBuffer) {
         Float64 pos = cycle ? cycle->mInputTime.mSampleTime : -1.0;
         if (pos >= 0.0) {
-            emu_engine_read_input(gEngine, (float*)mainBuffer, frameCount, (uint64_t)(pos + 0.5));
+            emu_engine_read_input(dev->engine, (float*)mainBuffer, frameCount, (uint64_t)(pos + 0.5));
         } else {
             memset(mainBuffer, 0, (size_t)frameCount * CHANNELS * sizeof(float));
         }
     } else if (operation == kAudioServerPlugInIOOperationWriteMix && mainBuffer) {
         Float64 pos = cycle ? cycle->mOutputTime.mSampleTime : -1.0;
         if (pos >= 0.0) {
-            atomic_fetch_add_explicit(&gFramesOut, frameCount, memory_order_relaxed);
-            emu_engine_write_output(gEngine, (const float*)mainBuffer, frameCount,
+            atomic_fetch_add_explicit(&dev->framesOut, frameCount, memory_order_relaxed);
+            emu_engine_write_output(dev->engine, (const float*)mainBuffer, frameCount,
                                     (uint64_t)(pos + 0.5));
         }
     }
