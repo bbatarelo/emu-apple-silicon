@@ -625,6 +625,8 @@ right bytes in the right place.
 | One stall, three brief glitches spread over ~50 ms; `anchorJitterMaxNs` in the tens of ms, ring underruns with no HAL overload | The schedule rebuild paused the sample clock instead of skipping the dead bus time; the seed change made the HAL resynchronise, and the anchor jump landed inside the new seed |
 | 176.4/192 kHz only: right byte counts, the other channel's tone stronger than this one's, peak pinned at 1.0000 | Frames taken from the packet's first byte, 4 bytes before they start |
 | One rate broken and the same rate clean a moment later, no code or setting changed in between | The previous stream ran at `bInterval 3`; look at what came *before* the broken stream, not at the broken stream |
+| Measured rate +1000 ppm or more, identical on the first run of every batch | Frames counted after the stream was told to stop: entries drained by `AbortPipe` add to the numerator and not the denominator |
+| Capture rate reads high; playback against capture reads hundreds of ppm | Empty intervals dropped from the denominator: frames per *delivered packet* reported as frames per interval |
 
 Two general lessons:
 

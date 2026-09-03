@@ -92,6 +92,11 @@ struct DuplexCtx {
     /* Steady-state statistics, gathered after settling. */
     uint64_t in_packets,  out_packets;
     uint64_t in_frames,   out_frames;
+    /* Intervals capture was asked about, and those that answered with nothing.
+     * Without these, in_frames / in_packets is frames per *delivered packet*
+     * and an interval the device skipped leaves both terms, so the rate it
+     * implies reads high by exactly the amount that went missing. */
+    uint64_t in_intervals, in_empty;
     uint32_t in_errors,   out_errors;
     uint32_t out_short;         /* device accepted fewer bytes than offered */
     uint32_t max_queue_depth;
@@ -237,12 +242,18 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
     for (uint32_t i = 0; i < ctx->entries_per_request; i++) {
         const IOUSBLowLatencyIsocFrame* f = &req->frames[i];
         ctx->intervals_elapsed++;
+        if (settled && !ctx->stopping) ctx->in_intervals++;
 
         if (!emu_frame_ok(f->frStatus)) {
             if (settled && !ctx->stopping) ctx->in_errors++;
             continue;
         }
-        if (f->frActCount == 0) continue;
+        if (f->frActCount == 0) {
+            /* An interval that answered with nothing still passed on the
+             * device's clock. Counted, not skipped. */
+            if (settled && !ctx->stopping) ctx->in_empty++;
+            continue;
+        }
 
         uint32_t frames = emu_frames_in_packet(f->frActCount, ctx->bytes_per_frame);
 
@@ -250,7 +261,14 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
          * first interval, and only the statistics wait. */
         emu_feedback_push(ctx->feedback, frames);
 
-        if (settled) {
+        /* `!stopping` as well, and not only `settled`: the interval, empty and
+         * error counters beside this one already carry it, so without it the
+         * requests still in flight when AbortPipe drains them contribute their
+         * frames to the numerator and nothing to the denominator. That reads
+         * as the device running fast -- +1337 ppm on a 48 kHz run whose every
+         * packet was exactly 48 frames, which is the same size of error a rate
+         * measurement here exists to resolve. */
+        if (settled && !ctx->stopping) {
             ctx->in_packets++;
             ctx->in_frames += frames;
         }
@@ -308,7 +326,7 @@ static void playback_complete(void* refcon, IOReturn result, void* arg0)
             if (settled && !ctx->stopping) ctx->out_errors++;
             continue;
         }
-        if (!settled) continue;
+        if (!settled || ctx->stopping) continue;
 
         ctx->out_packets++;
         ctx->out_frames += emu_frames_in_packet(f->frActCount, ctx->bytes_per_frame);
@@ -391,17 +409,26 @@ static void report(const DuplexCtx* ctx, const DuplexConfig* cfg)
     }
 
     /* With the low-latency API an entry is one service interval on both sides,
-     * so the same conversion applies to each. */
-    double in_per_interval  = (double)ctx->in_frames  / (double)ctx->in_packets;
+     * so the same conversion applies to each. Per elapsed interval, not per
+     * delivered packet: an interval that brought nothing is still an interval
+     * of the device's clock, and dividing it out is how a slow stream reads as
+     * a fast one. */
+    double in_per_packet    = (double)ctx->in_frames  / (double)ctx->in_packets;
+    double in_per_interval  = ctx->in_intervals
+        ? (double)ctx->in_frames / (double)ctx->in_intervals : 0.0;
     double out_per_entry    = (double)ctx->out_frames / (double)ctx->out_packets;
     double out_entry_ms     = ctx->interval_ms;
 
     double in_hz  = in_per_interval / ctx->interval_ms * 1000.0;
     double out_hz = out_per_entry   / out_entry_ms     * 1000.0;
 
-    printf("  capture   %llu packets, %llu frames, %.4f frames/interval\n",
+    printf("  capture   %llu packets over %llu intervals, %llu frames\n",
            (unsigned long long)ctx->in_packets,
-           (unsigned long long)ctx->in_frames, in_per_interval);
+           (unsigned long long)ctx->in_intervals,
+           (unsigned long long)ctx->in_frames);
+    printf("            %.4f frames/interval, %.4f per delivered packet, "
+           "%llu empty\n", in_per_interval, in_per_packet,
+           (unsigned long long)ctx->in_empty);
     printf("  playback  %llu packets, %llu frames, %.4f frames/entry (%.2f ms)\n",
            (unsigned long long)ctx->out_packets,
            (unsigned long long)ctx->out_frames, out_per_entry, out_entry_ms);
@@ -517,7 +544,6 @@ int emu_duplex_run(IOUSBDeviceInterface500** dev,
      * and only the rate calculation uses that. Dividing the settle window by
      * interval_ms here asked for 4000 entries at bInterval 3, which a 3-second
      * run never reaches, so no statistics were ever gathered. */
-    ctx->settle_intervals = (uint64_t)(SETTLE_MS * ctx->entries_per_ms);
     ctx->amplitude = cfg->amplitude;
 
     /* Measured with `emu-probe lltest`: the low-latency API delivers one entry
@@ -528,6 +554,13 @@ int emu_duplex_run(IOUSBDeviceInterface500** dev,
     ctx->entries_per_ms = period_microframes >= 8 ? 1 : (8 / period_microframes);
     ctx->entries_per_request = REQUEST_MS * ctx->entries_per_ms;
     if (ctx->entries_per_request > MAX_ENTRIES) ctx->entries_per_request = MAX_ENTRIES;
+
+    /* After entries_per_ms, not before: computed above it this multiplied by a
+     * still-zeroed field, so the settle window was zero intervals and every
+     * run reported the device's startup phase-alignment ramp as steady state.
+     * That ramp reads hundreds of ppm fast (FINDINGS), which is exactly the
+     * size of error a rate measurement here is meant to resolve. */
+    ctx->settle_intervals = (uint64_t)(SETTLE_MS * ctx->entries_per_ms);
 
     ctx->phase_increment = 2.0 * M_PI * (double)cfg->tone_hz / (double)cfg->sample_rate;
 
