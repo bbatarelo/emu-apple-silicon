@@ -761,6 +761,36 @@ Two general lessons:
    noise — "it changes with sample rate", "each rate differently", "like the
    192k problem" — while every counter read clean.
 
+### Measuring these rates: one run is not evidence
+
+A `bInterval 3` stream corrupts exactly one following stream, so the results of
+consecutive runs alternate. Two consequences, both of which produced confident
+wrong conclusions before they were understood:
+
+- **A single warm-up run makes it worse.** It creates the corruption it was
+  meant to absorb. Two throwaway runs land the measurement on the clean side;
+  `hal-loopback` now does this itself at these rates, and `-P` disables it.
+- **The first run after a rate or mode change is unreliable regardless.**
+  Priming twice reduces this but does not remove it: measured across five
+  repeats at 192 kHz, run 1 failed and runs 2 to 5 were clean, repeatedly.
+
+So compare *proportions of clean runs*, never single runs. `hal-loopback -N`
+repeats and reports the count. An A/B of the two input modes done as one run
+each showed a large apparent difference that vanished under repetition.
+
+### Self-loopback cannot judge 176.4/192 kHz
+
+The device's own ADC is inside the fault at these rates: capture traffic is
+what provokes the playback dropouts, and with the input stream disabled there
+is no capture at all. Both make self-loopback either compromised or impossible.
+
+`hal-loopback -i <name|uid>` listens on a second interface instead. Its clock is
+its own, so phase and drift become measurements rather than faults; splices and
+level still decide the result, and the analyser already separates a slow walk
+from a sudden step. Measured against an external interface the noise floor is
+also better -- mean THD+N about -70 dB at 48 kHz, against -54 dB through the
+device's own converters -- so a dropped packet stands out further.
+
 ---
 
 ## Open questions

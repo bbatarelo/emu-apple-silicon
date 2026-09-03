@@ -295,6 +295,59 @@ static int input_mode(AudioObjectID device, const char* wanted)
     return 0;
 }
 
+/*
+ * Injects a transport fault, so the recovery path can be exercised on working
+ * hardware.
+ *
+ * "transient" fails the next few submissions: the engine should log a rebuild
+ * and carry on, recoveries up by one and audio never stopping for more than a
+ * moment. "persistent" fails every submission until cleared: the engine should
+ * exhaust its retry budget, engineAlive should go to 0, and the device should
+ * leave the output menu. "none" clears it and revives a device given up on.
+ */
+static int fault_inject(AudioObjectID device, const char* mode)
+{
+    AudioObjectPropertyAddress address = {
+        'emuX', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+
+    if (!mode) {
+        CFStringRef current = NULL;
+        UInt32 size = sizeof current;
+        OSStatus s = AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &current);
+        if (s != noErr || !current) {
+            fprintf(stderr, "error: could not read the fault state (0x%x)\n", s);
+            return 1;
+        }
+        char buffer[32] = {0};
+        CFStringGetCString(current, buffer, sizeof buffer, kCFStringEncodingUTF8);
+        CFRelease(current);
+        printf("fault injection: %s\n", buffer);
+        return 0;
+    }
+
+    if (strcmp(mode, "transient") != 0 && strcmp(mode, "persistent") != 0 &&
+        strcmp(mode, "none") != 0) {
+        fprintf(stderr, "error: fault must be transient, persistent or none\n");
+        return 2;
+    }
+
+    CFStringRef value = CFStringCreateWithCString(NULL, mode, kCFStringEncodingUTF8);
+    if (!value) return 1;
+    OSStatus s = AudioObjectSetPropertyData(device, &address, 0, NULL, sizeof value, &value);
+    CFRelease(value);
+    if (s != noErr) {
+        fprintf(stderr, "error: could not inject the fault (0x%x)\n", s);
+        return 1;
+    }
+    printf("fault injection: %s\n", mode);
+    if (strcmp(mode, "none") != 0) {
+        printf("  watch:  hal-check | grep -E 'engineStreaming|engineAlive|recover'\n"
+               "  and:    log stream --predicate 'subsystem == \"net.quantum-bit.EMUTrackerPre\"'\n");
+    }
+    return 0;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -305,7 +358,11 @@ static void usage(void)
         "       hal-check safety                show the output safety offset (us)\n"
         "       hal-check safety <us>           set it; effective at the next stream start\n"
         "       hal-check input                 show whether capture is opened\n"
-        "       hal-check input auto|on|off     switch it; a running stream restarts\n");
+        "       hal-check input auto|on|off     switch it; a running stream restarts\n"
+        "       hal-check fault                 show the injected fault, if any\n"
+        "       hal-check fault transient       fail a few submissions; expect a rebuild\n"
+        "       hal-check fault persistent      fail everything; expect the device to die\n"
+        "       hal-check fault none            clear it, and revive the device\n");
 }
 
 int main(int argc, char** argv)
@@ -326,6 +383,9 @@ int main(int argc, char** argv)
         }
         if (strcmp(argv[1], "safety") == 0) {
             return safety_offset(device, argc > 2 ? argv[2] : NULL);
+        }
+        if (strcmp(argv[1], "fault") == 0) {
+            return fault_inject(device, argc > 2 ? argv[2] : NULL);
         }
         if (strcmp(argv[1], "input") == 0) {
             return input_mode(device, argc > 2 ? argv[2] : NULL);

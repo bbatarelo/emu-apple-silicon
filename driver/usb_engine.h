@@ -12,6 +12,11 @@
 
 #pragma once
 
+/* Both halves log under one subsystem so a single predicate catches the lot;
+ * the category separates them ("plugin" for the Core Audio surface, "engine"
+ * for the USB transport). */
+#define EMU_LOG_SUBSYSTEM "net.quantum-bit.EMUTrackerPre"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -92,6 +97,15 @@ typedef struct {
     uint32_t input_depth;
     uint32_t input_underruns;
     uint32_t input_overruns;
+
+    /* Health. The first is the counter whose absence cost a day and a half:
+     * with the engine dead, Core Audio keeps calling DoIOOperation and every
+     * other figure here keeps advancing, so nothing else distinguishes
+     * "playing" from "playing into a void". */
+    uint32_t engine_streaming;   /* 1 while transfers are on the bus */
+    uint64_t recoveries;         /* stream rebuilds after a transport fault */
+    uint64_t recovery_failures;  /* rebuilds that themselves failed */
+    uint32_t fault_mode;         /* injected fault, 0 when none (testing) */
     uint64_t empty_capture;      /* capture intervals with nothing usable, written as silence;
                                     a couple at every start is the ADC spinning up */
 } EmuEngineStats;
@@ -108,6 +122,11 @@ bool emu_engine_device_attached(void);
  * answer with none is a placeholder, since the plug-in has nothing published
  * to name. */
 const char* emu_engine_device_name(void);
+
+/* The attached device's name, for log prefixes. Reads only what is already
+ * known -- it never goes looking, so logging cannot have side effects -- and
+ * answers "E-MU device" when nothing is attached. */
+const char* emu_engine_log_name(void);
 
 /* Registers a callback for the attached device changing -- arriving, leaving,
  * or being swapped for a sibling -- so the plug-in can tell Core Audio that
@@ -177,3 +196,35 @@ void     emu_engine_reset_counters(void);
 /* While the engine runs: live counters. After it stops: the final counters of
  * the last session, kept so a post-mortem `make check` still has evidence. */
 void     emu_engine_stats(EmuEngineStats* stats);
+
+/* True while transfers are actually on the bus. Distinct from
+ * emu_engine_running, which only says a start was requested and no stop has
+ * arrived: between a transport fault and a successful rebuild the engine is
+ * running but not streaming, and that is exactly the state that used to be
+ * invisible from outside. */
+bool     emu_engine_streaming(void);
+
+/*
+ * Called on the engine thread when the engine has exhausted its rebuild
+ * attempts. The plug-in answers by marking the device not alive, which is the
+ * only way to tell Core Audio to stop handing audio to a transport that is no
+ * longer there. Runs with no locks held and must not call emu_engine_stop,
+ * which would join the thread it is running on.
+ */
+void     emu_engine_set_failure_handler(void (*handler)(void));
+
+/*
+ * Fault injection, so the recovery path can be exercised without unplugging
+ * anything. TRANSIENT fails the next few submissions and the engine should
+ * rebuild through it; PERSISTENT fails every submission until cleared and
+ * should drive it out to the failure handler. It lives in the engine because
+ * the fault it simulates is a submission the USB stack refuses, and that is
+ * the only place it can be observed.
+ */
+typedef enum {
+    EMU_FAULT_NONE       = 0,
+    EMU_FAULT_TRANSIENT  = 1,
+    EMU_FAULT_PERSISTENT = 2,
+} EmuFaultMode;
+
+void     emu_engine_inject_fault(EmuFaultMode mode);

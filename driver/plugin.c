@@ -40,7 +40,10 @@ static os_log_t emu_log(void)
     return log;
 }
 
-#define EMU_LOG(fmt, ...) os_log(emu_log(), "TrackerPre: " fmt, ##__VA_ARGS__)
+/* Named for whatever is actually attached, not for the model this driver was
+ * first written against. */
+#define EMU_LOG(fmt, ...) \
+    os_log(emu_log(), "%{public}s: " fmt, emu_engine_log_name(), ##__VA_ARGS__)
 
 /* --- object model --------------------------------------------------------
  *
@@ -190,6 +193,11 @@ enum {
      * Read once per StartIO; changing it under a running stream restarts the
      * stream. */
     kEMUProperty_InputMode = 'emuI',
+    /* Settable, testing only. Injects a transport fault so the recovery path
+     * can be exercised without unplugging anything: "transient" should be
+     * rebuilt through, "persistent" should exhaust the retry budget and take
+     * the device offline. */
+    kEMUProperty_FaultInject = 'emuX',
 };
 
 /*
@@ -223,6 +231,39 @@ static const Float64 kSupportedRates[] = {
 static pthread_mutex_t   gStateMutex     = PTHREAD_MUTEX_INITIALIZER;
 static UInt32            gRefCount       = 0;
 static AudioServerPlugInHostRef gHost    = NULL;
+
+/*
+ * Whether the transport is still there.
+ *
+ * This answered a hard-coded 1, which is true right up until it is
+ * catastrophically false: the engine can be gone while Core Audio goes on
+ * calling DoIOOperation and every byte the client writes lands in requests
+ * nobody is transmitting. Core Audio has no other way to be told, so this is
+ * the one signal that ends that state.
+ */
+static _Atomic bool gDeviceAlive = true;
+
+static void device_set_alive(bool alive)
+{
+    bool was = atomic_exchange(&gDeviceAlive, alive);
+    if (was == alive || !gHost) return;
+
+    EMU_LOG("device marked %{public}s", alive ? "alive" : "NOT alive");
+    AudioObjectPropertyAddress changed[] = {
+        { kAudioDevicePropertyDeviceIsAlive,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+        { kAudioDevicePropertyDeviceIsRunning,
+          kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
+    };
+    gHost->PropertiesChanged(gHost, kObjectID_Device, 2, changed);
+}
+
+/* Engine thread, once, when it has exhausted its rebuild attempts. */
+static void engine_failed(void)
+{
+    EMU_LOG("USB engine gave up; the device is unusable until it returns");
+    device_set_alive(false);
+}
 
 static Float64           gSampleRate     = 48000.0;
 static UInt32            gIOClients      = 0;
@@ -454,6 +495,7 @@ static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
         gHost = NULL;
         return kAudioHardwareUnspecifiedError;
     }
+    emu_engine_set_failure_handler(engine_failed);
     if (emu_engine_device_attached()) {
         EMU_LOG("initialized, publishing %{public}s at %{public}.0f Hz",
                 emu_engine_device_name(), gSampleRate);
@@ -696,6 +738,7 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 case kEMUProperty_ResetCounters:
                 case kEMUProperty_SafetyOffset:
                 case kEMUProperty_InputMode:
+                case kEMUProperty_FaultInject:
                     return true;
                 default: return false;
             }
@@ -779,7 +822,8 @@ static OSStatus IsPropertySettable(AudioServerPlugInDriverRef d, AudioObjectID o
     if (object == kObjectID_Device &&
         (address->mSelector == kEMUProperty_ClockSource ||
          address->mSelector == kEMUProperty_InputMode ||
-         address->mSelector == kEMUProperty_ResetCounters)) {
+         address->mSelector == kEMUProperty_ResetCounters ||
+         address->mSelector == kEMUProperty_FaultInject)) {
         *settable = true;
     }
     if (object == kObjectID_Device && address->mSelector == kEMUProperty_SafetyOffset) {
@@ -861,7 +905,7 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             *outSize = sizeof(Float64); return kAudioHardwareNoError;
 
         case kAudioObjectPropertyCustomPropertyInfoList:
-            *outSize = 5 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            *outSize = 6 * sizeof(AudioServerPlugInCustomPropertyInfo);
             return kAudioHardwareNoError;
 
         case kEMUProperty_Diagnostics:
@@ -869,6 +913,7 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             *outSize = sizeof(CFPropertyListRef); return kAudioHardwareNoError;
         case kEMUProperty_ClockSource:
         case kEMUProperty_InputMode:
+        case kEMUProperty_FaultInject:
         case kEMUProperty_ResetCounters:
             *outSize = sizeof(CFStringRef); return kAudioHardwareNoError;
 
@@ -952,7 +997,12 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
 
             case kAudioDevicePropertyTransportType: RETURN_U32(kAudioDeviceTransportTypeUSB);
             case kAudioDevicePropertyClockDomain:   RETURN_U32(0);
-            case kAudioDevicePropertyDeviceIsAlive: RETURN_U32(1);
+            /* Not a constant. When the engine exhausts its rebuild attempts
+             * it declares the device dead, which is the only way to make Core
+             * Audio stop handing audio to a transport that is gone: clients
+             * are forced to re-open, and a re-open starts a fresh engine. */
+            case kAudioDevicePropertyDeviceIsAlive:
+                RETURN_U32(atomic_load(&gDeviceAlive) ? 1 : 0);
             case kAudioDevicePropertyDeviceIsRunning: RETURN_U32(gIOClients > 0 ? 1 : 0);
             case kAudioDevicePropertyDeviceCanBeDefaultDevice: RETURN_U32(1);
             case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: RETURN_U32(1);
@@ -1013,6 +1063,12 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
                     n++;
                 }
+                if (n < capacity) {
+                    info[n].mSelector = kEMUProperty_FaultInject;
+                    info[n].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
+                    info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                    n++;
+                }
                 *outSize = n * sizeof(AudioServerPlugInCustomPropertyInfo);
                 return kAudioHardwareNoError;
             }
@@ -1063,6 +1119,17 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 *(CFStringRef*)outData = mode == kInputMode_On   ? CFSTR("on")
                                        : mode == kInputMode_Off  ? CFSTR("off")
                                                                  : CFSTR("auto");
+                *outSize = sizeof(CFStringRef);
+                return kAudioHardwareNoError;
+            }
+
+            case kEMUProperty_FaultInject: {
+                if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+                EmuEngineStats st;
+                emu_engine_stats(&st);
+                *(CFStringRef*)outData =
+                    st.fault_mode == EMU_FAULT_TRANSIENT  ? CFSTR("transient")  :
+                    st.fault_mode == EMU_FAULT_PERSISTENT ? CFSTR("persistent") : CFSTR("none");
                 *outSize = sizeof(CFStringRef);
                 return kAudioHardwareNoError;
             }
@@ -1155,6 +1222,13 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                                        ? engine.frames_played - out : 0;
                           raw > gDeficitBaseline ? raw - gDeficitBaseline : 0; }) },
                     { CFSTR("counterResets"), gResetCount },
+                    /* The counter whose absence cost a day and a half: with the
+                     * engine dead every other figure here keeps advancing. */
+                    { CFSTR("engineStreaming"), (uint64_t)engine.engine_streaming },
+                    { CFSTR("engineAlive"),     (uint64_t)(atomic_load(&gDeviceAlive) ? 1 : 0) },
+                    { CFSTR("recoveries"),        engine.recoveries        },
+                    { CFSTR("recoveryFailures"),  engine.recovery_failures },
+                    { CFSTR("faultInjected"),     (uint64_t)engine.fault_mode },
                 };
                 for (size_t i = 0; i < sizeof entries / sizeof entries[0]; i++) {
                     long long v = (long long)entries[i].value;
@@ -1497,6 +1571,37 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         return kAudioHardwareNoError;
     }
 
+    if (object == kObjectID_Device && address->mSelector == kEMUProperty_FaultInject) {
+        if (dataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+        CFStringRef requested = *(const CFStringRef*)data;
+        if (!requested) return kAudioHardwareIllegalOperationError;
+
+        EmuFaultMode mode;
+        if (CFStringCompare(requested, CFSTR("transient"), kCFCompareCaseInsensitive)
+            == kCFCompareEqualTo) {
+            mode = EMU_FAULT_TRANSIENT;
+        } else if (CFStringCompare(requested, CFSTR("persistent"), kCFCompareCaseInsensitive)
+                   == kCFCompareEqualTo) {
+            mode = EMU_FAULT_PERSISTENT;
+        } else if (CFStringCompare(requested, CFSTR("none"), kCFCompareCaseInsensitive)
+                   == kCFCompareEqualTo) {
+            mode = EMU_FAULT_NONE;
+        } else {
+            return kAudioHardwareIllegalOperationError;
+        }
+
+        /* Clearing a fault also revives a device the engine gave up on, so a
+         * test can put the driver back without restarting coreaudiod. */
+        if (mode == EMU_FAULT_NONE && !atomic_load(&gDeviceAlive)) {
+            device_set_alive(true);
+        }
+        emu_engine_inject_fault(mode);
+        EMU_LOG("fault injection set to %{public}s",
+                mode == EMU_FAULT_TRANSIENT  ? "transient" :
+                mode == EMU_FAULT_PERSISTENT ? "persistent" : "none");
+        return kAudioHardwareNoError;
+    }
+
     if (object == kObjectID_Device && address->mSelector == kEMUProperty_InputMode) {
         if (dataSize != sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
         CFStringRef requested = *(const CFStringRef*)data;
@@ -1607,6 +1712,7 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
 
     atomic_fetch_add_explicit(&gStartIOCount, 1, memory_order_relaxed);
 
+    bool revived = false;
     pthread_mutex_lock(&gStateMutex);
     if (gIOClients == 0) {
         /* Blocks -- tens of milliseconds -- until the streams are scheduled on
@@ -1637,9 +1743,15 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
         gTimelineSeed++;
         push_gain_to_engine();
         EMU_LOG("IO started at %{public}.0f Hz", gSampleRate);
+        revived = true;
     }
     gIOClients++;
     pthread_mutex_unlock(&gStateMutex);
+
+    /* Outside the lock: PropertiesChanged re-enters the plug-in. A device the
+     * engine gave up on is alive again the moment a fresh engine is on the
+     * bus, which is what makes a client re-open the way back. */
+    if (revived) device_set_alive(true);
     return kAudioHardwareNoError;
 }
 

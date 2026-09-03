@@ -83,7 +83,26 @@ typedef struct {
     double      rate;        /* 0: leave the device where it is */
     unsigned    buffer;      /* 0: likewise */
     unsigned    reps;
+    unsigned    runs;        /* repetitions of the glitch test */
     const char* wav;
+
+    /*
+     * Where the returned audio is listened for. Defaults to the device under
+     * test -- the cable goes out of it and back into it -- but a second
+     * interface can take that job instead.
+     *
+     * It has to be able to, for two reasons. Self-loopback measures the
+     * device's output through its own ADC, and at 176.4/192 kHz that ADC is
+     * inside the fault being measured: the capture traffic is what provokes
+     * the playback dropouts, and a bInterval 3 stream corrupts the IN stream
+     * of whichever stream follows it. Worse, the driver can be asked to run
+     * those rates with the input stream disabled entirely, and then there is
+     * no ADC to measure through at all. A separate interface has its own
+     * clock, its own converters and its own bus traffic, so it can hold an
+     * opinion about this one.
+     */
+    AudioObjectID capture;   /* kAudioObjectUnknown: use the device itself */
+    bool          split;     /* capture is a different device                */
 } Options;
 
 /* --- reporting ------------------------------------------------------------ */
@@ -169,6 +188,78 @@ static double get_rate(AudioObjectID device)
 
 /* The device may be shared, and a rate change is asynchronous: set it, then
  * wait for the read-back, the same discipline the driver uses on the wire. */
+/*
+ * Resolve a capture device by UID or by a substring of its name, listing what
+ * is available either way -- nobody knows a third-party interface's UID, and
+ * the listing is what makes the name form usable.
+ *
+ * Only input-capable devices are offered: a device with no input streams
+ * cannot do this job, and silently matching one would fail much later with a
+ * far less obvious message.
+ */
+static AudioObjectID find_capture_device(const char* needle)
+{
+    AudioObjectPropertyAddress address = {
+        kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address,
+                                       0, NULL, &size) != noErr || size == 0) {
+        return kAudioObjectUnknown;
+    }
+    unsigned count = size / sizeof(AudioObjectID);
+    AudioObjectID* ids = calloc(count, sizeof *ids);
+    if (!ids) return kAudioObjectUnknown;
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address,
+                                   0, NULL, &size, ids) != noErr) {
+        free(ids);
+        return kAudioObjectUnknown;
+    }
+
+    AudioObjectID found = kAudioObjectUnknown;
+    printf("input devices\n");
+    for (unsigned i = 0; i < count; i++) {
+        AudioObjectPropertyAddress streams = {
+            kAudioDevicePropertyStreams, kAudioObjectPropertyScopeInput,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 bytes = 0;
+        if (AudioObjectGetPropertyDataSize(ids[i], &streams, 0, NULL, &bytes) != noErr
+            || bytes == 0) {
+            continue;
+        }
+
+        char name[256] = {0}, uid[256] = {0};
+        CFStringRef cf = NULL;
+        UInt32 n = sizeof cf;
+        AudioObjectPropertyAddress na = {
+            kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        if (AudioObjectGetPropertyData(ids[i], &na, 0, NULL, &n, &cf) == noErr && cf) {
+            CFStringGetCString(cf, name, sizeof name, kCFStringEncodingUTF8);
+            CFRelease(cf);
+        }
+        cf = NULL; n = sizeof cf;
+        AudioObjectPropertyAddress ua = {
+            kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        if (AudioObjectGetPropertyData(ids[i], &ua, 0, NULL, &n, &cf) == noErr && cf) {
+            CFStringGetCString(cf, uid, sizeof uid, kCFStringEncodingUTF8);
+            CFRelease(cf);
+        }
+
+        bool match = needle && (strcmp(uid, needle) == 0 || strstr(name, needle) != NULL);
+        printf("  %s %-34s  %s\n", match ? "->" : "  ", name, uid);
+        if (match && found == kAudioObjectUnknown) found = ids[i];
+    }
+    printf("\n");
+    free(ids);
+    return found;
+}
+
 static bool set_rate(AudioObjectID device, double rate)
 {
     if (fabs(get_rate(device) - rate) < 1.0) return true;
@@ -336,8 +427,19 @@ typedef struct {
     _Atomic unsigned cycles;
     _Atomic bool     running;
 
-    /* First cycle's sample times: the origin of both index spaces. */
+    /* Which device does which job. One device may do both; when two are in
+     * play each callback is told apart by the device it arrived for, because
+     * the device under test is duplex and will otherwise offer its own input
+     * here -- taking that would interleave two unrelated sample-time bases
+     * into one capture buffer. */
+    AudioObjectID play_device, capture_device;
+    bool          split;
+
+    /* First cycle's sample times: the origin of each index space. With one
+     * device both are taken on the same callback; with two, each is taken on
+     * its own device's first callback, and the two bases are unrelated. */
     double in_origin, out_origin;
+    bool   in_started, out_started;
 
     /* Continuity of the HAL's own sample times. A gap here is Core Audio
      * skipping a cycle, which is a different fault from a ring glitch and is
@@ -372,7 +474,31 @@ static OSStatus loop_proc(AudioObjectID device, const AudioTimeStamp* now,
     bool have_out = output && output->mNumberBuffers > 0 && output->mBuffers[0].mData
                  && outputTime && (outputTime->mFlags & kAudioTimeStampSampleTimeValid);
 
-    if (atomic_load_explicit(&loop->cycles, memory_order_relaxed) == 0) {
+    /* Each device does exactly one job. Without this the duplex device under
+     * test contributes its own input alongside the capture device's, and the
+     * two sample-time bases land in the same buffer -- which reads as the
+     * capture stream skipping on almost every cycle. */
+    if (loop->split) {
+        bool is_capture = (device == loop->capture_device);
+        have_in  = have_in  && is_capture;
+        have_out = have_out && !is_capture;
+    }
+
+    if (loop->split) {
+        if (have_out && !loop->out_started) {
+            loop->out_origin = outputTime->mSampleTime;
+            loop->next_out   = loop->out_origin;
+            loop->lead_min   = 1e18;
+            loop->lead_max   = -1e18;
+            loop->frames_min = 0xffffffffu;
+            loop->out_started = true;
+        }
+        if (have_in && !loop->in_started) {
+            loop->in_origin = inputTime->mSampleTime;
+            loop->next_in   = loop->in_origin;
+            loop->in_started = true;
+        }
+    } else if (atomic_load_explicit(&loop->cycles, memory_order_relaxed) == 0) {
         if (!have_in || !have_out) return noErr;      /* wait for a full cycle */
         loop->in_origin = inputTime->mSampleTime;
         loop->out_origin = outputTime->mSampleTime;
@@ -381,6 +507,7 @@ static OSStatus loop_proc(AudioObjectID device, const AudioTimeStamp* now,
         loop->lead_min = 1e18;
         loop->lead_max = -1e18;
         loop->frames_min = 0xffffffffu;
+        loop->in_started = loop->out_started = true;
     }
 
     if (have_in && have_out) {
@@ -428,7 +555,12 @@ static OSStatus loop_proc(AudioObjectID device, const AudioTimeStamp* now,
     }
 
     if (have_in) {
-        unsigned frames = input->mBuffers[0].mDataByteSize / (CHANNELS * sizeof(float));
+        /* The listening device need not be stereo: a four-input interface
+         * presents all four in one buffer, so the frame count comes from its
+         * own channel count and only the first pair is taken. */
+        unsigned in_ch = input->mBuffers[0].mNumberChannels;
+        if (in_ch == 0) in_ch = CHANNELS;
+        unsigned frames = input->mBuffers[0].mDataByteSize / (in_ch * sizeof(float));
         const float* src = (const float*)input->mBuffers[0].mData;
 
         double delta = inputTime->mSampleTime - loop->next_in;
@@ -442,8 +574,17 @@ static OSStatus loop_proc(AudioObjectID device, const AudioTimeStamp* now,
         if (position >= 0.0) {
             uint64_t at = (uint64_t)(position + 0.5);
             if (at + frames <= loop->capture_capacity) {
-                memcpy(loop->capture + at * CHANNELS, src,
-                       (size_t)frames * CHANNELS * sizeof(float));
+                if (in_ch == CHANNELS) {
+                    memcpy(loop->capture + at * CHANNELS, src,
+                           (size_t)frames * CHANNELS * sizeof(float));
+                } else {
+                    float* into = loop->capture + at * CHANNELS;
+                    for (unsigned i = 0; i < frames; i++) {
+                        into[i * CHANNELS + 0] = src[(size_t)i * in_ch + 0];
+                        into[i * CHANNELS + 1] = in_ch > 1 ? src[(size_t)i * in_ch + 1]
+                                                           : src[(size_t)i * in_ch + 0];
+                    }
+                }
                 uint64_t reached = at + frames;
                 if (reached > atomic_load_explicit(&loop->captured, memory_order_relaxed)) {
                     atomic_store_explicit(&loop->captured, reached, memory_order_relaxed);
@@ -476,13 +617,45 @@ static bool run_stream(AudioObjectID device, Loop* loop, double rate,
         return false;
     }
 
+    /* One callback serves both devices: it already keys off which buffer list
+     * it was given, and a capture-only device never offers an output one. */
+    AudioDeviceIOProcID listen = NULL;
+    if (loop->split &&
+        (AudioDeviceCreateIOProcID(loop->capture_device, loop_proc, loop, &listen) != noErr
+         || !listen)) {
+        fprintf(stderr, "error: AudioDeviceCreateIOProcID failed on the capture device\n");
+        AudioDeviceDestroyIOProcID(device, proc);
+        return false;
+    }
+
     atomic_store(&loop->running, true);
+
+    /* Listening starts first, so no part of the tone can go out before there
+     * is something to hear it. */
+    if (listen) {
+        OSStatus ls = AudioDeviceStart(loop->capture_device, listen);
+        if (ls != noErr) {
+            fprintf(stderr, "error: AudioDeviceStart on the capture device: %d\n", (int)ls);
+            if (ls == -2004 || ls == 560557673) {
+                fprintf(stderr, "       microphone permission for this terminal is denied;\n"
+                                "       System Settings > Privacy & Security > Microphone.\n");
+            }
+            AudioDeviceDestroyIOProcID(loop->capture_device, listen);
+            AudioDeviceDestroyIOProcID(device, proc);
+            return false;
+        }
+    }
+
     OSStatus status = AudioDeviceStart(device, proc);
     if (status != noErr) {
         fprintf(stderr, "error: AudioDeviceStart: %d\n", (int)status);
         if (status == -2004 || status == 560557673) {
             fprintf(stderr, "       microphone permission for this terminal is denied;\n"
                             "       System Settings > Privacy & Security > Microphone.\n");
+        }
+        if (listen) {
+            AudioDeviceStop(loop->capture_device, listen);
+            AudioDeviceDestroyIOProcID(loop->capture_device, listen);
         }
         AudioDeviceDestroyIOProcID(device, proc);
         return false;
@@ -511,8 +684,10 @@ static bool run_stream(AudioObjectID device, Loop* loop, double rate,
 
     atomic_store(&loop->running, false);
     AudioDeviceStop(device, proc);
+    if (listen) AudioDeviceStop(loop->capture_device, listen);
     read_diag(device, final);
     AudioDeviceDestroyIOProcID(device, proc);
+    if (listen) AudioDeviceDestroyIOProcID(loop->capture_device, listen);
     return atomic_load(&loop->cycles) > 0;
 }
 
@@ -593,6 +768,9 @@ static void report_cycles(const Loop* loop, double rate)
     note("%u IO cycles, %u..%u frames each, longest gap %.2f ms",
          atomic_load((_Atomic unsigned*)&loop->cycles), loop->frames_min,
          loop->frames_max, host_gap_ms);
+    /* One device driving both directions has a single cycle to compare; two
+     * devices do not. */
+    if (!loop->split)
     note("output cycle leads input by %.0f..%.0f frames (%.2f..%.2f ms)",
          loop->lead_min, loop->lead_max, loop->lead_min * 1000.0 / rate,
          loop->lead_max * 1000.0 / rate);
@@ -674,7 +852,22 @@ static void write_wav(const char* path, const float* interleaved, uint64_t frame
 
 /* --- the tone test -------------------------------------------------------- */
 
-typedef enum { kDepthSmoke, kDepthFull } Depth;
+/*
+ * kDepthPrime runs a stream and looks at nothing.
+ *
+ * A bInterval 3 stream leaves exactly one following stream corrupt, at any
+ * rate, and only running a stream clears it -- waiting does not. So a single
+ * throwaway run before a measurement *creates* the corruption it was meant to
+ * absorb, and the results alternate broken/clean in a way that looks like a
+ * real difference between whatever two things are being compared. Two
+ * throwaway runs land the measurement on the clean side of that alternation.
+ *
+ * This is left to the tool rather than the operator because it is not
+ * discoverable from the output: a poisoned run fails in ways that read as
+ * driver faults, and comparing single runs across it produces confident,
+ * wrong conclusions.
+ */
+typedef enum { kDepthPrime, kDepthSmoke, kDepthFull } Depth;
 
 static int tone_test(AudioObjectID device, const Options* options, double seconds,
                      Depth depth, const char* title)
@@ -699,10 +892,12 @@ static int tone_test(AudioObjectID device, const Options* options, double second
     }
     apply_fade(plan, plan_frames, (uint64_t)(rate * 0.02));
 
+    if (depth != kDepthPrime) {
     printf("\n-- %s at %.0f Hz\n", title, rate);
     printf("   left %.1f Hz (bin %u), right %.1f Hz (bin %u), %.1f dBFS, %.1f s\n\n",
            bin[0] * rate / EMU_BLOCK, bin[0], bin[1] * rate / EMU_BLOCK, bin[1],
            20.0 * log10(options->amplitude), seconds);
+    }
 
     Loop loop;
     memset(&loop, 0, sizeof loop);
@@ -710,10 +905,18 @@ static int tone_test(AudioObjectID device, const Options* options, double second
     loop.plan_frames = plan_frames;
     loop.capture = capture;
     loop.capture_capacity = capacity;
+    loop.play_device = device;
+    loop.capture_device = options->split ? options->capture : device;
+    loop.split = options->split;
 
     Diag before, after, final;
     uint64_t analysis_start = 0;
     bool ran = run_stream(device, &loop, rate, &before, &after, &final, &analysis_start);
+
+    if (depth == kDepthPrime) {
+        free(plan); free(capture); free(mono);
+        return ran ? 0 : 1;
+    }
 
     uint64_t captured = atomic_load(&loop.captured);
     verdict(ran && captured > 0, "the stream ran and delivered audio",
@@ -757,11 +960,17 @@ static int tone_test(AudioObjectID device, const Options* options, double second
 
         if (depth == kDepthSmoke) continue;
 
+        /* Two crystals walk against each other by definition, so with a
+         * separate capture device phase and drift stop being faults and become
+         * measurements. What still has to hold is that the waveform does not
+         * jump: the analyser separates a slow walk from a sudden step, and
+         * selftest covers exactly that distinction. */
         snprintf(what, sizeof what, "%s: no frame moved", kName[c]);
-        verdict(fabs(s.frames_slipped) < MAX_SLIPPED_FRAMES, what,
-                "phase span %.3f deg = %.3f frames over %u blocks",
-                s.phase_span_deg, s.frames_slipped, s.blocks);
-        if (fabs(s.frames_slipped) >= MAX_SLIPPED_FRAMES) {
+        verdict(options->split || fabs(s.frames_slipped) < MAX_SLIPPED_FRAMES, what,
+                "phase span %.3f deg = %.3f frames over %u blocks%s",
+                s.phase_span_deg, s.frames_slipped, s.blocks,
+                options->split ? "   (two clocks; measured, not judged)" : "");
+        if (!options->split && fabs(s.frames_slipped) >= MAX_SLIPPED_FRAMES) {
             note("largest step %.2f deg in block %u, %.2f s in",
                  s.phase_step_max_deg, s.worst_phase_block,
                  s.worst_phase_block * (double)EMU_BLOCK / rate);
@@ -770,7 +979,9 @@ static int tone_test(AudioObjectID device, const Options* options, double second
         snprintf(what, sizeof what, "%s: the two clocks do not drift", kName[c]);
         double ppm = s.phase_slope_deg / (360.0 * bin[c] / EMU_BLOCK)   /* frames/block */
                    / (double)EMU_BLOCK * 1e6;
-        verdict(fabs(ppm) < 20.0, what, "%.3f deg/block = %.2f ppm", s.phase_slope_deg, ppm);
+        verdict(options->split || fabs(ppm) < 20.0, what,
+                "%.3f deg/block = %.2f ppm%s", s.phase_slope_deg, ppm,
+                options->split ? "   (device against capture clock)" : "");
 
         snprintf(what, sizeof what, "%s: the level holds", kName[c]);
         verdict(s.level_max_db - s.level_min_db < MAX_LEVEL_SPREAD_DB, what,
@@ -855,6 +1066,9 @@ static int latency_test(AudioObjectID device, const Options* options)
     loop.plan_frames = plan_frames;
     loop.capture = capture;
     loop.capture_capacity = capacity;
+    loop.play_device = device;
+    loop.capture_device = options->split ? options->capture : device;
+    loop.split = options->split;
 
     Diag before, after, final;
     uint64_t analysis_start = 0;
@@ -878,11 +1092,25 @@ static int latency_test(AudioObjectID device, const Options* options)
      * output sample times -- so the difference between those origins goes back
      * in explicitly.
      */
-    double origin_shift = loop.out_origin - loop.in_origin;
-    uint64_t back = (uint64_t)(kSearchBack * rate);
-    if ((double)back > origin_shift) back = (uint64_t)origin_shift;
-    uint64_t from = (uint64_t)(origin_shift + 0.5) - back;
-    unsigned search = (unsigned)((kSearchBack + kSearchAhead) * rate);
+    /* With one device the two index spaces share a clock, so the difference
+     * between their origins is the correction that turns a capture offset into
+     * a round trip. With two there is no shared base and no such correction:
+     * the search starts at the beginning of the capture, over a window wide
+     * enough to contain any plausible offset, and the latency figure below
+     * becomes a raw offset rather than a round trip. */
+    double origin_shift = 0.0;
+    uint64_t from;
+    unsigned search;
+    if (options->split) {
+        from = 0;
+        search = (unsigned)(1.0 * rate);
+    } else {
+        origin_shift = loop.out_origin - loop.in_origin;
+        uint64_t back = (uint64_t)(kSearchBack * rate);
+        if ((double)back > origin_shift) back = (uint64_t)origin_shift;
+        from = (uint64_t)(origin_shift + 0.5) - back;
+        search = (unsigned)((kSearchBack + kSearchAhead) * rate);
+    }
 
     static const char* const kName[CHANNELS] = { "left", "right" };
     double mean[CHANNELS] = {0}, spread[CHANNELS] = {0};
@@ -1018,6 +1246,19 @@ static void usage(void)
         "  -b <frames>         set the IO buffer size first\n"
         "  -n <count>          chirps in the latency test         (default 5)\n"
         "  -w <file.wav>       write the captured audio (32-bit float)\n"
+        "  -i <name|uid>       listen on another interface rather than this one\n"
+        "                      (-i M4). Its clock is its own, so phase and drift\n"
+        "                      are then measured rather than judged; splices and\n"
+        "                      level still decide the result. Required to measure\n"
+        "                      176.4/192 kHz with the input stream disabled.\n"
+        "  -P                  do not prime before measuring (see below)\n"
+        "  -N <runs>           repeat the glitch test and report how many ran\n"
+        "                      clean. One run is not evidence at 176.4/192 kHz.\n"
+        "\n"
+        "At 176.4 and 192 kHz two throwaway streams run first: a bInterval 3\n"
+        "stream leaves the next one corrupt whatever its rate, so a single\n"
+        "warm-up run would put the measurement on the corrupt side of that\n"
+        "alternation and make unrelated comparisons look significant.\n"
         "\n"
         "Needs the driver installed and a loopback cable. Set the input gain so\n"
         "the returned tone does not clip; the tests report the level they saw.\n");
@@ -1025,11 +1266,13 @@ static void usage(void)
 
 int main(int argc, char** argv)
 {
-    Options options = { .seconds = 10.0, .amplitude = 0.25, .reps = 5 };
+    Options options = { .seconds = 10.0, .amplitude = 0.25, .reps = 5, .runs = 1 };
     double level_db = -12.0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "s:a:r:b:n:w:h")) != -1) {
+    const char* capture_name = NULL;
+    bool no_prime = false;
+    while ((opt = getopt(argc, argv, "s:a:r:b:n:w:i:N:Ph")) != -1) {
         switch (opt) {
             case 's': options.seconds = atof(optarg); break;
             case 'a': level_db = atof(optarg); break;
@@ -1045,6 +1288,17 @@ int main(int argc, char** argv)
                 break;
             }
             case 'w': options.wav = optarg; break;
+            case 'i': capture_name = optarg; break;
+            case 'P': no_prime = true; break;
+            case 'N': {
+                int n = atoi(optarg);
+                if (n < 1 || n > 32) {
+                    fprintf(stderr, "error: runs must be between 1 and 32\n");
+                    return 2;
+                }
+                options.runs = (unsigned)n;
+                break;
+            }
             default: usage(); return 2;
         }
     }
@@ -1076,10 +1330,70 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    if (capture_name) {
+        options.capture = find_capture_device(capture_name);
+        if (options.capture == kAudioObjectUnknown) {
+            fprintf(stderr, "error: no input device matching \"%s\"\n", capture_name);
+            return 1;
+        }
+        if (options.capture == device) {
+            fprintf(stderr, "error: that is the device under test; omit -i to loop it back\n");
+            return 1;
+        }
+        options.split = true;
+
+        /* Both ends must agree on the rate: the analysis derives its bin
+         * frequencies from one number, and a capture device an octave out
+         * would land the tone in the wrong bin and read as silence. */
+        double want = options.rate > 0 ? options.rate : get_rate(device);
+        if (want > 0 && !set_rate(options.capture, want)) {
+            fprintf(stderr, "error: the capture device would not go to %.0f Hz\n", want);
+            return 1;
+        }
+        printf("listening on a separate interface at %.0f Hz;"
+               " phase and drift are measured, not judged\n", want);
+    }
+
+    /* See kDepthPrime. Skipped for the sweep, which primes each rate itself. */
+    if (!no_prime && get_rate(device) >= 176400.0 &&
+        strcmp(command, "selftest") != 0 && strcmp(command, "sweep") != 0) {
+        printf("priming twice at %.0f Hz: a bInterval 3 stream corrupts the next one,"
+               " and one throwaway run would leave this measurement on the corrupt side\n",
+               get_rate(device));
+        tone_test(device, &options, 1.5, kDepthPrime, NULL);
+        tone_test(device, &options, 1.5, kDepthPrime, NULL);
+    }
+
     header(device);
 
     if (strcmp(command, "smoke") == 0) {
         tone_test(device, &options, 2.0, kDepthSmoke, "smoke");
+    } else if (strcmp(command, "glitches") == 0 && options.runs > 1) {
+        /*
+         * Repeat, and report every run.
+         *
+         * A single glitch measurement at these rates is not evidence. The
+         * poisoning alternates, priming only mostly absorbs it, and the first
+         * run after a rate or mode change is unreliable whatever is done -- so
+         * one run's verdict can be either the driver's behaviour or the state
+         * it inherited, with nothing in the output to say which. Comparing two
+         * single runs across that produced a confident wrong conclusion about
+         * the input modes during this tool's own development.
+         */
+        int clean = 0;
+        for (unsigned r = 0; r < options.runs; r++) {
+            int before_run = gFailures;
+            char title[64];
+            snprintf(title, sizeof title, "glitches, run %u of %u", r + 1, options.runs);
+            tone_test(device, &options, options.seconds, kDepthFull, title);
+            if (gFailures == before_run) clean++;
+        }
+        printf("\n%d of %u runs clean\n", clean, options.runs);
+        if (clean != (int)options.runs && clean > 0) {
+            printf("  Mixed. At 176.4/192 kHz that is usually the stream-to-stream\n"
+                   "  poisoning rather than a difference in what is being measured;\n"
+                   "  judge by how many runs are clean, not by any single one.\n");
+        }
     } else if (strcmp(command, "glitches") == 0) {
         tone_test(device, &options, options.seconds, kDepthFull, "glitches");
     } else if (strcmp(command, "latency") == 0) {

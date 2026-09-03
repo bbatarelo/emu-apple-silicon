@@ -89,6 +89,10 @@ build/bin/hal-loopback glitches     # a long tone: level, phase, splices, drift
 build/bin/hal-loopback latency      # round trip by chirp
 build/bin/hal-loopback sweep        # the glitch test at every rate
 build/bin/hal-loopback selftest     # the analysers themselves; no hardware
+
+# Listen on a different interface, which is the authoritative measurement and
+# the only one possible at 176.4/192 kHz with the input stream disabled.
+build/bin/hal-loopback -i M4 -r 192000 -N 5 glitches
 ```
 
 `make loopback` runs at whatever sample rate the device is set to. To test

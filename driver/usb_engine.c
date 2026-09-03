@@ -55,6 +55,7 @@
 #include "usb_engine.h"
 #include "ring.h"
 #include "../shared/usb_util.h"
+#include <os/log.h>
 #include "../shared/device.h"
 
 #include <errno.h>
@@ -147,6 +148,23 @@ static _Atomic(void (*)(void))           gIdentityObserver;
  * by the engine thread, applied by the hot-plug queue -- every store is
  * followed by a refresh there, in order with the notifications. */
 static _Atomic(const EmuDeviceIdentity*) gRunningIdentity;
+
+/*
+ * The device's name for log lines.
+ *
+ * Every message used to be prefixed "TrackerPre:" whatever was plugged in,
+ * which is wrong the moment the driver serves the rest of the family -- a 0404
+ * reporting that the Tracker Pre gave up sends the reader after the wrong
+ * hardware. Deliberately not emu_engine_device_name(): this only reads what is
+ * already known, so it never arms the hot-plug watch as a side effect of
+ * logging, and it stays short enough to sit in front of every line.
+ */
+const char* emu_engine_log_name(void)
+{
+    const EmuDeviceIdentity* id = atomic_load_explicit(&gRunningIdentity, memory_order_relaxed);
+    if (!id) id = atomic_load_explicit(&gIdentity, memory_order_relaxed);
+    return id ? id->name : "E-MU device";
+}
 
 /* All of this belongs to gNotifyQueue, which is serial, so the counts need no
  * lock of their own. The iterators are held for the life of the process on
@@ -468,7 +486,16 @@ struct Engine {
 
     /* A stop request carries no payload: relaxed atomic access is sufficient,
      * and CFRunLoopStop supplies the wakeup when the request comes externally. */
+    /* Stopping is an external request: Core Audio asked the engine to stop and
+     * the thread should exit. Faulted is the transport failing underneath it,
+     * which is not a reason to exit -- it is a reason to rebuild. Conflating
+     * the two is what turned one bad submission into a day of silence. */
     _Atomic bool stopping;
+    _Atomic bool faulted;
+
+    _Atomic uint64_t recoveries;
+    _Atomic uint64_t recovery_failures;
+
     CFRunLoopRef  run_loop;
 };
 
@@ -498,6 +525,83 @@ static bool         gWithInput = true;
 
 /* Startup handshake: emu_engine_start blocks until the engine thread has the
  * streams scheduled and the timeline anchor published, or has failed. */
+/*
+ * The engine had no logging at all until a stream died silently and stayed
+ * dead for a day and a half: Core Audio went on running IO cycles at real
+ * time, every plug-in counter went on advancing, and the only trace of the
+ * fault in the whole system log was an "IO started" line with no matching
+ * "IO stopped". Faults log at os_log_error so they survive the default level:
+ *
+ *   log show --predicate 'subsystem == "net.quantum-bit.EMUTrackerPre"'
+ */
+static os_log_t engine_log(void)
+{
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ log = os_log_create(EMU_LOG_SUBSYSTEM, "engine"); });
+    return log;
+}
+/* The os_log category already says "engine", so the prefix carries the one
+ * thing the category cannot: which device this is about. */
+#define ENG_LOG(fmt, ...)   os_log(engine_log(), "%{public}s: " fmt, emu_engine_log_name(), ##__VA_ARGS__)
+#define ENG_ERR(fmt, ...)   os_log_error(engine_log(), "%{public}s: " fmt, emu_engine_log_name(), ##__VA_ARGS__)
+#define ENG_DEBUG(fmt, ...) os_log_debug(engine_log(), "%{public}s: " fmt, emu_engine_log_name(), ##__VA_ARGS__)
+
+/* Rebuild attempts before the engine gives up and says so. Six with the
+ * backoff below spans about eight seconds, which covers a hub renegotiating or
+ * a device re-enumerating without leaving an absent device retrying forever. */
+#define MAX_RECOVERY_ATTEMPTS 6
+/* How long a session must have run before it counts as having recovered, and
+ * so restores the retry budget. Long enough that a stream which faults straight
+ * back cannot refresh it indefinitely. */
+#define RECOVERY_STABLE_SECONDS 5.0
+#define RECOVERY_BACKOFF_MS(attempt) (50u << ((attempt) < 5 ? (attempt) : 5))
+
+/* Submissions a TRANSIENT injected fault fails before clearing itself. Two
+ * failures fault a running stream (one submit, one after the reschedule) and
+ * the third fails the first rebuild, so a test sees a failed rebuild and a
+ * successful one and still lands well inside the retry budget. A budget large
+ * enough to exhaust that would make "transient" indistinguishable from
+ * "persistent", which is the distinction this knob exists for. */
+#define TRANSIENT_FAULT_SUBMITS 3
+
+/* Transfers actually on the bus, as opposed to gRunning's "a start was
+ * requested and no stop has arrived yet". */
+static _Atomic bool gStreaming = false;
+/* Invoked once when the engine gives up for good. */
+static void (* _Atomic gFailureHandler)(void) = NULL;
+
+static _Atomic uint32_t gFaultMode;
+static _Atomic uint32_t gFaultCountdown;
+
+void emu_engine_inject_fault(EmuFaultMode mode)
+{
+    atomic_store_explicit(&gFaultCountdown,
+                          mode == EMU_FAULT_TRANSIENT ? TRANSIENT_FAULT_SUBMITS : 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gFaultMode, (uint32_t)mode, memory_order_relaxed);
+    ENG_LOG("fault injection set to %u", (unsigned)mode);
+}
+
+/* True when this submission should be failed on purpose. */
+static bool fault_should_fail(void)
+{
+    uint32_t mode = atomic_load_explicit(&gFaultMode, memory_order_relaxed);
+    if (mode == EMU_FAULT_NONE) return false;
+    if (mode == EMU_FAULT_PERSISTENT) return true;
+
+    uint32_t left = atomic_load_explicit(&gFaultCountdown, memory_order_relaxed);
+    while (left > 0) {
+        if (atomic_compare_exchange_weak_explicit(&gFaultCountdown, &left, left - 1,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {
+            return true;
+        }
+    }
+    atomic_store_explicit(&gFaultMode, EMU_FAULT_NONE, memory_order_relaxed);
+    return false;
+}
+
 typedef enum { ENGINE_IDLE, ENGINE_STARTING, ENGINE_STREAMING, ENGINE_FAILED } EngineStartState;
 static pthread_mutex_t   gStartLock  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t    gStartCond  = PTHREAD_COND_INITIALIZER;
@@ -847,6 +951,16 @@ bool emu_engine_running(void)
     return atomic_load_explicit(&gRunning, memory_order_acquire);
 }
 
+bool emu_engine_streaming(void)
+{
+    return atomic_load_explicit(&gStreaming, memory_order_acquire);
+}
+
+void emu_engine_set_failure_handler(void (*handler)(void))
+{
+    atomic_store_explicit(&gFailureHandler, handler, memory_order_relaxed);
+}
+
 /* The last session's counters, captured after teardown drains the IO writer
  * and before the next start resets the engine. Without this, a post-mortem
  * `make check` after a bad session reads all zeros -- exactly when the
@@ -967,6 +1081,10 @@ void emu_engine_stats(EmuEngineStats* stats)
     stats->input_overruns  = atomic_load_explicit(&gInputRing.discarded, memory_order_relaxed);
     stats->empty_capture   = atomic_load_explicit(&gEngine.empty_capture, memory_order_relaxed);
     pthread_mutex_unlock(&gStatsLock);
+    stats->engine_streaming   = emu_engine_streaming() ? 1u : 0u;
+    stats->recoveries         = atomic_load_explicit(&gEngine.recoveries, memory_order_relaxed);
+    stats->recovery_failures  = atomic_load_explicit(&gEngine.recovery_failures, memory_order_relaxed);
+    stats->fault_mode         = atomic_load_explicit(&gFaultMode, memory_order_relaxed);
 }
 
 /* --- transfers ------------------------------------------------------------- */
@@ -990,6 +1108,8 @@ static IOReturn submit_capture(Request* req)
     }
     req->frame_start = e->next_in_frame;
     e->next_in_frame += REQUEST_MS;
+
+    if (fault_should_fail()) return kIOReturnNotResponding;
 
     IOReturn result = (*e->in_intf)->LowLatencyReadIsochPipeAsync(
         e->in_intf, e->in_pipe, req->buffer, req->frame_start,
@@ -1185,7 +1305,9 @@ static IOReturn submit_playback(Request* req)
     req->frame_start = e->next_out_frame;
     e->next_out_frame += REQUEST_MS;
 
-    IOReturn result = (*e->out_intf)->LowLatencyWriteIsochPipeAsync(
+    IOReturn result = fault_should_fail()
+        ? kIOReturnNotResponding
+        : (*e->out_intf)->LowLatencyWriteIsochPipeAsync(
         e->out_intf, e->out_pipe, req->buffer, req->frame_start,
         e->entries_per_request, 1, req->frames, playback_complete, req);
 
@@ -1404,10 +1526,18 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
         CFRunLoopStop(CFRunLoopGetCurrent());
         return;
     }
-    if (submit_capture(req) != kIOReturnSuccess) {
+    IOReturn kr = submit_capture(req);
+    if (kr != kIOReturnSuccess) {
+        ENG_DEBUG("capture submit failed 0x%08x, rescheduling", kr);
         reschedule(e);
-        if (submit_capture(req) != kIOReturnSuccess) {
-            atomic_store_explicit(&e->stopping, true, memory_order_relaxed);
+        kr = submit_capture(req);
+        if (kr != kIOReturnSuccess) {
+            /* A reschedule did not help, so the transport itself is gone.
+             * Leave the run loop and let the thread rebuild the stream; do NOT
+             * set stopping, which would exit the thread and strand Core Audio
+             * streaming into nothing. */
+            ENG_ERR("capture submit failed after reschedule 0x%08x, rebuilding stream", kr);
+            atomic_store_explicit(&e->faulted, true, memory_order_relaxed);
             CFRunLoopStop(CFRunLoopGetCurrent());
         }
     }
@@ -1488,10 +1618,16 @@ static void playback_complete(void* refcon, IOReturn result, void* arg0)
                 atomic_load_explicit(&e->frames_played, memory_order_relaxed), filtered);
         }
 
-        if (submit_playback(req) != kIOReturnSuccess) {
+        IOReturn kr = submit_playback(req);
+        if (kr != kIOReturnSuccess) {
+            ENG_DEBUG("playback submit failed 0x%08x, rescheduling", kr);
             reschedule(e);
-            if (submit_playback(req) != kIOReturnSuccess)
-                atomic_store_explicit(&e->stopping, true, memory_order_relaxed);
+            kr = submit_playback(req);
+            if (kr != kIOReturnSuccess) {
+                ENG_ERR("playback submit failed after reschedule 0x%08x, rebuilding stream", kr);
+                atomic_store_explicit(&e->faulted, true, memory_order_relaxed);
+                CFRunLoopStop(CFRunLoopGetCurrent());
+            }
         }
     }
 }
@@ -1599,6 +1735,32 @@ static bool select_alt(IOUSBInterfaceInterface500** intf, const EmuDeviceModel* 
     }
     *chosen_out = chosen;
     return true;
+}
+
+/*
+ * Drop the handles teardown has already released, and nothing else.
+ *
+ * A rebuild needs the Engine's resource fields empty so setup starts clean and
+ * teardown cannot double-free, while every counter and the timeline position
+ * carry across untouched.
+ */
+static void clear_resources(Engine* e)
+{
+    e->identity = NULL;
+    e->device   = NULL;
+    e->service  = 0;
+    e->in_intf  = NULL;
+    e->out_intf = NULL;
+    e->run_loop = NULL;
+    e->in_pipe = e->out_pipe = 0;
+    e->fb_pipe = 0;
+    for (int i = 0; i < MAX_REQUESTS; i++) {
+        e->in_requests[i].buffer  = NULL; e->in_requests[i].frames  = NULL;
+        e->out_requests[i].buffer = NULL; e->out_requests[i].frames = NULL;
+    }
+    for (int i = 0; i < FB_REQUESTS; i++) {
+        e->fb_requests[i].buffer = NULL; e->fb_requests[i].frames = NULL;
+    }
 }
 
 static void teardown(Engine* e)
@@ -1764,14 +1926,12 @@ static uint32_t schedule_depth(Engine* e, uint32_t safety_us)
     return (uint32_t)need;
 }
 
-static void* engine_thread(void* arg)
+/* One streaming session: bring the device up, run it, take it down again.
+ * Returns what ended it, so the thread above can tell a stop from a fault. */
+typedef enum { kSessionSetupFailed = -1, kSessionStopped = 0, kSessionFaulted = 1 } SessionEnd;
+
+static SessionEnd stream_session(Engine* e, bool announced)
 {
-    (void)arg;
-    Engine* e = &gEngine;
-    pthread_mutex_lock(&gStatsLock);
-    memset(e, 0, sizeof *e);
-    atomic_init(&e->stopping, false);
-    pthread_mutex_unlock(&gStatsLock);
     emu_ring_reset(&gInputRing);
 
     mach_timebase_info_data_t tb;
@@ -1780,7 +1940,7 @@ static void* engine_thread(void* arg)
     e->sample_rate = gSampleRate;
     bind_reset();
 
-#define ENGINE_FAIL() do { teardown(e); signal_start_state(ENGINE_FAILED); return NULL; } while (0)
+#define ENGINE_FAIL() do { teardown(e); return kSessionSetupFailed; } while (0)
 
     e->feedback = emu_feedback_init(e->feedback_storage);
     if (!e->feedback) ENGINE_FAIL();
@@ -1945,8 +2105,7 @@ static void* engine_thread(void* arg)
     }
     if (!submitted) {
         teardown(e);
-        signal_start_state(ENGINE_FAILED);
-        return NULL;
+        return kSessionSetupFailed;
     }
     /* Last, and never fatal. Reading the device's stated demand is a
      * measurement placed alongside the stream, not a part of it. */
@@ -1963,11 +2122,16 @@ static void* engine_thread(void* arg)
     atomic_store_explicit(&gBindGate, 0, memory_order_release);
 
     atomic_store_explicit(&gRunning, true, memory_order_release);
-    signal_start_state(ENGINE_STREAMING);
+    atomic_store_explicit(&gStreaming, true, memory_order_release);
+    /* The start handshake is answered once, by the first session. A rebuild
+     * must not signal it again: StartIO has long since returned. */
+    if (!announced) signal_start_state(ENGINE_STREAMING);
 
-    while (!atomic_load_explicit(&e->stopping, memory_order_relaxed)) {
+    while (!atomic_load_explicit(&e->stopping, memory_order_relaxed) &&
+           !atomic_load_explicit(&e->faulted, memory_order_relaxed)) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
     }
+    atomic_store_explicit(&gStreaming, false, memory_order_release);
 
     clear_engine_thread_policy();
 
@@ -1988,12 +2152,133 @@ static void* engine_thread(void* arg)
      * live counter can still change. Engine storage is reset at the next
      * start, under gStatsLock, rather than while diagnostics may read it. */
     teardown(e);
+    return atomic_load_explicit(&e->faulted, memory_order_relaxed)
+         ? kSessionFaulted : kSessionStopped;
+}
+
+/*
+ * The engine thread: run a session, and rebuild it if the transport failed.
+ *
+ * Previously two consecutive failed submissions set `stopping`, the thread ran
+ * teardown and exited, and nothing on the system knew: Core Audio went on
+ * calling DoIOOperation, the write path went on dropping frames because the
+ * bind gate was closed, and the only way back was restarting coreaudiod. A
+ * failed submission is now a fault, faults are rebuilt through, and only an
+ * exhausted retry budget ends the session -- telling the plug-in, rather than
+ * going quiet.
+ */
+static void* engine_thread(void* arg)
+{
+    (void)arg;
+    Engine* e = &gEngine;
+
+    /* Once, here rather than per session: a rebuild must keep frames_played --
+     * Core Audio derives sample time from it and treats a backwards step as a
+     * fault -- and every counter with it. */
+    pthread_mutex_lock(&gStatsLock);
+    memset(e, 0, sizeof *e);
+    atomic_init(&e->stopping, false);
+    atomic_init(&e->faulted, false);
+    pthread_mutex_unlock(&gStatsLock);
+
+    bool announced = false;
+    unsigned attempt = 0;
+
+    for (;;) {
+        atomic_store_explicit(&e->faulted, false, memory_order_relaxed);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        SessionEnd end = stream_session(e, announced);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ran_for = (double)(t1.tv_sec - t0.tv_sec)
+                       + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+
+        if (end == kSessionStopped) break;
+
+        /*
+         * The budget counts *consecutive* failed rebuilds, so a session that
+         * genuinely recovered and played gives it back. Without this the
+         * allowance is cumulative over the engine's whole life: six faults
+         * recovered cleanly across an afternoon, and the seventh -- equally
+         * recoverable -- would take the device offline instead.
+         *
+         * Gated on having run for a while rather than merely on having reached
+         * the streaming state, so a fault that lets setup succeed and then
+         * fails immediately cannot refresh the budget forever and retry
+         * without end.
+         */
+        if (end == kSessionFaulted && ran_for >= RECOVERY_STABLE_SECONDS) {
+            attempt = 0;
+        }
+
+        if (end == kSessionSetupFailed && !announced) {
+            /* A first start that never came up fails fast rather than
+             * retrying: StartIO is blocked on this handshake, and a device
+             * that is not there when Core Audio asks is better reported than
+             * waited for. */
+            ENG_ERR("stream did not come up at %u Hz", gSampleRate);
+            signal_start_state(ENGINE_FAILED);
+            break;
+        }
+        announced = true;
+
+        if (atomic_load_explicit(&e->stopping, memory_order_relaxed)) break;
+        if (end == kSessionSetupFailed) {
+            atomic_fetch_add_explicit(&e->recovery_failures, 1, memory_order_relaxed);
+        }
+
+        if (++attempt > MAX_RECOVERY_ATTEMPTS) {
+            ENG_ERR("giving up after %u failed rebuilds; marking the device not alive",
+                    MAX_RECOVERY_ATTEMPTS);
+            break;
+        }
+
+        unsigned delay_ms = RECOVERY_BACKOFF_MS(attempt - 1);
+        ENG_ERR("transport fault, rebuilding in %u ms (attempt %u of %u)",
+                delay_ms, attempt, MAX_RECOVERY_ATTEMPTS);
+
+        /* teardown has already released the hardware, so a device that needs
+         * to re-enumerate is not held open while we wait. Only the resource
+         * handles are cleared; every counter carries across, because a fault
+         * that resets the evidence is a fault nobody can diagnose after it. */
+        clear_resources(e);
+
+        /* Slept in slices rather than in one go: StopIO joins this thread, so
+         * a single 1.6 s wait would be 1.6 s of coreaudiod blocked on a device
+         * the user has already switched away from. */
+        for (unsigned waited = 0; waited < delay_ms; waited += 25) {
+            if (atomic_load_explicit(&e->stopping, memory_order_relaxed)) break;
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 25 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+
+        if (atomic_load_explicit(&e->stopping, memory_order_relaxed)) break;
+        if (end != kSessionSetupFailed) {
+            atomic_fetch_add_explicit(&e->recoveries, 1, memory_order_relaxed);
+            ENG_LOG("rebuilding at frame %llu",
+                    (unsigned long long)atomic_load_explicit(&e->frames_played,
+                                                             memory_order_relaxed));
+        }
+    }
+
+    atomic_store_explicit(&gStreaming, false, memory_order_release);
     emu_engine_stats(&gFinalStats);
     pthread_mutex_lock(&gStatsLock);
     gHaveFinalStats = true;
     pthread_mutex_unlock(&gStatsLock);
 
+    bool gave_up = announced &&
+                   !atomic_load_explicit(&e->stopping, memory_order_relaxed);
     atomic_store_explicit(&gRunning, false, memory_order_release);
+
+    /* Last, and outside everything: the handler re-enters the plug-in, which
+     * must not find the engine half torn down. */
+    if (gave_up) {
+        void (*handler)(void) =
+            atomic_load_explicit(&gFailureHandler, memory_order_relaxed);
+        if (handler) handler();
+    }
     return NULL;
 }
 

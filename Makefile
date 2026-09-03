@@ -6,6 +6,8 @@
 #   make check      show what the driver is doing
 #   make record     record 5 seconds and report what arrived
 #   make test       run the test suite (no hardware needed)
+#   make test-recovery  fault-inject the driver and check it recovers
+#   make test-recovery  fault-inject the running driver and check it recovers
 #
 # Needs: Xcode command line tools, and Rust (stable). Nothing else.
 
@@ -23,7 +25,7 @@ CFLAGS  := -std=c17 -Wall -Wextra -O2
 FRAMEWORKS := -framework CoreFoundation -framework CoreAudio -framework IOKit
 AUDIO_FRAMEWORKS := -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 
-.PHONY: all driver tools install uninstall check record loopback test clean help
+.PHONY: test-recovery all driver tools install uninstall check record loopback test clean help
 
 all: driver tools
 
@@ -115,6 +117,12 @@ record: $(BIN)/hal-record
 # device is set to; hal-loopback -r <hz> sets one first.
 loopback: $(BIN)/hal-loopback
 	@$(BIN)/hal-loopback -w $(BUILD)/loopback.wav
+
+# Injects a transport fault into the installed driver and checks the engine
+# rebuilds, gives up when it should, and comes back. Needs the driver installed
+# and audio playing to it -- a fault can only go into a stream that exists.
+test-recovery: $(BIN)/hal-check
+	@./scripts/test-recovery.sh
 
 test: $(BIN)/hal-loopback
 	@cd $(CORE) && cargo test
