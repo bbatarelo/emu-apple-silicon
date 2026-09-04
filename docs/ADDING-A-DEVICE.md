@@ -177,3 +177,25 @@ If they differ, the likely work is:
   with no per-device code. A device whose MIDI is *not* standard USB-MIDI —
   the Tracker Pre advertises no MIDI interface at all despite having DIN
   ports — is unexplored territory.
+
+---
+
+## With more than one device attached
+
+`emu-probe` talks to the hardware directly and takes the first known device it
+finds. To aim it at a particular model:
+
+```bash
+EMU_PRODUCT=3f04 build/bin/emu-probe descriptors
+```
+
+The Core Audio tools (`hal-check`, `hal-loopback`, `hal-record`, `hal-trace`)
+select by UID or serial instead:
+
+```bash
+EMU_DEVICE=3F04 build/bin/hal-check
+```
+
+Both matter when adding a device: you will usually have a known-good unit
+plugged in alongside the new one, and without a selector every tool would keep
+answering about the wrong box.

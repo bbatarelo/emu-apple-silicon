@@ -128,8 +128,9 @@ the interface.
 ## Which devices?
 
 **Tracker Pre** (`041e:3f0a`) and **0404 USB** (`041e:3f04`), both verified on
-real hardware. One build serves either — plug one in and the driver finds it,
-and names itself after whichever it found.
+real hardware. One build serves either, and **both at once**: plug in two and
+you get two Core Audio devices, each with its own name, controls and transport,
+streaming independently at any rate either supports.
 
 The **0202 USB** is the one still untested. It is built on the same CA0189
 chipset and should speak the same protocol; the 0404 turned out to, needing a
@@ -138,8 +139,42 @@ minutes. See **[docs/ADDING-A-DEVICE.md](docs/ADDING-A-DEVICE.md)** — no drive
 changes needed to find out, and the results are genuinely useful even if you
 stop there.
 
-With two known devices plugged in at once, only one is published; which one is
-`EMU_DEFAULT_PRODUCT_ID` in `shared/device.h`.
+Up to `EMU_MAX_DEVICES` (4) are published. A fifth is ignored.
+
+**MIDI is still single-device**: with two units attached, MIDI endpoints appear
+for the preferred one only (`EMU_DEFAULT_PRODUCT_ID` in `shared/device.h`).
+Audio is unaffected.
+
+### Device names, and a one-time change
+
+Each device is identified by its unit's serial number:
+
+    net.quantum-bit.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03
+
+A single fixed name cannot identify two boxes, so this replaced the old
+`net.quantum-bit.EMUTrackerPre`. **Upgrading from a version before multi-device
+resets your chosen output device once** — macOS keys that choice on the UID and
+sees a new name. Select the device again and it sticks.
+
+The serial is what makes the choice stick afterwards. It survives replugging and
+moving to another port, so an interface you unplug and plug back in returns as
+*the same device* and playback resumes on its own, rather than coming back as a
+stranger you have to re-select.
+
+### Pointing the tools at one device
+
+With several attached, `EMU_DEVICE` selects by any part of the UID or serial —
+the product ID is usually enough:
+
+```bash
+EMU_DEVICE=3F04 build/bin/hal-check           # the 0404
+EMU_DEVICE=3F0A build/bin/hal-check           # the Tracker Pre
+EMU_DEVICE=3F04 build/bin/hal-loopback -i M4 -r 192000 -N 3 glitches
+```
+
+Without it, the first device found wins, which is the single-device case
+unchanged. `emu-probe` talks to the hardware rather than to Core Audio, so it
+uses `EMU_PRODUCT=3f04` instead.
 
 ---
 
@@ -185,6 +220,17 @@ correct channel mapping, clock tracking anchored to the device, latency
 reported from a loopback measurement, and MIDI in and out on the 0404 USB —
 verified byte-for-byte through a DIN loopback cable.
 
+Several devices at once: two interfaces publish separately and stream together
+at 192 kHz, each with exact frame accounting. Unplugging one mid-stream leaves
+the other untouched, and the removed device is re-adopted on replug — verified
+with an application playing through it, which resumed by itself.
+
+The engine also survives a transport fault: it rebuilds the stream with backoff
+rather than dying, logs what happened, and if it exhausts its budget it tells
+Core Audio the device is gone instead of streaming into nothing.
+`build/bin/hal-check fault transient|persistent|none` exercises that path, and
+`make test-recovery` checks it end to end.
+
 Known issue: on some setups — @dnadlinger's development 0404 USB among them,
 though another user's 0404 USB and Tracker Pre are reported clean — full
 duplex at 176.4 and 192 kHz crackles, about one dropped playback packet a
@@ -203,7 +249,9 @@ Not done:
   unit, so some may not be reachable; the 0404 has three more that nothing reads
   yet.
 - Stereo only. The 0404 also offers four-channel modes, which are ignored.
-- One device at a time, even when several are attached.
+- MIDI is single-device: with two units attached, endpoints appear for the
+  preferred one only.
+- More than four devices at once. A fifth is ignored silently.
 - The 0202 USB is untested.
 
 ---

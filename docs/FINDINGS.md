@@ -809,6 +809,67 @@ from a sudden step. Measured against an external interface the noise floor is
 also better -- mean THD+N about -70 dB at 48 kHz, against -54 dB through the
 device's own converters -- so a dropped packet stands out further.
 
+### A start needs enough lead to submit its whole queue
+
+Starting two devices together reliably lost whichever finished setup second,
+with `kIOReturnIsoTooOld` (`0xe00002ee`) on the first playback submission.
+
+The schedule's start frame is chosen as `now + SCHEDULE_LEAD_MS` *before* the
+slow part of setup -- setting the clock rate and verifying it by read-back,
+selecting alternate settings, allocating the low-latency buffers. Putting the
+queue on the bus is then scores of submissions: about 81 requests per direction
+at 48 kHz, so roughly 160 calls. Four milliseconds of lead does not survive
+that, and does not come close when a second engine is doing the same work on
+the same bus.
+
+It is not a failure, it is a stale schedule -- the same thing `reschedule()`
+exists for mid-stream. Setup now aborts what reached the bus, rebuilds from the
+current bus frame with the lead multiplied by four, and retries, up to four
+attempts. The lead is pure startup latency: it shifts the timeline origin once
+and costs nothing while running.
+
+Two things this cost before it was understood. The failure is timing-dependent,
+so runs of eight consecutive successes proved nothing -- only the log line says
+which path executed. And the first fix rebuilt with the *same* lead, which was
+always going to hit the same wall.
+
+### A hot-plug watch that tracks the choice cannot serve several devices
+
+The watcher notified the plug-in only when the *chosen* identity changed:
+
+```c
+if (was != found && notify && observer) observer();
+```
+
+Correct when the driver published one device and had to pick a model. With
+several published it is the wrong question: while the preferred product is
+attached the choice never changes, so a second device arriving or leaving was
+invisible. It was never adopted, and unplugging it was never noticed.
+
+The symptom is asymmetric and confusing: cycling the *preferred* device works
+perfectly, cycling any other does nothing at all. The watch now fingerprints
+the whole attached set and reports any change to it.
+
+An idle hot-plug test passed before this was found, because that test happened
+to cycle the preferred device.
+
+### Nothing came back is one fact, not eleven
+
+An unplugged loopback cable used to produce a level failure, a crosstalk
+failure and a spray of "splices" -- all the same fact, none of them about the
+driver. `hal-loopback` now says it once and stops for that channel.
+
+The threshold is -100 dBFS, between the two regimes this rig actually shows: a
+connected loopback returns -23 to -37 dBFS in use and about -120 dBFS with the
+gain right down, while a disconnected one returns digital silence at -143 dBFS.
+So it separates "no signal" from "very quiet signal", which is the distinction
+that matters.
+
+This cost a full measurement cycle before the check existed: the rig reports a
+disconnected cable identically to a broken driver, and only the driver's own
+counters (`framesToOutput == framesBound`, zero faults) told them apart.
+
+
 ---
 
 ## Open questions

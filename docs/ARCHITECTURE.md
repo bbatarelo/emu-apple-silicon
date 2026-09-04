@@ -371,6 +371,83 @@ Startup order matters and is not negotiable: parse descriptors, set the clock
 rate, **verify it by read-back**, then select alternate settings. Doing it in any
 other order can wedge the device until it is physically replugged.
 
+## Multiple devices
+
+The driver publishes one Core Audio device per attached unit, each with its own
+transport. Two boxes stream at once, at any rate either supports, sharing
+nothing but the bus and one IOKit notification port.
+
+### What a device is
+
+`plugin.c` keeps a small registry, `gDevices[EMU_MAX_DEVICES]`. Each slot holds
+everything that used to be file scope -- the rate, clock source, volume, mute,
+IO client count, input mode, safety offset, timeline anchor, liveness -- plus
+the `EmuEngine*` for its unit. Nothing about a device lives outside its slot.
+
+Object IDs are computed rather than fixed:
+
+    id = DEVICE_OBJECT_BASE + index * DEVICE_OBJECT_STRIDE + role
+
+so an incoming `AudioObjectID` maps back to a device and a role by arithmetic
+(`device_for_object`), and `object_kind` folds in the plug-in object so the
+property switches can dispatch on role rather than on a number. Slot 0 lands on
+exactly the IDs the old fixed enum used, which is why the change was invisible
+to clients.
+
+### Which unit an engine opens
+
+`emu_engine_create(product_id, location_id)` binds an engine to a *port*, not a
+model. A product ID cannot tell two boxes of the same model apart, and "the
+first 0404 in the registry" is ambiguous the moment there are two of anything.
+`emu_enumerate_units` reports what is attached; `emu_find_unit` opens one.
+
+### UIDs come from the unit's serial
+
+    net.quantum-bit.EMUTrackerPre.<serial>
+
+Both devices report a serial in their USB descriptor
+(`E-MU-69-3F04-...`, `E-MU-C7-3F0A-...`), and it is the only identifier that
+survives both replugging and moving to another port. This matters more than it
+looks: macOS remembers the user's chosen output device *by UID*, so a
+serial-based name means a replugged interface comes back as the same device and
+playback resumes on its own. A slot index or location ID would return as a
+stranger and leave the user re-selecting it by hand.
+
+The tools match on the prefix and take `EMU_DEVICE=<text>` to choose among
+several; `emu-probe` takes `EMU_PRODUCT=<hex pid>`, since it talks to the
+hardware rather than to Core Audio.
+
+### Following the bus
+
+`reconcile_devices()` diffs the attached units against the published slots,
+adopting arrivals and retiring departures, and runs from `Initialize` and from
+the hot-plug observer. Slots are matched by location, because that is what
+distinguishes two identical boxes and it is stable for as long as the cable
+stays put.
+
+Retiring takes the slot out of the registry under the state lock and destroys
+its engine *outside* it, because stopping an engine joins its thread and that
+thread may want the same lock. A device removed mid-stream is handled the same
+way: its engine faults, reconcile retires it before the rebuild budget runs
+out, and the other device is undisturbed.
+
+### What is still shared
+
+One IOKit notification port and the device table. That is deliberate -- the
+watch is a property of the bus, not of a device -- and it is the last global
+the engines touch.
+
+### Known limits
+
+- `EMU_MAX_DEVICES` is 4. A fifth unit is ignored silently.
+- `device_for_object` reads a slot's `present` flag without the state lock that
+  `reconcile_devices` writes it under. Not observed to bite, including through
+  mid-stream removal, but it is a race and should be closed.
+- **The MIDI driver is still single-device.** `midi-driver/plugin.c` opens
+  `emu_find_device(EMU_DEFAULT_PRODUCT_ID)`, so with two units attached it
+  publishes MIDI endpoints for the preferred one only. The audio side was
+  converted; the MIDI side was written before this and has not been.
+
 ## The MIDI driver
 
 Audio and MIDI live in different daemons on macOS — coreaudiod hosts HAL
