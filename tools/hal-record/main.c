@@ -64,7 +64,15 @@ static AudioObjectID find_device(void)
         UInt32 uidSize = sizeof(uid);
         if (AudioObjectGetPropertyData(devices[i], &uidAddress, 0, NULL,
                                        &uidSize, &uid) != noErr || !uid) continue;
-        Boolean match = CFStringCompare(uid, CFSTR(DEVICE_UID), 0) == kCFCompareEqualTo;
+/* Devices are named by the plug-in's prefix plus the unit's serial, so the
+         * match is on the prefix. EMU_DEVICE=<text> picks among them when more
+         * than one is attached; without it the first found wins. */
+        Boolean match = CFStringHasPrefix(uid, CFSTR(DEVICE_UID));
+        const char* want = getenv("EMU_DEVICE");
+        if (match && want && *want) {
+            CFStringRef w = CFStringCreateWithCString(NULL, want, kCFStringEncodingUTF8);
+            if (w) { match = CFStringFind(uid, w, 0).location != kCFNotFound; CFRelease(w); }
+        }
         CFRelease(uid);
         if (match) return devices[i];
     }

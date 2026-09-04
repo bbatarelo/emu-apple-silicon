@@ -67,6 +67,20 @@
 
 /* Signal has to be there at all, and must not be clipping. */
 #define MIN_LEVEL_DB       (-40.0)
+
+/*
+ * Below this, nothing came back at all.
+ *
+ * A quiet loopback still returns the converter's own noise floor -- around
+ * -120 dBFS on this rig with the gain right down, and -23 to -37 dBFS in
+ * normal use. A cable that is not plugged in returns digital silence, and the
+ * analyser then reports a level failure, a crosstalk failure and a waveful of
+ * "splices" that are all the same fact: there is no signal to judge. Saying so
+ * once, plainly, is the difference between "the driver is broken" and "the
+ * cable is out" -- a distinction that cost a full measurement cycle before
+ * this check existed.
+ */
+#define NO_SIGNAL_DB       (-100.0)
 #define MAX_PEAK             0.98
 
 /* The other channel's tone, in this channel. A swap reads about 0 dB relative;
@@ -158,7 +172,19 @@ static AudioObjectID find_device(void)
         UInt32 uidSize = sizeof(uid);
         if (AudioObjectGetPropertyData(devices[i], &uidAddress, 0, NULL,
                                        &uidSize, &uid) != noErr || !uid) continue;
-        Boolean match = CFStringCompare(uid, CFSTR(DEVICE_UID), 0) == kCFCompareEqualTo;
+        /* Devices are named by the plug-in's prefix plus the unit's serial, so
+         * the match is on the prefix. EMU_DEVICE=<text> picks among them by
+         * UID or serial when more than one is attached; without it the first
+         * found wins, which is the single-device case unchanged. */
+        Boolean match = CFStringHasPrefix(uid, CFSTR(DEVICE_UID));
+        const char* want = getenv("EMU_DEVICE");
+        if (match && want && *want) {
+            CFStringRef w = CFStringCreateWithCString(NULL, want, kCFStringEncodingUTF8);
+            if (w) {
+                match = CFStringFind(uid, w, 0).location != kCFNotFound;
+                CFRelease(w);
+            }
+        }
         CFRelease(uid);
         if (match) return devices[i];
     }
@@ -952,6 +978,15 @@ static int tone_test(AudioObjectID device, const Options* options, double second
         snprintf(what, sizeof what, "%s: the tone is there, unclipped", kName[c]);
         verdict(s.level_mean_db > MIN_LEVEL_DB && s.peak < MAX_PEAK, what,
                 "%.2f dBFS, peak %.4f", s.level_mean_db, s.peak);
+
+        /* Nothing came back on this channel. Every check below would fail for
+         * that one reason, so say it once and stop rather than burying it. */
+        if (s.level_mean_db < NO_SIGNAL_DB) {
+            note("no signal on %s -- check the loopback cable, the input gain,",
+                 kName[c]);
+            note("and that the tone is going to the device you are listening to");
+            continue;
+        }
 
         snprintf(what, sizeof what, "%s: it is this channel's tone", kName[c]);
         verdict(s.rival_worst_db - s.level_mean_db < MAX_CROSSTALK_DB, what,

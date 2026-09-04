@@ -189,6 +189,27 @@ static uint32_t drain(io_iterator_t iter)
 /* `notify` is false for the initial resolve, which happens while the plug-in
  * is still initializing: the host is about to ask for the name anyway, and
  * telling it a device it has not enumerated yet has changed is at best noise. */
+/*
+ * A fingerprint of what is attached, per product.
+ *
+ * The observer used to fire only when the *chosen* identity changed, which was
+ * the right question when the driver published one device and had to pick a
+ * model. With several published it is the wrong question entirely: while the
+ * preferred product is attached the choice never changes, so a second device
+ * arriving or leaving was invisible -- it was never adopted, and unplugging it
+ * was never noticed. Any change in the attached set has to be reported.
+ */
+static uint64_t gAttachedSignature;
+
+static uint64_t attached_signature(void)
+{
+    uint64_t sig = 1469598103934665603ull;
+    for (unsigned i = 0; i < EMU_DEVICE_COUNT; i++) {
+        sig = (sig ^ gAttached[i]) * 1099511628211ull;
+    }
+    return sig;
+}
+
 static void refresh_identity(bool notify)
 {
     const EmuDeviceIdentity* found =
@@ -205,9 +226,14 @@ static void refresh_identity(bool notify)
 
     const EmuDeviceIdentity* was =
         atomic_exchange_explicit(&gIdentity, found, memory_order_relaxed);
+
+    uint64_t sig = attached_signature();
+    bool set_changed = (sig != gAttachedSignature);
+    gAttachedSignature = sig;
+
     void (*observer)(void) =
         atomic_load_explicit(&gIdentityObserver, memory_order_relaxed);
-    if (was != found && notify && observer) observer();
+    if ((was != found || set_changed) && notify && observer) observer();
 }
 
 /* Engine thread only. The store is what refresh_identity reads; the refresh
@@ -538,6 +564,10 @@ struct Engine {
 
     /* The physical unit this engine owns. product_id alone cannot tell two
      * boxes of the same model apart, so the port is what it opens. */
+    /* Bus frames of lead when a schedule is built. Constant in steady state;
+     * raised only when a start finds its own schedule already elapsed. */
+    uint32_t  schedule_lead_ms;
+
     uint16_t  unit_product_id;
     uint64_t  unit_location_id;
 
@@ -577,6 +607,14 @@ struct Engine {
  *
  *   log show --predicate 'subsystem == "net.quantum-bit.EMUTrackerPre"'
  */
+typedef struct Engine Engine;
+
+/* This engine's device, for its own log lines. Reads the engine rather than a
+ * global: with two engines running, a shared "currently running identity" is
+ * whichever started last, so every line was attributed to one device and the
+ * other's faults appeared under the wrong name. */
+static const char* engine_name(const Engine* e);
+
 static os_log_t engine_log(void)
 {
     static os_log_t log;
@@ -586,9 +624,10 @@ static os_log_t engine_log(void)
 }
 /* The os_log category already says "engine", so the prefix carries the one
  * thing the category cannot: which device this is about. */
-#define ENG_LOG(fmt, ...)   os_log(engine_log(), "%{public}s: " fmt, emu_engine_log_name(), ##__VA_ARGS__)
-#define ENG_ERR(fmt, ...)   os_log_error(engine_log(), "%{public}s: " fmt, emu_engine_log_name(), ##__VA_ARGS__)
-#define ENG_DEBUG(fmt, ...) os_log_debug(engine_log(), "%{public}s: " fmt, emu_engine_log_name(), ##__VA_ARGS__)
+/* Each takes its name from `e`, which every call site has in scope. */
+#define ENG_LOG(fmt, ...)   os_log(engine_log(), "%{public}s: " fmt, engine_name(e), ##__VA_ARGS__)
+#define ENG_ERR(fmt, ...)   os_log_error(engine_log(), "%{public}s: " fmt, engine_name(e), ##__VA_ARGS__)
+#define ENG_DEBUG(fmt, ...) os_log_debug(engine_log(), "%{public}s: " fmt, engine_name(e), ##__VA_ARGS__)
 
 /* Rebuild attempts before the engine gives up and says so. Six with the
  * backoff below spans about eight seconds, which covers a hub renegotiating or
@@ -707,17 +746,14 @@ static bool fault_should_fail(Engine* e)
  * needed to. */
 
 
-/* Stage 1 keeps exactly one instance, but it is reached only through a handle
- * and owns all of its own state, so a second device is a second create() call
- * rather than a second copy of the driver. */
-static Engine gTheEngine;
-static bool   gTheEngineTaken;
 
 EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id)
 {
-    if (gTheEngineTaken) return NULL;
-    Engine* e = &gTheEngine;
-    memset(e, 0, sizeof *e);
+    /* One allocation per attached unit. The Engine owns every piece of state
+     * a stream needs, so two of them are two independent transports sharing
+     * nothing but the hot-plug watch. */
+    Engine* e = calloc(1, sizeof *e);
+    if (!e) return NULL;
     e->unit_product_id  = product_id;
     e->unit_location_id = location_id;
     pthread_mutex_init(&e->lifecycle_lock, NULL);
@@ -734,7 +770,6 @@ EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id)
     e->requested_rate = 48000;
     e->safety_us = 10000;
     e->with_input = true;
-    gTheEngineTaken = true;
     return e;
 }
 
@@ -746,7 +781,7 @@ void emu_engine_destroy(EmuEngine* e)
     pthread_mutex_destroy(&e->stats_lock);
     pthread_mutex_destroy(&e->start_lock);
     pthread_cond_destroy(&e->start_cond);
-    gTheEngineTaken = false;
+    free(e);
 }
 static void bind_reset(Engine* e)
 {
@@ -1464,7 +1499,7 @@ static void reschedule(Engine* e)
     if ((*e->out_intf)->GetBusFrameNumber(e->out_intf, &now, &at) != kIOReturnSuccess) {
         return;
     }
-    uint64_t start = now + SCHEDULE_LEAD_MS;
+    uint64_t start = now + (e->schedule_lead_ms ? e->schedule_lead_ms : SCHEDULE_LEAD_MS);
     bool rebuilt = false;
 
     /* The feedback pipe carries no audio and holds no cursor, so a stale
@@ -1820,6 +1855,18 @@ static bool select_alt(IOUSBInterfaceInterface500** intf, const EmuDeviceModel* 
  * teardown cannot double-free, while every counter and the timeline position
  * carry across untouched.
  */
+static const char* engine_name(const Engine* e)
+{
+    if (e) {
+        if (e->identity) return e->identity->name;
+        if (e->unit_product_id) {
+            const EmuDeviceIdentity* id = emu_device_for_product(e->unit_product_id);
+            if (id) return id->name;
+        }
+    }
+    return "E-MU device";
+}
+
 static void clear_resources(Engine* e)
 {
     e->identity = NULL;
@@ -2016,47 +2063,51 @@ static SessionEnd stream_session(Engine* e, bool announced)
     e->sample_rate = e->requested_rate;
     bind_reset(e);
 
-#define ENGINE_FAIL() do { teardown(e); return kSessionSetupFailed; } while (0)
+/* Setup has a dozen ways to fail and used to report one message for all of
+ * them ("stream did not come up"), which says nothing about where to look.
+ * Each site now names itself. */
+#define ENGINE_FAIL(why) do { ENG_ERR("setup failed: %{public}s", (why)); \
+                              teardown(e); return kSessionSetupFailed; } while (0)
 
     e->feedback = emu_feedback_init(e->feedback_storage);
-    if (!e->feedback) ENGINE_FAIL();
+    if (!e->feedback) ENGINE_FAIL("feedback queue would not initialise");
 
-    if (!open_device(e)) ENGINE_FAIL();
+    if (!open_device(e)) ENGINE_FAIL("could not open the USB device");
 
     IOUSBConfigurationDescriptorPtr cfg = NULL;
     EmuDeviceModel model;
     if ((*e->device)->GetConfigurationDescriptorPtr(e->device, 0, &cfg) != kIOReturnSuccess ||
         emu_parse_config_descriptor((const uint8_t*)cfg,
                                     OSSwapLittleToHostInt16(cfg->wTotalLength), &model) != 0) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2030");
     }
 
-    if (!set_clock_rate(e, &model, e->requested_rate)) ENGINE_FAIL();
+    if (!set_clock_rate(e, &model, e->requested_rate)) ENGINE_FAIL("device would not take the sample rate");
 
-    if (!emu_find_interface(e->device, 1, &e->out_intf)) ENGINE_FAIL();
-    if (e->with_input && !emu_find_interface(e->device, 2, &e->in_intf)) ENGINE_FAIL();
+    if (!emu_find_interface(e->device, 1, &e->out_intf)) ENGINE_FAIL("no playback interface");
+    if (e->with_input && !emu_find_interface(e->device, 2, &e->in_intf)) ENGINE_FAIL("no capture interface");
 
     if ((*e->out_intf)->USBInterfaceOpen(e->out_intf) != kIOReturnSuccess) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2039");
     }
     if (e->in_intf && (*e->in_intf)->USBInterfaceOpen(e->in_intf) != kIOReturnSuccess) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2042");
     }
 
     /* Interface 2 stays at alternate setting 0 when it is not opened: no
      * bandwidth reserved for it, and no IN transaction on the bus. */
     const EmuAltSetting *out_alt = NULL, *in_alt = NULL;
-    if (!select_alt(e->out_intf, &model, 1, e->requested_rate, &out_alt)) ENGINE_FAIL();
+    if (!select_alt(e->out_intf, &model, 1, e->requested_rate, &out_alt)) ENGINE_FAIL("no playback alt setting for this rate");
     if (e->in_intf && !select_alt(e->in_intf, &model, 2, e->requested_rate, &in_alt)) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2050");
     }
 
     if (!emu_find_isoc_pipe(e->out_intf, kUSBOut, &e->out_pipe, &e->out_max)) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2054");
     }
     if (e->in_intf &&
         !emu_find_isoc_pipe(e->in_intf, kUSBIn, &e->in_pipe, &e->in_max)) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2058");
     }
     /* The only isochronous IN pipe on the playback interface is the explicit
      * feedback endpoint. Its absence is not a failure: the transport does not
@@ -2097,11 +2148,11 @@ static SessionEnd stream_session(Engine* e, bool announced)
 
     CFRunLoopSourceRef in_source = NULL, out_source = NULL;
     if ((*e->out_intf)->CreateInterfaceAsyncEventSource(e->out_intf, &out_source) != kIOReturnSuccess) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2099");
     }
     if (e->in_intf &&
         (*e->in_intf)->CreateInterfaceAsyncEventSource(e->in_intf, &in_source) != kIOReturnSuccess) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2103");
     }
     e->run_loop = CFRunLoopGetCurrent();
     if (in_source) CFRunLoopAddSource(e->run_loop, in_source, kCFRunLoopDefaultMode);
@@ -2115,14 +2166,14 @@ static SessionEnd stream_session(Engine* e, bool announced)
                 (UInt32)e->entries_per_request * e->out_max, kUSBLowLatencyWriteBuffer) != kIOReturnSuccess ||
             (*e->out_intf)->LowLatencyCreateBuffer(e->out_intf, (void**)&e->out_requests[i].frames,
                 list_bytes, kUSBLowLatencyFrameListBuffer) != kIOReturnSuccess) {
-            ENGINE_FAIL();
+            ENGINE_FAIL("setup step near line 2117");
         }
         if (e->in_intf &&
             ((*e->in_intf)->LowLatencyCreateBuffer(e->in_intf, &e->in_requests[i].buffer,
                 (UInt32)e->entries_per_request * e->in_max, kUSBLowLatencyReadBuffer) != kIOReturnSuccess ||
              (*e->in_intf)->LowLatencyCreateBuffer(e->in_intf, (void**)&e->in_requests[i].frames,
                 list_bytes, kUSBLowLatencyFrameListBuffer) != kIOReturnSuccess)) {
-            ENGINE_FAIL();
+            ENGINE_FAIL("setup step near line 2124");
         }
     }
     for (uint32_t i = 0; i < e->fb_num_requests; i++) {
@@ -2145,11 +2196,22 @@ static SessionEnd stream_session(Engine* e, bool announced)
     UInt64 now = 0;
     AbsoluteTime at;
     if ((*e->out_intf)->GetBusFrameNumber(e->out_intf, &now, &at) != kIOReturnSuccess) {
-        ENGINE_FAIL();
+        ENGINE_FAIL("setup step near line 2147");
     }
-    e->next_in_frame = now + SCHEDULE_LEAD_MS;
-    e->next_out_frame = now + SCHEDULE_LEAD_MS;
-    e->next_fb_frame = now + SCHEDULE_LEAD_MS;
+    /*
+     * The lead has to cover the time it takes to put the whole queue on the
+     * bus, not just one request. A deep schedule is scores of submissions --
+     * 81 requests at 48 kHz, so about 160 calls across both directions -- and
+     * with another engine setting up on the same bus at the same time, four
+     * milliseconds of lead elapses before the last of them lands. The first
+     * attempt keeps the old value, since it is enough on an idle bus and it is
+     * pure startup latency; a start that finds its schedule already gone
+     * doubles it and tries again.
+     */
+    if (e->schedule_lead_ms == 0) e->schedule_lead_ms = SCHEDULE_LEAD_MS;
+    e->next_in_frame = now + e->schedule_lead_ms;
+    e->next_out_frame = now + e->schedule_lead_ms;
+    e->next_fb_frame = now + e->schedule_lead_ms;
 
     /* The timeline starts here, and it starts *known*: sample 0 is the first
      * frame of the first packet, scheduled SCHEDULE_LEAD_MS bus frames ahead
@@ -2158,10 +2220,10 @@ static SessionEnd stream_session(Engine* e, bool announced)
      * means Core Audio's very first GetZeroTimeStamp is already on the
      * device's timeline -- there is no host-clock placeholder to splice away
      * from later, and a splice stalls the IO thread (FINDINGS). */
-    uint64_t start_host = abs_to_ticks(at) + SCHEDULE_LEAD_MS * e->ticks_per_ms;
+    uint64_t start_host = abs_to_ticks(at) + e->schedule_lead_ms * e->ticks_per_ms;
     e->ts_filter = emu_ts_filter_init(e->ts_filter_storage, start_host,
                                       REQUEST_MS * e->ticks_per_ms);
-    if (!e->ts_filter) ENGINE_FAIL();
+    if (!e->ts_filter) ENGINE_FAIL("timestamp filter would not initialise");
 
     /*
      * Resume on the timeline rather than restarting it.
@@ -2192,14 +2254,56 @@ static SessionEnd stream_session(Engine* e, bool announced)
      * through its whole first request. The first playback request is bound
      * by its submit; the rest are bound by the completion sweep as Core Audio
      * starts writing -- until then they are silence either way. */
-    bool submitted = true;
-    for (uint32_t i = 0; i < e->num_requests && submitted && e->in_intf; i++) {
-        submitted = submit_capture(&e->in_requests[i]) == kIOReturnSuccess;
+    /*
+     * Putting the queue on the bus, with one retry.
+     *
+     * kIOReturnIsoTooOld here means the schedule went stale while setup ran:
+     * the start frame is chosen before the clock is set and verified, the alt
+     * settings selected and the buffers allocated, and SCHEDULE_LEAD_MS of
+     * margin does not survive another engine doing all of that at the same
+     * time on the same bus. That is not a failure, it is a stale schedule --
+     * exactly what reschedule() exists for mid-stream -- so it is rebuilt from
+     * the current bus frame and tried once more.
+     *
+     * Without this, starting two devices together reliably lost whichever
+     * finished setup second.
+     */
+    IOReturn sub_kr = kIOReturnSuccess;
+    const char* sub_what = "capture";
+    for (int attempt = 0; attempt < 4; attempt++) {
+        sub_kr = kIOReturnSuccess;
+        sub_what = "capture";
+        for (uint32_t i = 0; i < e->num_requests && sub_kr == kIOReturnSuccess && e->in_intf; i++) {
+            sub_kr = submit_capture(&e->in_requests[i]);
+        }
+        if (sub_kr == kIOReturnSuccess) {
+            sub_what = "playback";
+            for (uint32_t i = 0; i < e->num_requests && sub_kr == kIOReturnSuccess; i++) {
+                sub_kr = submit_playback(&e->out_requests[i]);
+            }
+        }
+        if (sub_kr != kIOReturnIsoTooOld) break;
+
+        /* Take back whatever did go on the bus before rebuilding the
+         * schedule, so the retry starts from an empty queue. */
+        uint32_t lead = e->schedule_lead_ms * 4;
+        if (lead > 256) lead = 256;
+        ENG_LOG("schedule went stale during setup; lead %u -> %u ms, retrying",
+                e->schedule_lead_ms, lead);
+        e->schedule_lead_ms = lead;
+
+        (*e->out_intf)->AbortPipe(e->out_intf, e->out_pipe);
+        if (e->in_intf) (*e->in_intf)->AbortPipe(e->in_intf, e->in_pipe);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+        reschedule(e);
     }
-    for (uint32_t i = 0; i < e->num_requests && submitted; i++) {
-        submitted = submit_playback(&e->out_requests[i]) == kIOReturnSuccess;
-    }
-    if (!submitted) {
+    if (sub_kr != kIOReturnSuccess) {
+        /* The queue would not go on the bus. kIOReturnNoBandwidth here means
+         * the controller cannot reserve isochronous time for this schedule. */
+        ENG_ERR("setup failed: %{public}s queue would not submit (0x%08x)%{public}s",
+                sub_what, sub_kr,
+                sub_kr == kIOReturnNoBandwidth ? " -- no isochronous bandwidth" :
+                sub_kr == kIOReturnIsoTooOld   ? " -- schedule still stale after a rebuild" : "");
         teardown(e);
         return kSessionSetupFailed;
     }

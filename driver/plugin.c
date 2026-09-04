@@ -43,8 +43,17 @@ static os_log_t emu_log(void)
 
 /* Named for whatever is actually attached, not for the model this driver was
  * first written against. */
+/* Named for the device the message is about. Plug-in-wide messages have no
+ * device in hand and say so, rather than borrowing whichever name a shared
+ * global happened to hold -- with two published, that was always one of them
+ * and wrong for the other. */
+typedef struct Device Device;
+static const char* device_log_name(const Device* dev);
+
 #define EMU_LOG(fmt, ...) \
-    os_log(emu_log(), "%{public}s: " fmt, emu_engine_log_name(), ##__VA_ARGS__)
+    os_log(emu_log(), "%{public}s: " fmt, device_log_name(dev), ##__VA_ARGS__)
+#define EMU_LOG_PLUGIN(fmt, ...) \
+    os_log(emu_log(), "EMU driver: " fmt, ##__VA_ARGS__)
 
 /* --- object model --------------------------------------------------------
  *
@@ -257,7 +266,7 @@ typedef enum {
     kRole_Count
 } DeviceRole;
 
-typedef struct {
+struct Device {
     bool                     present;
     unsigned                 index;
     AudioObjectID            base;      /* first object ID of this device's block */
@@ -288,7 +297,7 @@ typedef struct {
     UInt64 resetCount;
     UInt64 timelineSeed;
     UInt64 periodCount;
-} Device;
+};
 
 static Device   gDevices[EMU_MAX_DEVICES];
 static unsigned gDeviceCount;
@@ -538,13 +547,149 @@ static ULONG ReleaseRef(void* driver)
  * runs on it -- StopIO, client removal -- happens on its own threads
  * afterwards, the same as for any device that goes away.
  */
+
+/* --- registry ------------------------------------------------------------
+ *
+ * The published set follows what is attached. A unit is matched to its slot by
+ * location: the port is what distinguishes two boxes of the same model, and it
+ * is stable for as long as the cable stays where it is, which is exactly the
+ * lifetime of the slot.
+ */
+
+/*
+ * A device's UID: the plug-in's prefix plus the unit's own serial.
+ *
+ * It has to identify the box, not the slot -- macOS remembers a user's chosen
+ * output device by UID across reboots, and a per-slot name would move the
+ * moment two devices were plugged in a different order. Both of these devices
+ * report a serial (E-MU-69-3F04-... and E-MU-C7-3F0A-...), which survives
+ * replugging and changing ports.
+ *
+ * Caller releases.
+ */
+static CFStringRef device_uid(const Device* dev)
+{
+    if (!dev || !dev->uid[0]) return NULL;
+    return CFStringCreateWithCString(NULL, dev->uid, kCFStringEncodingUTF8);
+}
+
+static const char* device_log_name(const Device* dev)
+{
+    if (dev && dev->identity) return dev->identity->name;
+    return "EMU driver";
+}
+
+static Device* slot_for_location(uint64_t location_id)
+{
+    for (unsigned i = 0; i < EMU_MAX_DEVICES; i++) {
+        if (gDevices[i].present && gDevices[i].unitLocationID == location_id) {
+            return &gDevices[i];
+        }
+    }
+    return NULL;
+}
+
+/* Bring a slot up for a newly seen unit. Its object IDs come out of its index,
+ * so slot 0 keeps the block the single-device build used. */
+static void device_adopt(Device* dev, unsigned index, const EmuUnit* unit)
+{
+    memset(dev, 0, sizeof *dev);
+    dev->index          = index;
+    dev->base           = DEVICE_OBJECT_BASE + index * DEVICE_OBJECT_STRIDE;
+    dev->identity       = unit->identity;
+    dev->unitProductID  = unit->identity->product_id;
+    dev->unitLocationID = unit->location_id;
+    snprintf(dev->uid, sizeof dev->uid, "%s.%s", DEVICE_UID, unit->serial);
+
+    dev->sampleRate     = 48000.0;
+    dev->policyRate     = 48000.0;
+    dev->inputActive    = true;
+    dev->outputActive   = true;
+    dev->inputMode      = kInputMode_On;
+    dev->clockSource    = kClockSource_Device;
+    dev->volumeScalar   = 1.0f;
+    dev->muted          = false;
+    dev->outputSafetyUS = OUTPUT_SAFETY_DEFAULT_US;
+    dev->timelineSeed   = 1;
+    atomic_init(&dev->deviceAlive, true);
+
+    dev->engine = emu_engine_create(dev->unitProductID, dev->unitLocationID);
+    if (dev->engine) {
+        /* The handler carries this slot, so a failure names the device it
+         * happened to rather than whichever was published first. */
+        emu_engine_set_failure_handler(dev->engine, engine_failed, dev);
+    }
+    if (dev->engine) {
+    
+    }
+    dev->present = true;
+}
+
+/* Take a slot down. The engine is stopped and freed outside the state lock,
+ * because stopping joins its thread. */
+static EmuEngine* device_retire_locked(Device* dev)
+{
+    EmuEngine* engine = dev->engine;
+    dev->present = false;
+    dev->engine  = NULL;
+    return engine;
+}
+
+/*
+ * Match the registry to the bus. Returns true if the published set changed, so
+ * the caller can tell Core Audio to re-read the device list.
+ */
+static bool reconcile_devices(void)
+{
+    EmuUnit units[EMU_MAX_DEVICES];
+    unsigned n = emu_enumerate_units(units, EMU_MAX_DEVICES);
+
+    EmuEngine* retired[EMU_MAX_DEVICES];
+    unsigned   retired_n = 0;
+    bool changed = false;
+
+    pthread_mutex_lock(&gStateMutex);
+
+    for (unsigned i = 0; i < EMU_MAX_DEVICES; i++) {
+        Device* dev = &gDevices[i];
+        if (!dev->present) continue;
+        bool still_there = false;
+        for (unsigned u = 0; u < n; u++) {
+            if (units[u].location_id == dev->unitLocationID) { still_there = true; break; }
+        }
+        if (!still_there) {
+            retired[retired_n++] = device_retire_locked(dev);
+            changed = true;
+        }
+    }
+
+    for (unsigned u = 0; u < n; u++) {
+        if (slot_for_location(units[u].location_id)) continue;
+        for (unsigned i = 0; i < EMU_MAX_DEVICES; i++) {
+            if (gDevices[i].present) continue;
+            device_adopt(&gDevices[i], i, &units[u]);
+            changed = true;
+            break;
+        }
+    }
+
+    unsigned count = 0;
+    for (unsigned i = 0; i < EMU_MAX_DEVICES; i++) if (gDevices[i].present) count++;
+    gDeviceCount = count;
+
+    pthread_mutex_unlock(&gStateMutex);
+
+    /* Outside the lock: stop joins the engine thread, and that thread may be
+     * inside a callback that wants the same lock. */
+    for (unsigned i = 0; i < retired_n; i++) emu_engine_destroy(retired[i]);
+
+    return changed;
+}
+
 static void device_presence_changed(void)
 {
-    /* Stage 3: these fire from the hot-plug observer and the input-mode
-     * setter, neither of which names a device yet. With several published
-     * they have to notify each one, not just the first. */
-    Device* dev = &gDevices[0];
     if (!gHost) return;
+    reconcile_devices();
 
     AudioObjectPropertyAddress list[] = {
         { kAudioPlugInPropertyDeviceList,
@@ -554,60 +699,24 @@ static void device_presence_changed(void)
     };
     gHost->PropertiesChanged(gHost, kObjectID_PlugIn, 2, list);
 
-    if (emu_engine_device_attached()) {
-        /* The name follows whichever member of the family is attached, and a
-         * device Core Audio keeps across a swap is not re-queried unasked. */
-        AudioObjectPropertyAddress name = {
-            kAudioObjectPropertyName,
-            kAudioObjectPropertyScopeGlobal,
-            kAudioObjectPropertyElementMain,
-        };
+    /* Each published device is told separately: a device Core Audio keeps
+     * across a change is not re-queried unasked, and with several of them the
+     * first one's notification says nothing about the rest. */
+    AudioObjectPropertyAddress name = {
+        kAudioObjectPropertyName,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    };
+    for (unsigned i = 0; i < EMU_MAX_DEVICES; i++) {
+        Device* dev = &gDevices[i];
+        if (!dev->present) continue;
         gHost->PropertiesChanged(gHost, device_object(dev, kRole_Device), 1, &name);
-        EMU_LOG("device attached: publishing %{public}s", emu_engine_device_name());
-    } else {
-        EMU_LOG("device detached: withdrawn from Core Audio");
     }
+    EMU_LOG_PLUGIN("device set changed: %u published", gDeviceCount);
 }
 
 static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef host)
 {
-    /* Register the one device this stage publishes. Its object IDs come out
-     * of the same arithmetic every device will use, so slot 0 lands on exactly
-     * the IDs the fixed enum used to name and nothing a client has cached
-     * changes. */
-    Device* dev = &gDevices[0];
-    memset(dev, 0, sizeof *dev);
-    dev->present     = true;
-    dev->index       = 0;
-    dev->base        = DEVICE_OBJECT_BASE;
-    dev->sampleRate  = 48000.0;
-    dev->policyRate  = 48000.0;
-    dev->inputActive = true;
-    dev->outputActive = true;
-    dev->inputMode   = kInputMode_On;
-    dev->clockSource = kClockSource_Device;
-    dev->volumeScalar = 1.0f;
-    dev->muted       = false;
-    dev->outputSafetyUS = OUTPUT_SAFETY_DEFAULT_US;
-    dev->timelineSeed = 1;
-    atomic_init(&dev->deviceAlive, true);
-
-    /* Bind the slot to a physical unit. One device is still published, but it
-     * is now a *named* one: the engine opens that port rather than whichever
-     * box of that model the registry happens to return first. */
-    EmuUnit units[EMU_MAX_DEVICES];
-    unsigned found = emu_enumerate_units(units, EMU_MAX_DEVICES);
-    unsigned pick = 0;
-    for (unsigned u = 0; u < found; u++) {
-        if (units[u].identity->product_id == EMU_DEFAULT_PRODUCT_ID) { pick = u; break; }
-    }
-    if (found > 0) {
-        dev->identity       = units[pick].identity;
-        dev->unitProductID  = units[pick].identity->product_id;
-        dev->unitLocationID = units[pick].location_id;
-        snprintf(dev->uid, sizeof dev->uid, "%s.%s", DEVICE_UID, units[pick].serial);
-    }
-    gDeviceCount = 1;
 
     (void)driver;
     gHost = host;
@@ -619,24 +728,19 @@ static OSStatus Initialize(AudioServerPlugInDriverRef driver, AudioServerPlugInH
          * Failing here puts the reason in the log next to the HAL's own
          * complaint, rather than leaving a plug-in that looks fine and lists
          * nothing. */
-        EMU_LOG("initialize failed: could not arm the hot-plug watch "
+        EMU_LOG_PLUGIN("initialize failed: could not arm the hot-plug watch "
                 "(IOKit notification port or matching notification), "
                 "so no device will be published");
         gHost = NULL;
         return kAudioHardwareUnspecifiedError;
     }
-    dev->engine = emu_engine_create(dev->unitProductID, dev->unitLocationID);
-    if (!dev->engine) {
-        EMU_LOG("initialize failed: could not create the USB transport");
-        gHost = NULL;
-        return kAudioHardwareUnspecifiedError;
-    }
-    emu_engine_set_failure_handler(dev->engine, engine_failed, dev);
-    if (emu_engine_device_attached()) {
-        EMU_LOG("initialized, publishing %{public}s at %{public}.0f Hz",
-                emu_engine_device_name(), dev->sampleRate);
+    /* Publish whatever is attached right now; the observer keeps it matched
+     * from here on. */
+    reconcile_devices();
+    if (gDeviceCount > 0) {
+        EMU_LOG_PLUGIN("initialized, publishing %u device(s)", gDeviceCount);
     } else {
-        EMU_LOG("initialized, no device attached: publishing nothing until one is");
+        EMU_LOG_PLUGIN("initialized, no device attached: publishing nothing until one is");
     }
     return kAudioHardwareNoError;
 }
@@ -1020,7 +1124,7 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
 
         case kAudioObjectPropertyOwnedObjects:
             if (object == kObjectID_PlugIn) {
-                *outSize = emu_engine_device_attached() ? sizeof(AudioObjectID) : 0;
+                *outSize = gDeviceCount * sizeof(AudioObjectID);
             } else if ((dev && role_ == kRole_Device)) {
                 UInt32 n = stream_count(dev, address->mScope);
                 if (stream_matches_scope(dev, device_object(dev, kRole_StreamOutput), address->mScope)) n += 2;
@@ -1029,7 +1133,7 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             return kAudioHardwareNoError;
 
         case kAudioPlugInPropertyDeviceList:
-            *outSize = emu_engine_device_attached() ? sizeof(AudioObjectID) : 0;
+            *outSize = gDeviceCount * sizeof(AudioObjectID);
             return kAudioHardwareNoError;
 
         case kAudioDevicePropertyStreams:
@@ -1123,25 +1227,39 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             /* The device list is where presence is expressed: one device
              * while hardware is attached, none otherwise. See
              * device_presence_changed for how Core Audio learns it moved. */
+            /* The device list is where presence is expressed: one entry per
+             * attached unit, none when nothing is plugged in. See
+             * device_presence_changed for how Core Audio learns it moved. */
             case kAudioObjectPropertyOwnedObjects:
-            case kAudioPlugInPropertyDeviceList:
-                if (!emu_engine_device_attached() || dataSize < sizeof(AudioObjectID)) {
-                    *outSize = 0;
-                    return kAudioHardwareNoError;
+            case kAudioPlugInPropertyDeviceList: {
+                AudioObjectID* ids = (AudioObjectID*)outData;
+                UInt32 capacity = dataSize / (UInt32)sizeof(AudioObjectID);
+                UInt32 n = 0;
+                for (unsigned i = 0; i < EMU_MAX_DEVICES && n < capacity; i++) {
+                    if (!gDevices[i].present) continue;
+                    ids[n++] = device_object(&gDevices[i], kRole_Device);
                 }
-                *(AudioObjectID*)outData = device_object(&gDevices[0], kRole_Device);
-                *outSize = sizeof(AudioObjectID);
+                *outSize = n * sizeof(AudioObjectID);
                 return kAudioHardwareNoError;
+            }
 
             case kAudioPlugInPropertyTranslateUIDToDevice: {
                 if (qualifierSize != sizeof(CFStringRef) || !qualifier) {
                     return kAudioHardwareIllegalOperationError;
                 }
                 CFStringRef uid = *(const CFStringRef*)qualifier;
-                *(AudioObjectID*)outData =
-                    (emu_engine_device_attached() && uid &&
-                     CFStringCompare(uid, CFSTR(DEVICE_UID), 0) == kCFCompareEqualTo)
-                        ? device_object(&gDevices[0], kRole_Device) : kAudioObjectUnknown;
+                AudioObjectID match = kAudioObjectUnknown;
+                for (unsigned i = 0; uid && i < EMU_MAX_DEVICES; i++) {
+                    Device* cand = &gDevices[i];
+                    if (!cand->present) continue;
+                    CFStringRef own = device_uid(cand);
+                    if (own && CFStringCompare(uid, own, 0) == kCFCompareEqualTo) {
+                        match = device_object(cand, kRole_Device);
+                    }
+                    if (own) CFRelease(own);
+                    if (match != kAudioObjectUnknown) break;
+                }
+                *(AudioObjectID*)outData = match;
                 *outSize = sizeof(AudioObjectID);
                 return kAudioHardwareNoError;
             }
@@ -1154,10 +1272,24 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
             case kAudioObjectPropertyBaseClass: RETURN_U32(kAudioObjectClassID);
             case kAudioObjectPropertyClass:     RETURN_U32(kAudioDeviceClassID);
             case kAudioObjectPropertyOwner:     RETURN_U32(kObjectID_PlugIn);
-            case kAudioObjectPropertyName:         RETURN_CFSTR_UTF8(emu_engine_device_name());
+            /* This device's own model, not "whatever is attached": with two
+             * published, the global answer would name them both the same. */
+            case kAudioObjectPropertyName:
+                RETURN_CFSTR_UTF8(dev->identity ? dev->identity->name
+                                                : emu_engine_device_name());
             case kAudioObjectPropertyManufacturer: RETURN_CFSTR(DEVICE_MANUFACTURER);
-            case kAudioDevicePropertyDeviceUID:    RETURN_CFSTR(DEVICE_UID);
-            case kAudioDevicePropertyModelUID:     RETURN_CFSTR(DEVICE_UID ".model");
+            case kAudioDevicePropertyDeviceUID: {
+                CFStringRef uid = device_uid(dev);
+                if (!uid) return kAudioHardwareUnspecifiedError;
+                *(CFStringRef*)outData = uid;      /* caller owns it */
+                *outSize = sizeof(CFStringRef);
+                return kAudioHardwareNoError;
+            }
+            /* The model is the same for every unit of a family, which is what
+             * kAudioDevicePropertyModelUID means: it groups devices, it does
+             * not name one. */
+            case kAudioDevicePropertyModelUID:
+                RETURN_CFSTR_UTF8(dev->identity ? dev->identity->name : DEVICE_UID ".model");
 
             case kAudioDevicePropertyTransportType: RETURN_U32(kAudioDeviceTransportTypeUSB);
             case kAudioDevicePropertyClockDomain:   RETURN_U32(0);
