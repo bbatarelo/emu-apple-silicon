@@ -182,8 +182,9 @@ static bool usb_attach(void)
                                     OSSwapLittleToHostInt16(cfg->wTotalLength),
                                     &model) != 0 ||
         model.midi_interface == 0xff) {
-        /* A Tracker Pre lands here: MIDI ports on the box, nothing in the
-         * descriptors to drive them with. */
+        /* A Tracker Pre lands here: no MIDI connectors on the box and no
+         * MIDI-streaming interface in its descriptors -- nothing to publish,
+         * which is correct rather than a failure. */
         EMU_LOG("%{public}s has no MIDI-streaming interface", gIdentity->name);
         (*dev)->Release(dev);
         return false;

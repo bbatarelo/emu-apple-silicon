@@ -348,8 +348,8 @@ truncated format descriptor and the whole configuration was rejected with
 "not control".** Interfaces that are neither `0x01` nor `0x02` contribute no alt
 settings and their class-specific descriptors are skipped.
 
-The Tracker Pre has MIDI ports on the box but no MIDI-streaming interface in its
-descriptors, which is why this went unnoticed.
+The Tracker Pre has neither: no DIN connectors on the chassis, and no
+MIDI-streaming interface in its descriptors, which is why this went unnoticed.
 
 The interface itself is ordinary USB-MIDI 1.0, unlike the audio side: one
 embedded jack each way on **bulk** endpoints `0x05` OUT and `0x85` IN, with a

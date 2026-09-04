@@ -143,7 +143,7 @@ pub struct DeviceModel {
     pub status_endpoint: u8,
 
     /// MIDI-streaming interface, 0xff when the device has none. The 0404 USB
-    /// has one; the Tracker Pre has MIDI ports on the box but nothing in its
+    /// has one; the Tracker Pre has no MIDI connectors and nothing in its
     /// descriptors.
     pub midi_interface: u8,
     /// Bulk endpoints of the MIDI interface, 0 when absent.

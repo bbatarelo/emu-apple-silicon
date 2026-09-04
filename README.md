@@ -241,9 +241,9 @@ it. See `docs/FINDINGS.md`.
 
 Not done:
 
-- MIDI on the Tracker Pre. It has DIN ports on the box but advertises no
-  MIDI-streaming interface, so how to reach them is still unknown. The 0404's
-  MIDI works.
+- MIDI on the Tracker Pre — but there is nothing to do. It has no DIN
+  connectors on the chassis and advertises no MIDI-streaming interface, so
+  there is no port to reach. The 0404 has both, and its MIDI works.
 - The devices' own controls — pad, phantom power, direct monitoring, and the
   0404's S/PDIF — are not exposed. The Tracker Pre advertises only one extension
   unit, so some may not be reachable; the 0404 has three more that nothing reads
