@@ -443,10 +443,16 @@ the engines touch.
 - `device_for_object` reads a slot's `present` flag without the state lock that
   `reconcile_devices` writes it under. Not observed to bite, including through
   mid-stream removal, but it is a race and should be closed.
-- **The MIDI driver is still single-device.** `midi-driver/plugin.c` opens
-  `emu_find_device(EMU_DEFAULT_PRODUCT_ID)`, so with two units attached it
-  publishes MIDI endpoints for the preferred one only. The audio side was
-  converted; the MIDI side was written before this and has not been.
+- **The MIDI driver publishes one device.** It scans the attached units and
+  takes the first with a MIDI-streaming interface (`open_midi_capable`), so a
+  mixed set works, but a second MIDI-capable unit is not published. The audio
+  side was converted to a registry; the MIDI side has not been.
+
+  It used to ask for `EMU_DEFAULT_PRODUCT_ID` instead, which is a question
+  about audio: with a Tracker Pre attached it got a device with no MIDI at all
+  and published *nothing*, while a 0404's MIDI sat unused beside it. "Which
+  device does the user prefer" and "which device has the interface I need" are
+  different questions.
 
 ## The MIDI driver
 

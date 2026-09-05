@@ -870,6 +870,47 @@ disconnected cable identically to a broken driver, and only the driver's own
 counters (`framesToOutput == framesBound`, zero faults) told them apart.
 
 
+### A MIDI driver must look for MIDI, not for the favourite device
+
+`midi-driver` asked `emu_find_device(EMU_DEFAULT_PRODUCT_ID)` for its hardware.
+That constant answers a question about *audio* -- which model to publish when
+several are attached -- and the answer can be a device with no MIDI at all.
+
+With a Tracker Pre and a 0404 both plugged in, it returned the Tracker Pre,
+found no MIDI-streaming interface, and published nothing. The 0404's MIDI was
+present and working the whole time; applications simply saw no E-MU MIDI ports,
+with one line in the log to say why:
+
+    EMUMIDI: E-MU Tracker Pre has no MIDI-streaming interface
+
+It now scans the attached units and takes the first that actually has the
+interface. A device without one is skipped rather than treated as a failure,
+which is the normal case for a Tracker Pre.
+
+The general shape is worth keeping: a component should select hardware by the
+capability it needs, not by a preference expressed for something else. The
+preferred-product idea is meaningful only to the audio side.
+
+
+### Verifying MIDI needs a second interface, not a loopback
+
+A DIN cable from the device's MIDI OUT back to its own MIDI IN tests the cable
+and the codec, but both ends are this driver: a symmetric bug in the packet
+encoder and decoder would cancel out and read as success.
+
+Running the cable to a *different* interface removes that. Bytes leave through
+this driver, cross real DIN wiring, and return through another vendor's driver,
+so the two ends share nothing. Measured that way in both directions -- note
+on/off, control change, program change (a two-byte message, a different code
+index number), pitch bend and a SysEx transfer -- the stream is byte-for-byte
+identical.
+
+One caution: the first exchange after connecting can carry stray bytes that
+were already in flight, and a stray status byte makes the *next* message decode
+under running status, which looks like corruption of a message that was
+actually fine. Discard the first run; it is not a fault.
+
+
 ---
 
 ## Open questions

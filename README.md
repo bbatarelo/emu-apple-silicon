@@ -141,9 +141,10 @@ stop there.
 
 Up to `EMU_MAX_DEVICES` (4) are published. A fifth is ignored.
 
-**MIDI is still single-device**: with two units attached, MIDI endpoints appear
-for the preferred one only (`EMU_DEFAULT_PRODUCT_ID` in `shared/device.h`).
-Audio is unaffected.
+**MIDI publishes one device**: the first attached unit that actually has a
+MIDI-streaming interface. Mixed sets are handled — a Tracker Pre alongside a
+0404 gives you the 0404's MIDI — but two MIDI-capable units would still yield
+only the first. Audio is unaffected either way.
 
 ### Device names, and a one-time change
 
@@ -218,7 +219,9 @@ More in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 Working: playback, capture, all six sample rates, master volume and mute,
 correct channel mapping, clock tracking anchored to the device, latency
 reported from a loopback measurement, and MIDI in and out on the 0404 USB —
-verified byte-for-byte through a DIN loopback cable.
+verified byte-for-byte in both directions against a separate USB-MIDI interface
+over a DIN cable, covering note on/off, control and program change, pitch bend
+and SysEx.
 
 Several devices at once: two interfaces publish separately and stream together
 at 192 kHz, each with exact frame accounting. Unplugging one mid-stream leaves
@@ -249,8 +252,8 @@ Not done:
   unit, so some may not be reachable; the 0404 has three more that nothing reads
   yet.
 - Stereo only. The 0404 also offers four-channel modes, which are ignored.
-- MIDI is single-device: with two units attached, endpoints appear for the
-  preferred one only.
+- MIDI on more than one device at a time. The driver picks the first unit
+    that has a MIDI interface; a second MIDI-capable unit is not published.
 - More than four devices at once. A fifth is ignored silently.
 - The 0202 USB is untested.
 

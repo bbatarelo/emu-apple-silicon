@@ -152,43 +152,76 @@ static void usb_detach(void)
     pthread_mutex_unlock(&gUsbLock);
 }
 
+/*
+ * Find an attached unit that actually has MIDI, and open its device.
+ *
+ * Deliberately not "the preferred product": that is a question about audio,
+ * and the answer to it can be a device with no MIDI at all. With a Tracker Pre
+ * and a 0404 both attached, asking for the preferred product returned the
+ * Tracker Pre, which has no MIDI-streaming interface, and the driver published
+ * nothing -- while the 0404's MIDI sat there unused. What this driver wants is
+ * not the favourite device, it is a device with the interface it needs.
+ *
+ * Descriptors are readable without opening the device, which matters: opening
+ * it would collide with the audio driver's clock requests.
+ */
+static IOUSBDeviceInterface500** open_midi_capable(const EmuDeviceIdentity** out_id,
+                                                   EmuDeviceModel* out_model)
+{
+    EmuUnit units[8];
+    unsigned n = emu_enumerate_units(units, 8);
+    unsigned skipped = 0;
+
+    for (unsigned i = 0; i < n; i++) {
+        io_service_t service = emu_find_unit(units[i].identity->product_id,
+                                             units[i].location_id);
+        if (!service) continue;
+
+        IOCFPlugInInterface** plugin = NULL;
+        SInt32 score = 0;
+        kern_return_t kr = IOCreatePlugInInterfaceForService(
+            service, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID, &plugin, &score);
+        IOObjectRelease(service);
+        if (kr != KERN_SUCCESS || !plugin) continue;
+
+        IOUSBDeviceInterface500** dev = NULL;
+        HRESULT hr = (*plugin)->QueryInterface(plugin,
+                        CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID500), (LPVOID*)&dev);
+        (*plugin)->Release(plugin);
+        if (hr || !dev) continue;
+
+        IOUSBConfigurationDescriptorPtr cfg = NULL;
+        if ((*dev)->GetConfigurationDescriptorPtr(dev, 0, &cfg) == kIOReturnSuccess &&
+            emu_parse_config_descriptor((const uint8_t*)cfg,
+                                        OSSwapLittleToHostInt16(cfg->wTotalLength),
+                                        out_model) == 0 &&
+            out_model->midi_interface != 0xff) {
+            *out_id = units[i].identity;
+            return dev;
+        }
+
+        /* No MIDI on this one. Not a failure -- the Tracker Pre has neither
+         * connectors nor an interface -- so try the next unit. */
+        skipped++;
+        (*dev)->Release(dev);
+    }
+
+    if (n == 0) {
+        EMU_LOG("no E-MU device attached");
+    } else {
+        EMU_LOG("none of the %u attached device(s) has a MIDI-streaming interface"
+                " (%u without one)", n, skipped);
+    }
+    return NULL;
+}
+
 static bool usb_attach(void)
 {
     if (gIntf) return true;
 
-    io_service_t service = IO_OBJECT_NULL;
-    gIdentity = emu_find_device(EMU_DEFAULT_PRODUCT_ID, &service);
-    if (!gIdentity) return false;
-
-    IOCFPlugInInterface** plugin = NULL;
-    SInt32 score = 0;
-    kern_return_t kr = IOCreatePlugInInterfaceForService(
-        service, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID, &plugin, &score);
-    IOObjectRelease(service);
-    if (kr != KERN_SUCCESS || !plugin) return false;
-
-    IOUSBDeviceInterface500** dev = NULL;
-    HRESULT hr = (*plugin)->QueryInterface(plugin,
-                    CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID500), (LPVOID*)&dev);
-    (*plugin)->Release(plugin);
-    if (hr || !dev) return false;
-
-    /* Descriptors are readable without opening the device, which matters:
-     * opening it would collide with the audio driver's clock requests. */
-    IOUSBConfigurationDescriptorPtr cfg = NULL;
     EmuDeviceModel model;
-    if ((*dev)->GetConfigurationDescriptorPtr(dev, 0, &cfg) != kIOReturnSuccess ||
-        emu_parse_config_descriptor((const uint8_t*)cfg,
-                                    OSSwapLittleToHostInt16(cfg->wTotalLength),
-                                    &model) != 0 ||
-        model.midi_interface == 0xff) {
-        /* A Tracker Pre lands here: no MIDI connectors on the box and no
-         * MIDI-streaming interface in its descriptors -- nothing to publish,
-         * which is correct rather than a failure. */
-        EMU_LOG("%{public}s has no MIDI-streaming interface", gIdentity->name);
-        (*dev)->Release(dev);
-        return false;
-    }
+    IOUSBDeviceInterface500** dev = open_midi_capable(&gIdentity, &model);
+    if (!dev) return false;
 
     IOUSBInterfaceInterface500** intf = NULL;
     if (!emu_find_interface(dev, model.midi_interface, &intf)) {
