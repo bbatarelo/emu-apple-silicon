@@ -5,6 +5,8 @@
 #   make uninstall  remove it           (asks for your password)
 #   make check      show what the driver is doing
 #   make record     record 5 seconds and report what arrived
+#   make version    the version this tree builds
+#   make version-check  VERSION, README badge and tag agree
 #   make test       run the test suite (no hardware needed)
 #   make test-recovery  fault-inject the driver and check it recovers
 #   make test-recovery  fault-inject the running driver and check it recovers
@@ -23,13 +25,44 @@ MIDI_INSTALL_DIR := /Library/Audio/MIDI Drivers
 CORE       := rust/emu-ca0189
 CORE_LIB   := $(CORE)/target/release/libemu_ca0189.a
 
-CFLAGS  := -std=c17 -Wall -Wextra -O2
+# One source of truth for the version. VERSION is the release; the git revision
+# distinguishes a build from that tag from a working tree that has moved on,
+# which "0.1.0" alone cannot. Both reach the code as defines and both bundles'
+# Info.plist as substitutions, so nothing can report a version the build did
+# not actually produce.
+VERSION := $(shell cat VERSION)
+GITREV  := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell \
+             git diff --quiet 2>/dev/null || echo -dirty)
+
+CFLAGS  := -std=c17 -Wall -Wextra -O2 \
+           -DEMU_VERSION=\"$(VERSION)\" -DEMU_GITREV=\"$(GITREV)\"
 FRAMEWORKS := -framework CoreFoundation -framework CoreAudio -framework IOKit
 AUDIO_FRAMEWORKS := -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
 
-.PHONY: test-recovery all driver midi-driver tools install uninstall uninstall-midi check record loopback test clean help
+.PHONY: version version-check test-recovery all driver midi-driver tools install uninstall uninstall-midi check record loopback test clean help
 
 all: driver midi-driver tools
+
+version:
+	@echo "$(VERSION) (git $(GITREV))"
+
+# Keeps the places a version is written from drifting apart. VERSION and the
+# README badge are both in the tree and must agree -- there is no excuse for
+# those differing. The tag is reported rather than enforced, because it is
+# created at the merge, after the bump.
+version-check:
+	@badge=$$(sed -n 's/.*badge\/version-\([0-9][^-]*\)-.*/\1/p' README.md | head -1); \
+	if [ "$$badge" != "$(VERSION)" ]; then \
+	    echo "VERSION is $(VERSION) but the README badge says $${badge:-none}" >&2; \
+	    echo "  update the badge at the top of README.md" >&2; \
+	    exit 1; \
+	fi; \
+	echo "VERSION and README badge agree: $(VERSION)"; \
+	if git rev-parse "v$(VERSION)" >/dev/null 2>&1; then \
+	    echo "tag v$(VERSION) exists"; \
+	else \
+	    echo "tag v$(VERSION) not created yet -- tag it on the merge commit"; \
+	fi
 
 help:
 	@sed -n '2,12p' Makefile | sed 's/^# \?//'
@@ -50,7 +83,8 @@ $(BUNDLE): driver/*.c driver/*.h driver/Info.plist shared/*.c shared/*.h $(CORE_
 	@echo "building the driver"
 	@rm -rf $(BUNDLE)
 	@mkdir -p $(BUNDLE)/Contents/MacOS
-	@cp driver/Info.plist $(BUNDLE)/Contents/Info.plist
+	@sed -e 's/@VERSION@/$(VERSION)/g' -e 's/@GITREV@/$(GITREV)/g' \
+	     driver/Info.plist > $(BUNDLE)/Contents/Info.plist
 	@clang -bundle $(CFLAGS) -mmacosx-version-min=14.0 \
 	    -o $(BUNDLE)/Contents/MacOS/EMUTrackerPre \
 	    driver/plugin.c driver/usb_engine.c shared/usb_util.c $(CORE_LIB) \
@@ -64,7 +98,8 @@ $(MIDI_BUNDLE): midi-driver/*.c midi-driver/Info.plist shared/*.c shared/*.h $(C
 	@echo "building the MIDI driver"
 	@rm -rf $(MIDI_BUNDLE)
 	@mkdir -p $(MIDI_BUNDLE)/Contents/MacOS
-	@cp midi-driver/Info.plist $(MIDI_BUNDLE)/Contents/Info.plist
+	@sed -e 's/@VERSION@/$(VERSION)/g' -e 's/@GITREV@/$(GITREV)/g' \
+	     midi-driver/Info.plist > $(MIDI_BUNDLE)/Contents/Info.plist
 	@clang -bundle $(CFLAGS) -mmacosx-version-min=14.0 \
 	    -o $(MIDI_BUNDLE)/Contents/MacOS/EMUMIDIDriver \
 	    midi-driver/plugin.c shared/usb_util.c $(CORE_LIB) \

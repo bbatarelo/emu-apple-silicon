@@ -18,7 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define DEVICE_UID "net.quantum-bit.EMUTrackerPre"
+#define DEVICE_UID "net.batarelo.EMUTrackerPre"
 #define CHANNELS   2
 
 typedef struct {

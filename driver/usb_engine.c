@@ -332,7 +332,7 @@ static bool watch_identity(void)
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         /* dispatch_queue_create retries allocation rather than returning NULL. */
-        gNotifyQueue = dispatch_queue_create("net.quantum-bit.EMUTrackerPre.hotplug",
+        gNotifyQueue = dispatch_queue_create("net.batarelo.EMUTrackerPre.hotplug",
                                              DISPATCH_QUEUE_SERIAL);
         gNotifyPort = IONotificationPortCreate(kIOMainPortDefault);
         if (!gNotifyPort) return;
@@ -605,7 +605,7 @@ struct Engine {
  * fault in the whole system log was an "IO started" line with no matching
  * "IO stopped". Faults log at os_log_error so they survive the default level:
  *
- *   log show --predicate 'subsystem == "net.quantum-bit.EMUTrackerPre"'
+ *   log show --predicate 'subsystem == "net.batarelo.EMUTrackerPre"'
  */
 typedef struct Engine Engine;
 

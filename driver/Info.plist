@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>EMUTrackerPre</string>
 	<key>CFBundleIdentifier</key>
-	<string>net.quantum-bit.EMUTrackerPre</string>
+	<string>net.batarelo.EMUTrackerPre</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
+	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>@VERSION@ (@GITREV@)</string>
 	<key>CFPlugInFactories</key>
 	<dict>
 		<key>B71C4E90-3A62-4D18-9F27-5E0A8C3D6142</key>

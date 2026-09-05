@@ -15,7 +15,7 @@
 /* Both halves log under one subsystem so a single predicate catches the lot;
  * the category separates them ("plugin" for the Core Audio surface, "engine"
  * for the USB transport). */
-#define EMU_LOG_SUBSYSTEM "net.quantum-bit.EMUTrackerPre"
+#define EMU_LOG_SUBSYSTEM "net.batarelo.EMUTrackerPre"
 
 /* One attached device's transport. Opaque: the plug-in holds a handle per
  * device rather than the driver holding one device. */

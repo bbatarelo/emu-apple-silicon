@@ -11,9 +11,9 @@ matching *DriverKit App Development* provisioning profile if the team has been
 granted those entitlements by Apple. Without the grant:
 
 ```
-error: No profiles for 'net.quantum-bit.TrackerPreDriver' were found:
+error: No profiles for 'net.batarelo.TrackerPreDriver' were found:
 Xcode couldn't find any DriverKit App Development provisioning profiles
-matching 'net.quantum-bit.TrackerPreDriver'.
+matching 'net.batarelo.TrackerPreDriver'.
 ```
 
 This is why `make build` defaults to `SIGNING=0` (`CODE_SIGNING_ALLOWED=NO`).

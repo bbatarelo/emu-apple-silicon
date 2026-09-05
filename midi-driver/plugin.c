@@ -42,7 +42,7 @@ static os_log_t emu_log(void)
 {
     static os_log_t log;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ log = os_log_create("net.quantum-bit.EMUMIDIDriver", "driver"); });
+    dispatch_once(&once, ^{ log = os_log_create("net.batarelo.EMUMIDIDriver", "driver"); });
     return log;
 }
 

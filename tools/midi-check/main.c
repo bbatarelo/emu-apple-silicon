@@ -21,7 +21,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMIDI/CoreMIDI.h>
 
-#define DRIVER_ID "net.quantum-bit.EMUMIDIDriver"
+#define DRIVER_ID "net.batarelo.EMUMIDIDriver"
 
 static void print_cfstring(CFStringRef s)
 {

@@ -31,7 +31,7 @@
 #include "../shared/usb_util.h"
 #include "../shared/device.h"
 
-#define LOG_SUBSYSTEM "net.quantum-bit.EMUTrackerPre"
+#define LOG_SUBSYSTEM "net.batarelo.EMUTrackerPre"
 
 static os_log_t emu_log(void)
 {
@@ -81,7 +81,7 @@ enum {
  * device they were told to use, and the plug-in publishes exactly one device
  * whichever member of the family is attached. The name below is what anyone
  * actually reads, and that does follow the hardware. */
-#define DEVICE_UID          "net.quantum-bit.EMUTrackerPre"
+#define DEVICE_UID          "net.batarelo.EMUTrackerPre"
 #define DEVICE_MANUFACTURER "E-MU Systems (revival)"
 
 #define CHANNELS            2
@@ -208,6 +208,9 @@ enum {
      * rebuilt through, "persistent" should exhaust the retry budget and take
      * the device offline. */
     kEMUProperty_FaultInject = 'emuX',
+    /* Read-only. The version this driver was built from, so a tool can say
+     * what is actually installed rather than what the source tree says. */
+    kEMUProperty_Version = 'emuV',
 };
 
 /*
@@ -999,6 +1002,7 @@ static Boolean HasProperty(AudioServerPlugInDriverRef d, AudioObjectID object,
                 case kEMUProperty_SafetyOffset:
                 case kEMUProperty_InputMode:
                 case kEMUProperty_FaultInject:
+                case kEMUProperty_Version:
                     return true;
                 default: return false;
             }
@@ -1169,7 +1173,7 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
             *outSize = sizeof(Float64); return kAudioHardwareNoError;
 
         case kAudioObjectPropertyCustomPropertyInfoList:
-            *outSize = 6 * sizeof(AudioServerPlugInCustomPropertyInfo);
+            *outSize = 7 * sizeof(AudioServerPlugInCustomPropertyInfo);
             return kAudioHardwareNoError;
 
         case kEMUProperty_Diagnostics:
@@ -1178,6 +1182,7 @@ static OSStatus GetPropertyDataSize(AudioServerPlugInDriverRef d, AudioObjectID 
         case kEMUProperty_ClockSource:
         case kEMUProperty_InputMode:
         case kEMUProperty_FaultInject:
+        case kEMUProperty_Version:
         case kEMUProperty_ResetCounters:
             *outSize = sizeof(CFStringRef); return kAudioHardwareNoError;
 
@@ -1360,6 +1365,12 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                     n++;
                 }
                 if (n < capacity) {
+                    info[n].mSelector = kEMUProperty_Version;
+                    info[n].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
+                    info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+                    n++;
+                }
+                if (n < capacity) {
                     info[n].mSelector = kEMUProperty_FaultInject;
                     info[n].mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFString;
                     info[n].mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
@@ -1418,6 +1429,9 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 *outSize = sizeof(CFStringRef);
                 return kAudioHardwareNoError;
             }
+
+            case kEMUProperty_Version:
+                RETURN_CFSTR_UTF8(EMU_VERSION " (git " EMU_GITREV ")");
 
             case kEMUProperty_FaultInject: {
                 if (dataSize < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;

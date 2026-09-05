@@ -12,7 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DEVICE_UID "net.quantum-bit.EMUTrackerPre"
+#define DEVICE_UID "net.batarelo.EMUTrackerPre"
 
 static AudioObjectID find_device(void)
 {
@@ -355,9 +355,42 @@ static int fault_inject(AudioObjectID device, const char* mode)
     printf("fault injection: %s\n", mode);
     if (strcmp(mode, "none") != 0) {
         printf("  watch:  hal-check | grep -E 'engineStreaming|engineAlive|recover'\n"
-               "  and:    log stream --predicate 'subsystem == \"net.quantum-bit.EMUTrackerPre\"'\n");
+               "  and:    log stream --predicate 'subsystem == \"net.batarelo.EMUTrackerPre\"'\n");
     }
     return 0;
+}
+
+/*
+ * The installed driver's version, and whether it is the one this tree builds.
+ *
+ * The tool carries its own version from the same VERSION file, so a mismatch
+ * means exactly one thing: something was built and not installed. That is the
+ * single most common way to spend an afternoon testing the wrong binary, and
+ * it is worth the two lines to make it impossible to miss.
+ */
+static void print_version(AudioObjectID device)
+{
+    AudioObjectPropertyAddress address = {
+        'emuV', kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain
+    };
+    CFStringRef v = NULL;
+    UInt32 size = sizeof v;
+    char installed[128] = "";
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &v) == noErr && v) {
+        CFStringGetCString(v, installed, sizeof installed, kCFStringEncodingUTF8);
+        CFRelease(v);
+    }
+
+    const char* mine = EMU_VERSION " (git " EMU_GITREV ")";
+    if (!installed[0]) {
+        printf("  driver version    (not reported -- older than 0.1.0)\n");
+        printf("                    this build is %s; run: make install\n", mine);
+        return;
+    }
+    printf("  driver version    %s\n", installed);
+    if (strcmp(installed, mine) != 0) {
+        printf("                    ** this build is %s -- run: make install **\n", mine);
+    }
 }
 
 static void usage(void)
@@ -407,6 +440,7 @@ int main(int argc, char** argv)
     }
 
     printf("device found: AudioObjectID %u\n\n", device);
+    print_version(device);
 
     AudioObjectPropertyAddress address = {
         kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,

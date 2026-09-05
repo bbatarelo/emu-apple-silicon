@@ -21,7 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define DEVICE_UID "net.quantum-bit.EMUTrackerPre"
+#define DEVICE_UID "net.batarelo.EMUTrackerPre"
 
 #define TRACE_SECONDS   3.0
 #define POLL_USECS      4000

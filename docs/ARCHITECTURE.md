@@ -403,7 +403,7 @@ first 0404 in the registry" is ambiguous the moment there are two of anything.
 
 ### UIDs come from the unit's serial
 
-    net.quantum-bit.EMUTrackerPre.<serial>
+    net.batarelo.EMUTrackerPre.<serial>
 
 Both devices report a serial in their USB descriptor
 (`E-MU-69-3F04-...`, `E-MU-C7-3F0A-...`), and it is the only identifier that

@@ -1,5 +1,7 @@
 # E-MU Tracker Pre driver for Apple Silicon
 
+[![version](https://img.shields.io/badge/version-0.1.0-blue)](VERSION)
+
 A working macOS driver for the E-MU Tracker Pre and 0404 USB audio interfaces.
 
 E-MU stopped supporting macOS in 2011. The last official driver was a kernel
@@ -28,7 +30,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if you do not
 Then:
 
 ```bash
-git clone <this repository>
+git clone git@github.com:bbatarelo/emu-apple-silicon.git
 cd emu-apple-silicon
 make
 make install
@@ -53,7 +55,7 @@ make uninstall
 
 ---
 
-## Checking that it works
+## Does it work?
 
 ```bash
 make check
@@ -125,6 +127,56 @@ the interface.
 
 ---
 
+## Version
+
+The current version is in [`VERSION`](VERSION), and it is the only place the
+number is written: the build reads it into both bundles and into the code, so
+nothing can report a version it was not built with.
+
+What you have installed:
+
+```bash
+build/bin/hal-check | head -3
+```
+
+```
+  driver version    0.1.0 (git 7baf923)
+```
+
+If the tree you are standing in builds something newer, it says so, because the
+tools carry the same version:
+
+```
+  driver version    0.1.0 (git 7baf923)
+                    ** this build is 0.2.0 (git a1b2c3d) -- run: make install **
+```
+
+The git revision is part of the answer on purpose. `0.1.0` alone cannot tell a
+build made from the release apart from one made from a working tree that has
+moved on, and `-dirty` marks a build with uncommitted changes.
+
+`make version` prints what the tree would build.
+
+### Bumping it
+
+**Before merging to main, bump the version.** Patch for fixes, minor for new
+behaviour; major only in coordination with the repository owner.
+
+Three things move together:
+
+1. `VERSION`
+2. the badge at the top of this file
+3. a `git tag v<version>` on the merge commit
+
+`make version-check` enforces the first two — both are in the tree, so there is
+no excuse for them differing — and reports whether the tag exists, since that is
+created at the merge, after the bump.
+
+The check exists because a version that lies is worse than no version: someone
+reporting a bug against `0.2.0` needs that to mean one specific build.
+
+---
+
 ## Which devices?
 
 **Tracker Pre** (`041e:3f0a`) and **0404 USB** (`041e:3f04`), both verified on
@@ -146,21 +198,17 @@ MIDI-streaming interface. Mixed sets are handled — a Tracker Pre alongside a
 0404 gives you the 0404's MIDI — but two MIDI-capable units would still yield
 only the first. Audio is unaffected either way.
 
-### Device names, and a one-time change
+### How devices are named
 
 Each device is identified by its unit's serial number:
 
-    net.quantum-bit.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03
+    net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03
 
-A single fixed name cannot identify two boxes, so this replaced the old
-`net.quantum-bit.EMUTrackerPre`. **Upgrading from a version before multi-device
-resets your chosen output device once** — macOS keys that choice on the UID and
-sees a new name. Select the device again and it sticks.
-
-The serial is what makes the choice stick afterwards. It survives replugging and
-moving to another port, so an interface you unplug and plug back in returns as
-*the same device* and playback resumes on its own, rather than coming back as a
-stranger you have to re-select.
+The serial is what makes your choice of output device stick. macOS remembers
+that choice by this name, and the serial survives replugging and moving to
+another port — so an interface you unplug and plug back in comes back as *the
+same device* and playback resumes on its own, rather than returning as a
+stranger you have to select again.
 
 ### Pointing the tools at one device
 
