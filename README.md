@@ -30,7 +30,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if you do not
 Then:
 
 ```bash
-git clone git@github.com:bbatarelo/emu-apple-silicon.git
+git clone https://github.com/bbatarelo/emu-apple-silicon.git
 cd emu-apple-silicon
 make
 make install
