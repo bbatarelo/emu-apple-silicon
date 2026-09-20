@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>E-MU Tracker Pre &amp; 0404 USB drivers for Apple Silicon Macs</title>
+<meta name="description" content="Bring E-MU Tracker Pre and 0404 USB audio interfaces to Apple Silicon macOS. Open-source audio and 0404 MIDI drivers, build instructions, and compatibility notes.">
+<link rel="canonical" href="@SITE_URL@/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="E-MU audio. Back on your Mac.">
+<meta property="og:description" content="Open-source Apple Silicon drivers for E-MU Tracker Pre and 0404 USB. Audio, MIDI, and multiple interfaces.">
+<meta property="og:url" content="@SITE_URL@/">
+<meta property="og:image" content="@SITE_URL@/assets/emu-0404-usb.jpg">
+<meta property="og:image:alt" content="White E-MU 0404 USB audio interface, photographed by yoppy">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">@STRUCTURED_DATA@</script>
+<meta name="theme-color" content="#12352f">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="wrap top"><a class="brand" href="./" aria-label="E-MU Apple Silicon home">E-MU <span>/ APPLE SILICON</span></a><nav aria-label="Main navigation"><a href="#compatibility">Compatibility</a><a href="#install">Install</a><a href="https://github.com/bbatarelo/emu-apple-silicon">GitHub ↗</a></nav></header>
+<main id="main">
+<section class="wrap hero">
+<p class="eyebrow">INDEPENDENT · OPEN SOURCE · BUILT FOR ARM64</p>
+<h1>E-MU audio.<br><em>Back on your Mac.</em></h1>
+<p class="intro">Apple Silicon macOS drivers for the <strong>E-MU Tracker Pre</strong> and <strong>E-MU 0404 USB</strong>. Keep the interface you know. Play, record, and make music again.</p>
+<div class="actions"><a class="button" href="#install">Build &amp; install <span aria-hidden="true">↓</span></a><a class="text-link" href="https://github.com/bbatarelo/emu-apple-silicon/releases">Releases ↗</a></div>
+<p class="version">Current source version <strong>@VERSION@</strong> <span>· MIT licensed</span></p>
+<div class="signal" aria-hidden="true"><span>USB AUDIO</span><div></div><span>CORE AUDIO</span></div>
+</section>
+<figure class="wrap hardware-photo"><img src="assets/emu-0404-usb.jpg" width="960" height="638" alt="White E-MU 0404 USB audio interface with front inputs and top-panel controls" loading="lazy" decoding="async"><figcaption>E-MU 0404 USB · Photo by <a href="https://www.flickr.com/photos/44124362019@N01/4531748390">yoppy</a>, <a href="https://creativecommons.org/licenses/by/2.0/">CC BY 2.0</a>, via <a href="https://commons.wikimedia.org/wiki/File:E-MU_0404_USB_2.0_White.jpg">Wikimedia Commons</a>. Resized by Wikimedia.</figcaption></figure>
+<section class="band"><div class="wrap features"><div><strong>Your everyday apps</strong><p>Select the interface in macOS Sound settings and play music or open your recording app.</p></div><div><strong>Your security settings stay</strong><p>A user-space audio plug-in. No kernel extension, no disabling SIP, no reduced security.</p></div><div><strong>More than one interface</strong><p>Tracker Pre and 0404 USB can be connected and stream independently at the same time.</p></div></div></section>
+<section class="wrap section" id="compatibility">
+<p class="eyebrow">THE HARDWARE</p><h2>Two familiar interfaces.<br>A new life on Apple Silicon.</h2>
+<div class="cards"><article class="card"><span class="label">VERIFIED ON HARDWARE</span><h3>E-MU Tracker Pre</h3><p>Stereo USB playback and recording, with software output volume and mute.</p><p class="detail">Audio only. No exposed USB MIDI interface or physical MIDI ports.</p></article><article class="card"><span class="label">VERIFIED ON HARDWARE</span><h3>E-MU 0404 USB</h3><p>Stereo USB playback and recording, plus DIN MIDI input and output through CoreMIDI.</p><p class="detail">Four-channel modes and S/PDIF are not currently exposed.</p></article></div>
+<p>Targets Apple Silicon (ARM64) Macs, including M1, M2, M3 and M4 families. The current audio build targets macOS 14 or later; this is not a tested compatibility matrix for every Mac and macOS release. <strong>E-MU 0202 USB remains untested.</strong></p>
+<aside class="note"><h3>A note on high sample rates</h3><p>The driver offers 44.1, 48, 88.2, 96, 176.4 and 192 kHz. Full-duplex playback at 176.4/192 kHz can crackle on some setups. A playback-only mode disables input at those rates as a workaround. <a href="https://github.com/bbatarelo/emu-apple-silicon#status">Read the limitations before choosing a mode →</a></p></aside>
+</section>
+<section class="install" id="install"><div class="wrap section"><p class="eyebrow">GET CONNECTED</p><h2>Build once. Select it. Play.</h2><p>You need an Apple Silicon Mac, Xcode command line tools, and Rust. These instructions build from source; they do not download a compiled installer.</p><ol class="steps"><li><h3>Prepare your Mac</h3><p>Install Xcode command line tools with <code>xcode-select --install</code> and follow the <a href="https://www.rust-lang.org/tools/install">Rust installation instructions</a>.</p></li><li><h3>Build and install the driver</h3><pre><code>git clone https://github.com/bbatarelo/emu-apple-silicon.git
+cd emu-apple-silicon
+make
+make install</code></pre><p>The installer asks for your administrator password and restarts audio and MIDI services. Quit audio apps first: audio on the Mac will briefly stop.</p></li><li><h3>Choose your E-MU interface</h3><p>Open <strong>System Settings → Sound</strong>, choose E-MU Tracker Pre or E-MU 0404 USB, and start playback. Allow microphone access for apps you want to record with.</p></li></ol><a class="button light" href="https://github.com/bbatarelo/emu-apple-silicon#build-and-install-the-e-mu-driver-on-macos">Full installation guide ↗</a><p class="small">To remove the drivers, run <code>make uninstall</code> from the repository.</p></div></section>
+<section class="wrap section support"><div><p class="eyebrow">KEEP IT PLAYING</p><h2>Built in the open.</h2><p>This is an independent community project, informed by E-MU's released sources and <a href="https://github.com/Wouter1/EMU-driver">Wouter1's original E-MU driver project</a>, with contributions from <a href="https://github.com/dnadlinger/emu-apple-silicon">David Nadlinger</a>. It is not an official E-MU product. See the <a href="https://github.com/bbatarelo/emu-apple-silicon/blob/main/docs/provenance.md">reference material and provenance</a>.</p></div><div><h3>Something not working?</h3><p>Include your interface, Mac model, macOS version, sample rate, and the installed driver version from <code>build/bin/hal-check</code>.</p><a class="text-link" href="https://github.com/bbatarelo/emu-apple-silicon/issues">Report an issue ↗</a><p><a href="https://github.com/bbatarelo/emu-apple-silicon/tree/main/docs">Read the technical documentation ↗</a></p></div></section>
+</main><footer class="wrap"><span>E-MU Apple Silicon · Independent driver revival</span><a href="https://github.com/bbatarelo/emu-apple-silicon/blob/main/LICENSE">MIT license</a></footer>
+</body></html>

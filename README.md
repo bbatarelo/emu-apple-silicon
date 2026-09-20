@@ -328,6 +328,9 @@ Not done:
 
 ## Documentation
 
+The project landing page is maintained in [`site/`](site/). See
+[website publishing and preview instructions](docs/WEBSITE.md).
+
 | | |
 |---|---|
 | [docs/FINDINGS.md](docs/FINDINGS.md) | What the hardware does, and what macOS does. **Read this before changing anything.** |
