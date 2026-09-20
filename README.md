@@ -1,24 +1,43 @@
-# E-MU Tracker Pre driver for Apple Silicon
+# E-MU Tracker Pre and 0404 USB drivers for Apple Silicon macOS
 
 [![version](https://img.shields.io/badge/version-0.1.0-blue)](VERSION)
 
-A working macOS driver for the E-MU Tracker Pre and 0404 USB audio interfaces.
+A native **Apple Silicon macOS driver** for **E-MU Tracker Pre** and
+**E-MU 0404 USB** audio interfaces. This independent, open-source project brings
+these USB audio interfaces back to modern Macs using a Core Audio HAL plug-in.
+The 0404 USB's DIN MIDI input and output also work through CoreMIDI.
 
-E-MU stopped supporting macOS in 2011. The last official driver was a kernel
-extension, and kernel extensions no longer load on Apple Silicon, so the hardware
-has been silent on modern Macs for years. This brings it back.
+Playback and recording, software output volume and mute, and multiple connected
+interfaces are supported. The driver offers 44.1, 48, 88.2, 96, 176.4 and
+192 kHz sample rates. **Full-duplex audio at 176.4/192 kHz can crackle on some
+setups**; a playback-only mode is available. See [status and limitations](#status).
 
-**It plays and it records.** The device appears in System Settings like any other
-audio interface, with working volume and mute, at every sample rate the hardware
-supports: 44.1, 48, 88.2, 96, 176.4 and 192 kHz. On the 0404 USB the DIN MIDI
-ports work too, as ordinary CoreMIDI endpoints.
+No kernel extension or system extension is installed. You do not need to disable
+SIP or lower your Mac's security settings.
 
-No kernel extension. No system extension. No disabling SIP, no lowered security
-settings, and no Apple Developer account required.
+## E-MU driver compatibility on Apple Silicon Macs
+
+| Interface | Audio | MIDI |
+|---|---|---|
+| E-MU Tracker Pre USB | Stereo playback and recording, verified on hardware | No exposed MIDI interface or DIN ports |
+| E-MU 0404 USB | Stereo playback and recording, verified on hardware | DIN input and output |
+| E-MU 0202 USB | Untested; help testing is welcome | Not verified |
+
+The driver targets Apple Silicon (ARM64) Macs, including the M1, M2, M3 and M4
+families. This is an architecture target, not a claim that every Mac model or
+macOS release has been tested. A verified per-version macOS compatibility matrix
+is not yet available; please include your Mac model and macOS version when
+[reporting compatibility or a problem](https://github.com/bbatarelo/emu-apple-silicon/issues).
+
+## Source code and releases
+
+See [E-MU Apple Silicon driver releases](https://github.com/bbatarelo/emu-apple-silicon/releases)
+for published versions. The installation instructions below build the driver
+from source; they do not require a prebuilt installer package.
 
 ---
 
-## Installing
+## Build and install the E-MU driver on macOS
 
 You need macOS on Apple Silicon, Xcode command line tools, and Rust.
 
@@ -55,7 +74,7 @@ make uninstall
 
 ---
 
-## Does it work?
+## Optional diagnostics and troubleshooting
 
 ```bash
 make check
@@ -177,7 +196,7 @@ reporting a bug against `0.2.0` needs that to mean one specific build.
 
 ---
 
-## Which devices?
+## Using multiple E-MU audio interfaces
 
 **Tracker Pre** (`041e:3f0a`) and **0404 USB** (`041e:3f04`), both verified on
 real hardware. One build serves either, and **both at once**: plug in two and
@@ -320,7 +339,12 @@ Not done:
 
 ---
 
-## Contributing
+## Contributing and reporting problems
+
+[Open a GitHub issue](https://github.com/bbatarelo/emu-apple-silicon/issues)
+with your interface model, Mac model, macOS version, installed driver version
+(from `build/bin/hal-check`), and steps to reproduce the problem. For audio
+issues, include the sample rate and whether input is enabled.
 
 The most useful thing anyone can do is run `tools/emu-probe` against an 0202 and
 send the output. It is the last member of the family nobody has checked.
@@ -328,6 +352,17 @@ send the output. It is the last member of the family nobody has checked.
 After that: MIDI, the 0404's unread extension units, and reports of whether
 176.4 and 192 kHz are clean in full duplex on your unit — `make loopback` with
 a cable says, and FINDINGS explains why it matters.
+
+---
+
+## Acknowledgements
+
+Thanks to [Wouter1's E-MU driver project](https://github.com/Wouter1/EMU-driver)
+and E-MU's released driver sources for documenting how this hardware works,
+and to [David Nadlinger](https://github.com/dnadlinger/emu-apple-silicon)
+for contributions including 0404 USB support, MIDI, and streaming improvements.
+This is an independent implementation; the reference material and its licensing
+are described in [provenance](docs/provenance.md).
 
 ---
 
