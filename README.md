@@ -1,6 +1,6 @@
 # E-MU Tracker Pre and 0404 USB drivers for Apple Silicon macOS
 
-[![version](https://img.shields.io/badge/version-0.1.0-blue)](VERSION)
+[![version](https://img.shields.io/badge/version-0.1.1-blue)](VERSION)
 
 A native **Apple Silicon macOS driver** for **E-MU Tracker Pre** and
 **E-MU 0404 USB** audio interfaces. This independent, open-source project brings
@@ -341,6 +341,22 @@ The project landing page is maintained in [`site/`](site/). See
 | [driverkit/](driverkit/) | An unfinished DriverKit version, and why it is parked |
 
 ---
+
+## Developer tests
+
+Run `make test` before submitting driver changes. It builds and runs the Rust
+protocol tests, audio-analysis self-tests, and USB regression tests without
+hardware or an installed driver. `make test-build` builds all C test executables
+without running them.
+
+After installing a changed driver, `EMU_DEVICE=3F04 make test-integration` runs
+silent start/stop and injected startup-retry checks on an idle 0404. Use `3F0A`
+for Tracker Pre, or a unique UID/serial substring when several units match.
+Stop other playback and recording first. These tests do not replace listening,
+recovery, or analog loopback checks.
+
+See the **[test guide](tests/README.md)** for prerequisites, individual commands,
+coverage, and how to add regression tests.
 
 ## Contributing and reporting problems
 
