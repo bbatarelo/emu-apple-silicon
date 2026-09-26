@@ -339,8 +339,8 @@ static int fault_inject(AudioObjectID device, const char* mode)
     }
 
     if (strcmp(mode, "transient") != 0 && strcmp(mode, "persistent") != 0 &&
-        strcmp(mode, "none") != 0) {
-        fprintf(stderr, "error: fault must be transient, persistent or none\n");
+        strcmp(mode, "none") != 0 && strcmp(mode, "startup-stale") != 0) {
+        fprintf(stderr, "error: fault must be transient, persistent, startup-stale or none\n");
         return 2;
     }
 
@@ -353,7 +353,9 @@ static int fault_inject(AudioObjectID device, const char* mode)
         return 1;
     }
     printf("fault injection: %s\n", mode);
-    if (strcmp(mode, "none") != 0) {
+    if (strcmp(mode, "startup-stale") == 0)
+        printf("  armed once for the next stream setup; stop playback before starting the test\n");
+    if (strcmp(mode, "none") != 0 && strcmp(mode, "startup-stale") != 0) {
         printf("  watch:  hal-check | grep -E 'engineStreaming|engineAlive|recover'\n"
                "  and:    log stream --predicate 'subsystem == \"net.batarelo.EMUTrackerPre\"'\n");
     }
