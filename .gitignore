@@ -6,6 +6,7 @@ target/
 .DS_Store
 
 # Editors
+/.claude/
 .idea/
 .vscode/
 *.xcuserstate

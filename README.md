@@ -21,7 +21,8 @@ SIP or lower your Mac's security settings.
 |---|---|---|
 | E-MU Tracker Pre USB | Stereo playback and recording, verified on hardware | No exposed MIDI interface or DIN ports |
 | E-MU 0404 USB | Stereo playback and recording, verified on hardware | DIN input and output |
-| E-MU 0202 USB | Untested; help testing is welcome | Not verified |
+| E-MU 0202 USB | Community-tested | No MIDI ports |
+| E-MU 0204 USB | Untested | No MIDI ports |
 
 The driver targets Apple Silicon (ARM64) Macs, including the M1, M2, M3 and M4
 families. This is an architecture target, not a claim that every Mac model or
@@ -203,13 +204,6 @@ real hardware. One build serves either, and **both at once**: plug in two and
 you get two Core Audio devices, each with its own name, controls and transport,
 streaming independently at any rate either supports.
 
-The **0202 USB** is the one still untested. It is built on the same CA0189
-chipset and should speak the same protocol; the 0404 turned out to, needing a
-single parser fix. If you own one, `tools/emu-probe` will tell us in a few
-minutes. See **[docs/ADDING-A-DEVICE.md](docs/ADDING-A-DEVICE.md)** — no driver
-changes needed to find out, and the results are genuinely useful even if you
-stop there.
-
 Up to `EMU_MAX_DEVICES` (4) are published. A fifth is ignored.
 
 **MIDI publishes one device**: the first attached unit that actually has a
@@ -322,7 +316,7 @@ Not done:
 - MIDI on more than one device at a time. The driver picks the first unit
     that has a MIDI interface; a second MIDI-capable unit is not published.
 - More than four devices at once. A fifth is ignored silently.
-- The 0202 USB is untested.
+- The 0204 USB is untested and is absent from the driver's device list.
 
 ---
 
@@ -365,8 +359,8 @@ with your interface model, Mac model, macOS version, installed driver version
 (from `build/bin/hal-check`), and steps to reproduce the problem. For audio
 issues, include the sample rate and whether input is enabled.
 
-The most useful thing anyone can do is run `tools/emu-probe` against an 0202 and
-send the output. It is the last member of the family nobody has checked.
+If you own an 0204 USB, please report its USB product ID from System Information
+on your Mac. That is the first step toward adding it to the driver's device list.
 
 After that: MIDI, the 0404's unread extension units, and reports of whether
 176.4 and 192 kHz are clean in full duplex on your unit — `make loopback` with
