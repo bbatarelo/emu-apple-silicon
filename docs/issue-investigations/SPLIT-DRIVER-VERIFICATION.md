@@ -26,6 +26,15 @@ The split silent restart suite stopped at cycle 12 when the transport failed to 
 
 Before attributing a fixed latency cost to the architecture, measure fresh Tracker Pre generations with zero clients and a stopped transport at both boundaries. Keep the 0404 idle for the single-device comparison. Run the restart stress separately from the chirps. If the Tracker stays active, record its owning client and start/stop events. Compare submitted and bound frames over the same completed work before evaluating transport loss, while retaining the independent capture-underrun and waveform checks.
 
+### Independent reproductions for the stability milestone
+
+Two hardware-free checks against the unmodified implementation at `14dd024` narrow the first fixes.
+
+- A 512-frame WriteMix was submitted through the real HAL and remote proxy. A simulated successful USB bind consumed the corresponding production queue record. Before the next engine stats publication, the public HAL dictionary returned 512 frames written and zero bound. Publishing the counters yielded 512/512 with no further audio. The two reads were made with the fixture paused. The diagnostic mismatch can therefore occur without audio loss.
+- Two registered clients started on one device. Removing client 11 without an earlier StopIO correctly left client 22 playing. When client 22 then called StopIO, one client remained counted and the engine continued running. The current RemoveDeviceClient implementation ignores the removed client's ID. This reproduces a stale-owner path. The November 18 hardware capture does not establish that Core Audio delivered that callback sequence during cycle 12.
+
+Retest with the ordinary and injected hardware suites, with genuine unbound frames still visible and with a second active client surviving the other client's departure.
+
 ## Independent results for commit `3a17426`, November 18, 2026
 
 Both modes built from a fresh clone of the feature commit. The default HAL, split HAL, engine executable and MIDI plug-in all passed `codesign --verify --strict`. Alternating the build modes preserved both HAL binary hashes. The two HALs expose the same bundle identifier and factory. Inspection of their imports found USB device access only in the one-part HAL and Mach-service calls only in the split HAL.
