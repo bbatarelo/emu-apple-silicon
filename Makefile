@@ -8,7 +8,8 @@
 #   make version    the version this tree builds
 #   make version-check  VERSION, README badge and tag agree
 #   make test       run the test suite (no hardware needed)
-#   make test-recovery  fault-inject the driver and check it recovers
+#   make test-integration  silent start/retry tests (installed, idle device)
+#   make test-build  build all C test executables without running them
 #   make test-recovery  fault-inject the running driver and check it recovers
 #
 # Needs: Xcode command line tools, and Rust (stable). Nothing else.
@@ -65,7 +66,7 @@ version-check:
 	fi
 
 help:
-	@sed -n '2,12p' Makefile | sed 's/^# \?//'
+	@sed -n '2,14p' Makefile | sed -E 's/^# ?//'
 
 # ---------------------------------------------------------------- the core
 
@@ -184,8 +185,8 @@ record: $(BIN)/hal-record
 	@echo "listen with: afplay $(BUILD)/recording.wav"
 
 # Needs a cable from the outputs back to the inputs, both channels, at a level
-# that does not clip. Everything else here can be checked without hardware;
-# this is the only thing that closes the loop. Runs at whatever sample rate the
+# that does not clip. Unlike the silent integration tests, this checks the
+# analog signal path. Runs at whatever sample rate the
 # device is set to; hal-loopback -r <hz> sets one first.
 loopback: $(BIN)/hal-loopback
 	@$(BIN)/hal-loopback -w $(BUILD)/loopback.wav
@@ -196,11 +197,51 @@ loopback: $(BIN)/hal-loopback
 test-recovery: $(BIN)/hal-check
 	@./scripts/test-recovery.sh
 
-test: $(BIN)/hal-loopback
+# Hardware-free suite: safe to run without installing or opening a device.
+.PHONY: test-rust test-analysis test-regression test-build test-integration test-hal-startup
+
+test: test-rust test-analysis test-regression
+
+test-rust:
 	@cd $(CORE) && cargo test
-	@echo
+
+test-analysis: $(BIN)/hal-loopback
 	@$(BIN)/hal-loopback selftest
+
+test-regression: test-usb-abort
+
+# Build-only entry point for contributors; never installs a driver.
+test-build: $(BIN)/hal-loopback $(BIN)/usb-abort-test $(BIN)/hal-restart-test
+
+# Run sequentially even under make -j: both tests use the same installed unit.
+# Recovery (active playback) and analog loopback (cables) have separate setup;
+# see tests/README.md rather than silently including them here.
+test-integration: $(BIN)/hal-restart-test
+	@$(BIN)/hal-restart-test
+	@$(BIN)/hal-restart-test --startup-stale
+
+test-hal-startup: $(BIN)/hal-restart-test
+	@$(BIN)/hal-restart-test --startup-stale
 
 clean:
 	rm -rf $(BUILD)
 	@cd $(CORE) && cargo clean
+
+# Deterministic issue #7 reproducer. No USB hardware or installed-driver changes.
+# Also included in `make test`; never opens a real USB device.
+.PHONY: test-usb-abort
+test-usb-abort: $(BIN)/usb-abort-test
+	@$(BIN)/usb-abort-test
+
+$(BIN)/usb-abort-test: tests/regression/usb-abort-test.c driver/usb_engine.c driver/usb_engine.h driver/ring.h shared/usb_util.c shared/usb_util.h shared/device.h $(CORE_LIB)
+	@mkdir -p $(BIN)
+	@clang $(CFLAGS) -Wno-deprecated-declarations -o $@ $< shared/usb_util.c $(CORE_LIB) $(FRAMEWORKS)
+
+# Requires an idle, installed E-MU. Streams silence; no default/rate changes.
+.PHONY: test-hal-restart
+test-hal-restart: $(BIN)/hal-restart-test
+	@$(BIN)/hal-restart-test
+
+$(BIN)/hal-restart-test: tests/integration/hal-restart-test.c tools/hal-check/main.c
+	@mkdir -p $(BIN)
+	@clang $(CFLAGS) -o $@ $< -framework CoreAudio -framework CoreFoundation

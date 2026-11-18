@@ -1438,6 +1438,7 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
                 EmuEngineStats st;
                 emu_engine_stats(dev->engine, &st);
                 *(CFStringRef*)outData =
+                    st.fault_mode == EMU_FAULT_STARTUP_STALE ? CFSTR("startup-stale") :
                     st.fault_mode == EMU_FAULT_TRANSIENT  ? CFSTR("transient")  :
                     st.fault_mode == EMU_FAULT_PERSISTENT ? CFSTR("persistent") : CFSTR("none");
                 *outSize = sizeof(CFStringRef);
@@ -1895,6 +1896,9 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         } else if (CFStringCompare(requested, CFSTR("persistent"), kCFCompareCaseInsensitive)
                    == kCFCompareEqualTo) {
             mode = EMU_FAULT_PERSISTENT;
+        } else if (CFStringCompare(requested, CFSTR("startup-stale"), kCFCompareCaseInsensitive)
+                   == kCFCompareEqualTo) {
+            mode = EMU_FAULT_STARTUP_STALE;
         } else if (CFStringCompare(requested, CFSTR("none"), kCFCompareCaseInsensitive)
                    == kCFCompareEqualTo) {
             mode = EMU_FAULT_NONE;
@@ -1909,6 +1913,7 @@ static OSStatus SetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID obje
         }
         emu_engine_inject_fault(dev->engine, mode);
         EMU_LOG("fault injection set to %{public}s",
+                mode == EMU_FAULT_STARTUP_STALE ? "startup-stale" :
                 mode == EMU_FAULT_TRANSIENT  ? "transient" :
                 mode == EMU_FAULT_PERSISTENT ? "persistent" : "none");
         return kAudioHardwareNoError;

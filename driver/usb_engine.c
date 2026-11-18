@@ -387,6 +387,7 @@ typedef struct {
     void*                      buffer;
     IOUSBLowLatencyIsocFrame*  frames;
     uint64_t                   frame_start;
+    bool                       pending; /* engine thread: controller owns buffers */
 
     /* The timeline allocation made at submit -- which frames this request
      * carries, and in which packet sizes. Published to the IO thread as this
@@ -580,6 +581,11 @@ struct Engine {
     _Atomic uint64_t recovery_failures;
 
     CFRunLoopRef  run_loop;
+    CFRunLoopSourceRef in_source, out_source;
+    bool draining;                 /* engine thread only */
+    bool thread_policy_set;
+    unsigned pending_requests;
+    uint8_t fb_abort_pipe;          /* retained even if feedback is disabled */
 };
 
 /* StartIO/StopIO are control-thread calls, so serialize the complete
@@ -666,7 +672,7 @@ void emu_engine_inject_fault(EmuEngine* e, EmuFaultMode mode)
 static bool fault_should_fail(Engine* e)
 {
     uint32_t mode = atomic_load_explicit(&e->fault_mode, memory_order_relaxed);
-    if (mode == EMU_FAULT_NONE) return false;
+    if (mode == EMU_FAULT_NONE || mode == EMU_FAULT_STARTUP_STALE) return false;
     if (mode == EMU_FAULT_PERSISTENT) return true;
 
     uint32_t left = atomic_load_explicit(&e->fault_countdown, memory_order_relaxed);
@@ -1135,6 +1141,7 @@ void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
         } else {
             memset(stats, 0, sizeof *stats);
         }
+        stats->fault_mode = atomic_load_explicit(&e->fault_mode, memory_order_relaxed);
         pthread_mutex_unlock(&e->stats_lock);
         return;
     }
@@ -1204,9 +1211,47 @@ static uint64_t frames_in_ms(const Engine* e, uint64_t ms)
     return (ms * e->sample_rate + 500) / 1000;
 }
 
+/* Async completions are dispatched on the engine run loop, never inline
+ * inside the submit call. All ownership bookkeeping stays on that thread. */
+static IOReturn request_submitted(Request* req, IOReturn result)
+{
+    if (result == kIOReturnSuccess) {
+        req->pending = true;
+        req->engine->pending_requests++;
+    }
+    return result;
+}
+
+static bool request_completed(Request* req, IOReturn result)
+{
+    Engine* e = req->engine;
+    if (!req->pending) {
+        ENG_ERR("completion for a request not owned by USB; rebuilding stream");
+        atomic_store_explicit(&e->faulted, true, memory_order_relaxed);
+        return false;
+    }
+    req->pending = false;
+    e->pending_requests--;
+    /* Aborting a future transfer does not mean its planned bus time elapsed.
+     * Do this before inspecting frame lists, clock/feedback updates or submits.
+     * Draining also discards successful completions queued before AbortPipe. */
+    if (e->draining || atomic_load_explicit(&e->stopping, memory_order_relaxed) ||
+        atomic_load_explicit(&e->faulted, memory_order_relaxed)) return false;
+    if (result == kIOReturnAborted) {
+        ENG_ERR("unexpected USB cancellation; rebuilding stream");
+        atomic_store_explicit(&e->faulted, true, memory_order_relaxed);
+        CFRunLoopStop(CFRunLoopGetCurrent());
+        return false;
+    }
+    return true;
+}
+
 static IOReturn submit_capture(Request* req)
 {
     Engine* e = req->engine;
+    /* Refuse ownership violations before touching the buffer or frame list. */
+    if (req->pending || e->draining) return kIOReturnBusy;
+
     for (uint32_t i = 0; i < e->entries_per_request; i++) {
         req->frames[i].frStatus   = kUSBLowLatencyIsochTransferKey;
         req->frames[i].frReqCount = e->in_max;
@@ -1215,16 +1260,15 @@ static IOReturn submit_capture(Request* req)
     req->frame_start = e->next_in_frame;
     e->next_in_frame += REQUEST_MS;
 
-    if (fault_should_fail(e)) return kIOReturnNotResponding;
-
-    IOReturn result = (*e->in_intf)->LowLatencyReadIsochPipeAsync(
+    IOReturn result = fault_should_fail(e) ? kIOReturnNotResponding
+        : (*e->in_intf)->LowLatencyReadIsochPipeAsync(
         e->in_intf, e->in_pipe, req->buffer, req->frame_start,
         e->entries_per_request, 1, req->frames, capture_complete, req);
 
     /* Not on the bus, so not on the schedule: the frames stay unclaimed, for
      * the retry or for reschedule() to measure the gap from. */
     if (result != kIOReturnSuccess) e->next_in_frame = req->frame_start;
-    return result;
+    return request_submitted(req, result);
 }
 
 static void feedback_complete(void* refcon, IOReturn result, void* arg0);
@@ -1234,6 +1278,9 @@ static void feedback_complete(void* refcon, IOReturn result, void* arg0);
 static IOReturn submit_feedback(Request* req)
 {
     Engine* e = req->engine;
+    /* Refuse ownership violations before touching the buffer or frame list. */
+    if (req->pending || e->draining) return kIOReturnBusy;
+
 
     for (uint32_t i = 0; i < e->fb_entries_per_request; i++) {
         req->frames[i].frStatus   = kUSBLowLatencyIsochTransferKey;
@@ -1244,9 +1291,11 @@ static IOReturn submit_feedback(Request* req)
     req->frame_start = e->next_fb_frame;
     e->next_fb_frame += REQUEST_MS;
 
-    return (*e->out_intf)->LowLatencyReadIsochPipeAsync(
+    IOReturn result = (*e->out_intf)->LowLatencyReadIsochPipeAsync(
         e->out_intf, e->fb_pipe, req->buffer, req->frame_start,
         e->fb_entries_per_request, 1, req->frames, feedback_complete, req);
+    if (result != kIOReturnSuccess) e->next_fb_frame = req->frame_start;
+    return request_submitted(req, result);
 }
 
 /*
@@ -1268,6 +1317,8 @@ static void feedback_complete(void* refcon, IOReturn result, void* arg0)
     (void)arg0;
     Request* req = (Request*)refcon;
     Engine* e = req->engine;
+    if (!request_completed(req, result)) return;
+    if (!e->fb_pipe) return;
 
     if (result == kIOReturnIsoTooOld) reschedule(e);
 
@@ -1364,6 +1415,9 @@ static uint32_t planner_next(Engine* e)
 static IOReturn submit_playback(Request* req)
 {
     Engine* e = req->engine;
+    /* Refuse ownership violations before touching the buffer or frame list. */
+    if (req->pending || e->draining) return kIOReturnBusy;
+
     size_t offset = 0;
     size_t idx = (size_t)(req - e->out_requests);
 
@@ -1437,7 +1491,7 @@ static IOReturn submit_playback(Request* req)
      * retired rather than advertising a request that never went out. */
     bind_publish(e, idx, (uint8_t*)req->buffer,
                  req->data_frame_start, req->data_frame_end);
-    return kIOReturnSuccess;
+    return request_submitted(req, kIOReturnSuccess);
 }
 
 /*
@@ -1517,7 +1571,7 @@ static void reschedule(Engine* e)
         atomic_fetch_add_explicit(&e->dead_frames, gap, memory_order_relaxed);
         e->next_out_frame = start;
         emu_ts_filter_rebase(e->ts_filter,
-                             abs_to_ticks(at) + (SCHEDULE_LEAD_MS + REQUEST_MS) * e->ticks_per_ms);
+                             abs_to_ticks(at) + ((e->schedule_lead_ms ? e->schedule_lead_ms : SCHEDULE_LEAD_MS) + REQUEST_MS) * e->ticks_per_ms);
         atomic_store_explicit(&e->ts_resets, emu_ts_filter_resets(e->ts_filter),
                               memory_order_relaxed);
         e->generation++;
@@ -1566,6 +1620,7 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
     (void)arg0;
     Request* req = (Request*)refcon;
     Engine* e = req->engine;
+    if (!request_completed(req, result)) return;
 
     if (result == kIOReturnIsoTooOld) reschedule(e);
 
@@ -1654,6 +1709,7 @@ static void playback_complete(void* refcon, IOReturn result, void* arg0)
     (void)arg0;
     Request* req = (Request*)refcon;
     Engine* e = req->engine;
+    if (!request_completed(req, result)) return;
 
     if (result == kIOReturnIsoTooOld) reschedule(e);
 
@@ -1876,7 +1932,7 @@ static void clear_resources(Engine* e)
     e->out_intf = NULL;
     e->run_loop = NULL;
     e->in_pipe = e->out_pipe = 0;
-    e->fb_pipe = 0;
+    e->fb_pipe = e->fb_abort_pipe = 0;
     for (int i = 0; i < MAX_REQUESTS; i++) {
         e->in_requests[i].buffer  = NULL; e->in_requests[i].frames  = NULL;
         e->out_requests[i].buffer = NULL; e->out_requests[i].frames = NULL;
@@ -1886,8 +1942,9 @@ static void clear_resources(Engine* e)
     }
 }
 
-static void teardown(Engine* e)
+static void quiesce(Engine* e)
 {
+    e->draining = true;
     /* The direct path hands the IO thread pointers into buffers this function
      * frees, so a writer can be inside one right now. Closing the shared gate
      * atomically excludes a new writer and records one already admitted;
@@ -1901,6 +1958,48 @@ static void teardown(Engine* e)
     while ((atomic_load_explicit(&e->bind_gate, memory_order_acquire) &
             BIND_GATE_WRITING) != 0) {
         usleep(1000);
+    }
+
+    if (e->pending_requests) {
+        if (e->out_intf && e->out_pipe)
+            (*e->out_intf)->AbortPipe(e->out_intf, e->out_pipe);
+        if (e->in_intf && e->in_pipe)
+            (*e->in_intf)->AbortPipe(e->in_intf, e->in_pipe);
+        if (e->out_intf && e->fb_abort_pipe)
+            (*e->out_intf)->AbortPipe(e->out_intf, e->fb_abort_pipe);
+    }
+    CFAbsoluteTime warn_at = CFAbsoluteTimeGetCurrent() + 2.0;
+    while (e->pending_requests) {
+        /* A timeout is not permission to free controller-owned memory. Keep
+         * sources and engine alive until ownership is returned. If the USB
+         * stack fails to return callbacks, log the stall instead of hiding a
+         * use-after-free behind a successful StopIO. */
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+        if (e->pending_requests && CFAbsoluteTimeGetCurrent() >= warn_at) {
+            ENG_ERR("still draining USB: %u requests outstanding", e->pending_requests);
+            warn_at = CFAbsoluteTimeGetCurrent() + 5.0;
+        }
+    }
+}
+
+static void clear_engine_thread_policy(void);
+
+static void teardown(Engine* e)
+{
+    if (e->thread_policy_set) {
+        clear_engine_thread_policy();
+        e->thread_policy_set = false;
+    }
+    quiesce(e);
+    if (e->in_source) {
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), e->in_source, kCFRunLoopDefaultMode);
+        CFRelease(e->in_source);
+        e->in_source = NULL;
+    }
+    if (e->out_source) {
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), e->out_source, kCFRunLoopDefaultMode);
+        CFRelease(e->out_source);
+        e->out_source = NULL;
     }
 
     for (int i = 0; i < MAX_REQUESTS; i++) {
@@ -1932,6 +2031,7 @@ static void teardown(Engine* e)
     if (e->device) (*e->device)->Release(e->device);
     if (e->service) IOObjectRelease(e->service);
     if (e->identity) set_running_identity(NULL);
+    clear_resources(e);
 }
 
 /*
@@ -2049,12 +2149,80 @@ static uint32_t schedule_depth(Engine* e, uint32_t safety_us)
     return (uint32_t)need;
 }
 
+/* All requests must be returned and the bind gate closed before rebasing.
+ * Initial retries have not answered StartIO; recovery retains its sample epoch. */
+static IOReturn prepare_schedule(Engine* e, uint64_t resume)
+{
+    if (e->pending_requests) return kIOReturnBusy;
+    UInt64 now = 0;
+    AbsoluteTime at;
+    IOReturn kr = (*e->out_intf)->GetBusFrameNumber(e->out_intf, &now, &at);
+    if (kr != kIOReturnSuccess) return kr;
+    if (!e->schedule_lead_ms) e->schedule_lead_ms = SCHEDULE_LEAD_MS;
+    e->next_in_frame = e->next_out_frame = e->next_fb_frame = now + e->schedule_lead_ms;
+    e->out_cursor = e->in_cursor = resume;
+    e->generation++;
+    e->fb_residue_q16 = 0;
+    e->feedback = emu_feedback_init(e->feedback_storage);
+    double interval_ns = 1000000.0 / e->entries_per_ms;
+    emu_feedback_set_nominal(e->feedback, e->sample_rate, (uint64_t)interval_ns);
+    uint64_t host = abs_to_ticks(at) + e->schedule_lead_ms * e->ticks_per_ms;
+    e->ts_filter = emu_ts_filter_init(e->ts_filter_storage, host,
+                                      REQUEST_MS * e->ticks_per_ms);
+    if (!e->ts_filter) return kIOReturnError;
+    timeline_publish(e, resume, host);
+    e->draining = false;
+    return kIOReturnSuccess;
+}
+
+static IOReturn queue_initial_requests(Engine* e, uint64_t resume)
+{
+    for (unsigned attempt = 0; attempt < 4; attempt++) {
+        if (atomic_load_explicit(&e->stopping, memory_order_relaxed))
+            return kIOReturnAborted;
+        IOReturn kr = prepare_schedule(e, resume);
+        if (kr != kIOReturnSuccess) return kr;
+        for (unsigned i = 0; e->in_intf && i < e->num_requests; i++) {
+            kr = submit_capture(&e->in_requests[i]);
+            if (kr != kIOReturnSuccess) break;
+        }
+        for (unsigned i = 0; kr == kIOReturnSuccess && i < e->num_requests; i++) {
+            /* Arm on an idle device; consumed once, after slot zero is owned
+             * by USB. This hits the partial-start cancellation path precisely. */
+            uint32_t expected = EMU_FAULT_STARTUP_STALE;
+            if (i == 1 && atomic_compare_exchange_strong_explicit(&e->fault_mode,
+                    &expected, EMU_FAULT_NONE, memory_order_relaxed, memory_order_relaxed)) {
+                ENG_LOG("injecting one stale startup after first playback submission");
+                kr = kIOReturnIsoTooOld;
+            } else {
+                kr = submit_playback(&e->out_requests[i]);
+            }
+        }
+        if (kr == kIOReturnSuccess) {
+            if (attempt) ENG_LOG("startup retry succeeded: lead %u ms, %u requests pending",
+                                 e->schedule_lead_ms, e->pending_requests);
+            return kr;
+        }
+        if (kr != kIOReturnIsoTooOld || attempt == 3) return kr;
+        uint32_t lead = e->schedule_lead_ms * 4;
+        if (lead > 256) lead = 256;
+        ENG_LOG("schedule stale during setup; draining %u requests, lead %u -> %u ms (retry %u/3)",
+                e->pending_requests, e->schedule_lead_ms, lead, attempt + 1);
+        quiesce(e);
+        e->schedule_lead_ms = lead;
+        /* No callbacks may resubmit during quiesce. Every slot is now free;
+         * prepare_schedule will use one consistent epoch for anchor and map. */
+    }
+    return kIOReturnError;
+}
+
 /* One streaming session: bring the device up, run it, take it down again.
  * Returns what ended it, so the thread above can tell a stop from a fault. */
 typedef enum { kSessionSetupFailed = -1, kSessionStopped = 0, kSessionFaulted = 1 } SessionEnd;
 
 static SessionEnd stream_session(Engine* e, bool announced)
 {
+    e->draining = false;
     emu_ring_reset(&e->input_ring);
 
     mach_timebase_info_data_t tb;
@@ -2117,6 +2285,8 @@ static SessionEnd stream_session(Engine* e, bool announced)
         e->fb_pipe = 0;
     }
 
+    e->fb_abort_pipe = e->fb_pipe;
+
     e->bytes_per_frame = out_alt->channels * out_alt->subframe_size;
     if (e->bytes_per_frame == 0) e->bytes_per_frame = 6;
     /* The direct path's whole map, besides the per-request ranges: a
@@ -2146,17 +2316,16 @@ static SessionEnd stream_session(Engine* e, bool announced)
     e->num_requests = schedule_depth(e, e->safety_us);
     emu_feedback_set_nominal(e->feedback, e->requested_rate, (uint64_t)(interval_ms * 1e6));
 
-    CFRunLoopSourceRef in_source = NULL, out_source = NULL;
-    if ((*e->out_intf)->CreateInterfaceAsyncEventSource(e->out_intf, &out_source) != kIOReturnSuccess) {
+    if ((*e->out_intf)->CreateInterfaceAsyncEventSource(e->out_intf, &e->out_source) != kIOReturnSuccess) {
         ENGINE_FAIL("setup step near line 2099");
     }
     if (e->in_intf &&
-        (*e->in_intf)->CreateInterfaceAsyncEventSource(e->in_intf, &in_source) != kIOReturnSuccess) {
+        (*e->in_intf)->CreateInterfaceAsyncEventSource(e->in_intf, &e->in_source) != kIOReturnSuccess) {
         ENGINE_FAIL("setup step near line 2103");
     }
     e->run_loop = CFRunLoopGetCurrent();
-    if (in_source) CFRunLoopAddSource(e->run_loop, in_source, kCFRunLoopDefaultMode);
-    CFRunLoopAddSource(e->run_loop, out_source, kCFRunLoopDefaultMode);
+    if (e->in_source) CFRunLoopAddSource(e->run_loop, e->in_source, kCFRunLoopDefaultMode);
+    CFRunLoopAddSource(e->run_loop, e->out_source, kCFRunLoopDefaultMode);
 
     UInt32 list_bytes = e->entries_per_request * sizeof(IOUSBLowLatencyIsocFrame);
     for (uint32_t i = 0; i < e->num_requests; i++) {
@@ -2193,117 +2362,13 @@ static SessionEnd stream_session(Engine* e, bool announced)
         }
     }
 
-    UInt64 now = 0;
-    AbsoluteTime at;
-    if ((*e->out_intf)->GetBusFrameNumber(e->out_intf, &now, &at) != kIOReturnSuccess) {
-        ENGINE_FAIL("setup step near line 2147");
-    }
-    /*
-     * The lead has to cover the time it takes to put the whole queue on the
-     * bus, not just one request. A deep schedule is scores of submissions --
-     * 81 requests at 48 kHz, so about 160 calls across both directions -- and
-     * with another engine setting up on the same bus at the same time, four
-     * milliseconds of lead elapses before the last of them lands. The first
-     * attempt keeps the old value, since it is enough on an idle bus and it is
-     * pure startup latency; a start that finds its schedule already gone
-     * doubles it and tries again.
-     */
-    if (e->schedule_lead_ms == 0) e->schedule_lead_ms = SCHEDULE_LEAD_MS;
-    e->next_in_frame = now + e->schedule_lead_ms;
-    e->next_out_frame = now + e->schedule_lead_ms;
-    e->next_fb_frame = now + e->schedule_lead_ms;
-
-    /* The timeline starts here, and it starts *known*: sample 0 is the first
-     * frame of the first packet, scheduled SCHEDULE_LEAD_MS bus frames ahead
-     * of the (frame number, host time) pair the controller just gave us.
-     * Anchoring from the schedule instead of waiting for the first completion
-     * means Core Audio's very first GetZeroTimeStamp is already on the
-     * device's timeline -- there is no host-clock placeholder to splice away
-     * from later, and a splice stalls the IO thread (FINDINGS). */
-    uint64_t start_host = abs_to_ticks(at) + e->schedule_lead_ms * e->ticks_per_ms;
-    e->ts_filter = emu_ts_filter_init(e->ts_filter_storage, start_host,
-                                      REQUEST_MS * e->ticks_per_ms);
-    if (!e->ts_filter) ENGINE_FAIL("timestamp filter would not initialise");
-
-    /*
-     * Resume on the timeline rather than restarting it.
-     *
-     * On a first start session_reset has already put frames_played at zero, so
-     * this is the original "sample 0 is the first packet". On a *rebuild* it is
-     * the frame the device had reached before the fault, and it has to be:
-     * Core Audio's sample time follows frames_played and does not restart mid
-     * session, so publishing zero here would leave it writing near the start of
-     * the timeline while the fresh requests carry frames from far along it --
-     * no request covering anything written, every frame dropped as unmapped,
-     * and silence with the whole transport reporting healthy.
-     *
-     * The cursors are pinned to the same value for the same reason: out_cursor
-     * survives teardown, and left alone it would resume an in-flight window
-     * ahead of where the anchor says the device is.
-     */
     uint64_t resume = atomic_load_explicit(&e->frames_played, memory_order_relaxed);
-    e->out_cursor = resume;
-    e->in_cursor  = resume;
-    timeline_publish(e, resume, start_host);
-
 #undef ENGINE_FAIL
-
     set_engine_thread_policy();
-
-    /* Capture first, so playback has measurements waiting instead of starving
-     * through its whole first request. The first playback request is bound
-     * by its submit; the rest are bound by the completion sweep as Core Audio
-     * starts writing -- until then they are silence either way. */
-    /*
-     * Putting the queue on the bus, with one retry.
-     *
-     * kIOReturnIsoTooOld here means the schedule went stale while setup ran:
-     * the start frame is chosen before the clock is set and verified, the alt
-     * settings selected and the buffers allocated, and SCHEDULE_LEAD_MS of
-     * margin does not survive another engine doing all of that at the same
-     * time on the same bus. That is not a failure, it is a stale schedule --
-     * exactly what reschedule() exists for mid-stream -- so it is rebuilt from
-     * the current bus frame and tried once more.
-     *
-     * Without this, starting two devices together reliably lost whichever
-     * finished setup second.
-     */
-    IOReturn sub_kr = kIOReturnSuccess;
-    const char* sub_what = "capture";
-    for (int attempt = 0; attempt < 4; attempt++) {
-        sub_kr = kIOReturnSuccess;
-        sub_what = "capture";
-        for (uint32_t i = 0; i < e->num_requests && sub_kr == kIOReturnSuccess && e->in_intf; i++) {
-            sub_kr = submit_capture(&e->in_requests[i]);
-        }
-        if (sub_kr == kIOReturnSuccess) {
-            sub_what = "playback";
-            for (uint32_t i = 0; i < e->num_requests && sub_kr == kIOReturnSuccess; i++) {
-                sub_kr = submit_playback(&e->out_requests[i]);
-            }
-        }
-        if (sub_kr != kIOReturnIsoTooOld) break;
-
-        /* Take back whatever did go on the bus before rebuilding the
-         * schedule, so the retry starts from an empty queue. */
-        uint32_t lead = e->schedule_lead_ms * 4;
-        if (lead > 256) lead = 256;
-        ENG_LOG("schedule went stale during setup; lead %u -> %u ms, retrying",
-                e->schedule_lead_ms, lead);
-        e->schedule_lead_ms = lead;
-
-        (*e->out_intf)->AbortPipe(e->out_intf, e->out_pipe);
-        if (e->in_intf) (*e->in_intf)->AbortPipe(e->in_intf, e->in_pipe);
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
-        reschedule(e);
-    }
+    e->thread_policy_set = true;
+    IOReturn sub_kr = queue_initial_requests(e, resume);
     if (sub_kr != kIOReturnSuccess) {
-        /* The queue would not go on the bus. kIOReturnNoBandwidth here means
-         * the controller cannot reserve isochronous time for this schedule. */
-        ENG_ERR("setup failed: %{public}s queue would not submit (0x%08x)%{public}s",
-                sub_what, sub_kr,
-                sub_kr == kIOReturnNoBandwidth ? " -- no isochronous bandwidth" :
-                sub_kr == kIOReturnIsoTooOld   ? " -- schedule still stale after a rebuild" : "");
+        ENG_ERR("setup queue failed (0x%08x); draining before teardown", sub_kr);
         teardown(e);
         return kSessionSetupFailed;
     }
@@ -2332,20 +2397,6 @@ static SessionEnd stream_session(Engine* e, bool announced)
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false);
     }
     atomic_store_explicit(&e->streaming, false, memory_order_release);
-
-    clear_engine_thread_policy();
-
-    (*e->out_intf)->AbortPipe(e->out_intf, e->out_pipe);
-    if (e->in_intf) (*e->in_intf)->AbortPipe(e->in_intf, e->in_pipe);
-    if (e->fb_pipe) (*e->out_intf)->AbortPipe(e->out_intf, e->fb_pipe);
-    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.3, false);
-
-    if (in_source) {
-        CFRunLoopRemoveSource(e->run_loop, in_source, kCFRunLoopDefaultMode);
-        CFRelease(in_source);
-    }
-    CFRunLoopRemoveSource(e->run_loop, out_source, kCFRunLoopDefaultMode);
-    CFRelease(out_source);
 
     /* Closing the gate drains the last IO callback, so take the post-mortem
      * only after teardown: every callback-local diagnostic has landed and no
@@ -2532,6 +2583,7 @@ bool emu_engine_start(EmuEngine* e, uint32_t sample_rate, uint32_t output_safety
         pthread_join(e->thread, NULL);
         e->thread_joinable = false;
     }
+    e->schedule_lead_ms = SCHEDULE_LEAD_MS;
     e->requested_rate = sample_rate;
     e->safety_us = output_safety_us;
     e->with_input = with_input;
@@ -2591,9 +2643,9 @@ void emu_engine_stop(EmuEngine* e)
         pthread_mutex_unlock(&e->lifecycle_lock);
         return;
     }
-    bool was_running = atomic_load_explicit(&e->running, memory_order_acquire);
     atomic_store_explicit(&e->stopping, true, memory_order_relaxed);
-    if (was_running && e->run_loop) CFRunLoopStop(e->run_loop);
+    /* The engine checks stopping at least every 250 ms. Do not race its
+     * source teardown by reading its thread-owned run_loop here. */
     pthread_join(e->thread, NULL);
     e->thread_joinable = false;
     atomic_store_explicit(&e->running, false, memory_order_release);

@@ -236,6 +236,7 @@ typedef enum {
     EMU_FAULT_NONE       = 0,
     EMU_FAULT_TRANSIENT  = 1,
     EMU_FAULT_PERSISTENT = 2,
+    EMU_FAULT_STARTUP_STALE = 3, /* once on next setup, after a partial queue */
 } EmuFaultMode;
 
 void     emu_engine_inject_fault(EmuEngine* engine, EmuFaultMode mode);
