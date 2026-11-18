@@ -639,6 +639,57 @@ static void clients_and_sessions(AudioObjectID dev)
     CHECK(!d->engine->running);
 }
 
+static void client(AudioObjectID dev, UInt32 id, bool add)
+{
+    AudioServerPlugInClientInfo info = { .mClientID = id, .mProcessID = (pid_t)(1000 + id) };
+    CHECK((add ? gEMUInterface.AddDeviceClient : gEMUInterface.RemoveDeviceClient)(D, dev, &info) == 0);
+}
+
+/* What coreaudiod was measured to send: one StartIO when the first client
+ * starts and one StopIO when the last one stops, whoever those are. On the
+ * Tracker Pre a session whose stop carried another client's ID ran on with
+ * nobody playing until coreaudiod restarted. */
+static void clients_as_core_audio_sends_them(AudioObjectID dev)
+{
+    Device* d = device_for_object(dev, NULL);
+
+    say("  clients 11 and 22 open the device; 11 starts first, 22 stops last:\n");
+    client(dev, 11, true);
+    client(dev, 22, true);
+    CHECK(gEMUInterface.StartIO(D, dev, 11) == 0);
+    CHECK(gEMUInterface.StopIO(D, dev, 22) == 0);
+    say("  engine running %d, clients %u\n", (int)d->engine->running, (unsigned)d->iOClients);
+    CHECK(!d->engine->running && d->iOClients == 0 && !d->ioUnowned);
+    CHECK(u32(dev, kAudioDevicePropertyDeviceIsRunning, GLOBAL) == 0);
+
+    say("  both start; 11 goes without stopping; 22 stops:\n");
+    CHECK(gEMUInterface.StartIO(D, dev, 11) == 0);
+    CHECK(gEMUInterface.StartIO(D, dev, 22) == 0);
+    client(dev, 11, false);
+    say("  engine running %d, clients %u\n", (int)d->engine->running, (unsigned)d->iOClients);
+    CHECK(d->engine->running && d->iOClients == 1);     /* 22 is still playing */
+    CHECK(gEMUInterface.StopIO(D, dev, 22) == 0);
+    say("  engine running %d, clients %u\n", (int)d->engine->running, (unsigned)d->iOClients);
+    CHECK(!d->engine->running && d->iOClients == 0);    /* and nothing of 11's is left */
+
+    say("  11 starts, then goes without stopping while 22 is still open:\n");
+    client(dev, 11, true);
+    CHECK(gEMUInterface.StartIO(D, dev, 11) == 0);
+    client(dev, 11, false);
+    say("  engine running %d, unowned %d\n", (int)d->engine->running, (int)d->ioUnowned);
+    CHECK(d->engine->running);                  /* 22 may be the one playing */
+    CHECK(u32(dev, kAudioDevicePropertyDeviceIsRunning, GLOBAL) == 1);
+    CHECK(gEMUInterface.StopIO(D, dev, 22) == 0);
+    CHECK(!d->engine->running && !d->ioUnowned);
+
+    say("  22 starts and is the only client left when it goes without stopping:\n");
+    CHECK(gEMUInterface.StartIO(D, dev, 22) == 0);
+    client(dev, 22, false);
+    say("  engine running %d, clients %u\n", (int)d->engine->running, (unsigned)d->iOClients);
+    CHECK(!d->engine->running && d->iOClients == 0 && !d->ioUnowned);
+    CHECK(d->sessionsReaped == 1 && d->startersRemoved == 3 && d->foreignStops == 2);
+}
+
 static void* slow_start(void* arg)
 {
     AudioObjectID dev = *(AudioObjectID*)arg;
@@ -793,6 +844,9 @@ int main(void)
 
     say("== clients and sessions, Tracker Pre\n");
     clients_and_sessions(tracker);
+
+    say("== clients as Core Audio sends them\n");
+    clients_as_core_audio_sends_them(tracker);
 
     say("== one unit starting while another plays\n");
     start_does_not_stall_others(tracker, emu0404);

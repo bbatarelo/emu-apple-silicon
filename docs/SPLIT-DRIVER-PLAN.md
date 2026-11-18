@@ -16,6 +16,45 @@ Claude Fable 5.2 owns driver implementation. Codex owns independent verification
 
 For the first hardware diagnosis, use the loaded host's client lifecycle events and unit diagnostics. Distinguish an actual second client from a stale client entry. Check the 50 ms engine statistics publication against the HAL-local counter and reproduce the disagreement with the actual two-process path. Keep regression coverage for real dropped frames, a client disappearing, another valid client still playing, late stops and concurrent devices. Run the existing loopback and recovery fixtures directly with the selected UID. Record the revision and individual results. A hardware-free pass or a recorded chirp alone does not qualify the driver.
 
+### Milestone work by Claude Fable 5.2, 18 November 2026
+
+Working tree on `22e69ba`, uncommitted. `make`, `make MODE=two-part` and `make test` pass; ASan/UBSan pass on the regression and two-process suites. **Not yet done: the install and every hardware row of the table above** — see *Install request* below.
+
+**The stale client was my design, not a lost callback.** Measured on this Mac against the installed one-part `9b96335-dirty`, with two processes running silent IOProcs on the Tracker Pre: `startIOCalls` went 0 → 1 when the first started and stayed 1 through the second starting and the first stopping; the transport stopped when the last one stopped. coreaudiod sends one `StartIO` for the first client and one `StopIO` for the last, not a pair per client. The per-client ID set added in `3a17426` waited for the starter's own stop. When another client overlapped a restart cycle, the single `StopIO` carried a different ID, was ignored as "not a starter", and the session ran on with one counted client — the cycle-12 state. Which IDs coreaudiod puts on the two calls is not yet observed; the plug-in now logs every add, remove, start and stop with client ID and PID so the first hardware run shows it.
+
+The rule now: a stop ends the session if it comes from the starter **or from any client registered on this adoption of the slot**; it is ignored only from a client that is neither, which is what a stop left over from before an unplug looks like. A removed client's outstanding start is dropped with it. If it was the only start and other clients are still registered, the session is left to them (they may be the ones playing) and ends on their stop or when none is left. The existing `clients_and_sessions` assertions are unchanged and pass.
+
+**The counter skew was two clocks, and one-part had it too.** `framesToOutput` was the plug-in's live count; `framesBound` came from the engine — mid-write in one-part (the 1/20 A1 failure, one 512-frame buffer), up to 50 ms old in two-part (10 of 12 B cycles). Now the engine keeps the books itself and they are read as of one moment between writes:
+
+| Diagnostic | Meaning |
+|---|---|
+| `framesToOutput` | Frames whose fate is known: offered to a session + `framesRefused` + `framesDropped`. Same reading as `framesBound`, so the hardware suites' `bound == written` compares like with like. |
+| `framesRefused` | Handed to an engine with no session to carry them (stopped, tearing down, between a fault and its rebuild). |
+| `framesDropped` | Two-part: never reached the engine — store full, oversized, discarded by the pump, or no engine. |
+| `framesQueued` | Two-part: written, not yet taken by the engine. |
+| `framesUnpublished` | Two-part: taken by the engine, not yet in its published figures (≤ 50 ms). |
+| `framesUnreconciled` | Two-part: taken by an engine whose session ended before it published figures covering them. Stays. |
+| `framesSubmitted` | The plug-in's own count of every frame Core Audio wrote; never reset. Codex's review asked for it. |
+
+A lost, refused or late frame is in `framesToOutput` and not in `framesBound`, so the unchanged assertion still fails on real loss. A counter reset rebases the books from one coherent reading instead of zeroing them under a write (Codex's reset-race finding). Shared ABI is now 2: HAL and engine must be installed together once.
+
+**UID-targeted workflow.** `build/bin/hal-stream` opens a silent duplex IOProc on the unit `EMU_DEVICE` names, refuses to choose when several match, and restores any rate or buffer it was asked to set. `make test-recovery` starts and stops that stream itself instead of asking for the device to be selected and played to; its existing checks are unchanged, and it adds a fourth step (reopen, audio flows, transport idle and `ioClients 0` afterwards). `make test-integration` resolves the full UID first. `EMU_DEVICE=<uid> make test-device` runs restart, injected startup and recovery in order. `make install MODE=two-part` records the system input, output and sound-effects selections by UID and puts back any that moved.
+
+**New regression coverage.** `test-usb-abort`: 20,000 stats readings against a continuously writing thread, refused and unmapped frames visible, reset under a concurrent write. `test-hal-surface`: one start and a stop from another registered client; a starter removed with another still playing; a sole client removed. `test-split`: one write read across the process boundary before and after publication; a write with no session; an engine that dies after binding a write and before publishing it (256 submitted, 0 written, 256 unreconciled). One existing split assertion changed: the deliberately oversized write is now part of what was handed over, so the post-stop sum includes `framesDropped`.
+
+**Install request (Fable → Codex).** I have no sudo. From this checkout, with nothing playing on either unit:
+
+```sh
+make MODE=two-part && make install MODE=two-part     # once; restarts coreaudiod
+make engine-status                                    # both units listed, halPid non-zero
+log stream --predicate 'subsystem == "net.batarelo.EMUTrackerPre"' --info   # client lifecycle
+EMU_DEVICE=3F0A make test-device                      # Tracker Pre: restart ×20, injected ×20, recovery
+EMU_DEVICE=3F04 make test-device                      # 0404, cabling-independent only
+make reload && EMU_DEVICE=3F0A make test-device       # daily loop: new engine PID, same coreaudiod/HAL PIDs
+```
+
+Leave it installed. The first thing to read after a restart suite is `staleStops`, `foreignStops` and `lastStartClient`/`lastStopClient` from `hal-check`: `foreignStops > 0` with the transport idle confirms the cycle-12 mechanism; `staleStops > 0` with the transport still running would mean coreaudiod stops with an ID it never registered, and the rule needs widening. Stream teardown and the 120-frame capture underrun are not addressed here and are still to be qualified separately on hardware.
+
 ## Decision and starting point
 
 Keep the README's `make` and `make install` as the release path. The user should get today's in-process audio HAL, separate CoreMIDI bundle and tools, with the existing prerequisites. Add an opt-in development build with a resident HAL and a replaceable, unprivileged E-MU USB engine. The development benefit is the ability to replace that engine while Core Audio and unrelated audio devices stay up. Audio clients using the E-MU may need to reopen.

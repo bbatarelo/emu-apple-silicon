@@ -13,7 +13,8 @@
 #   make reload     two-part only: replace the engine, leave Core Audio running
 #   make test-integration  silent start/retry tests (installed, idle device)
 #   make test-build  build all C test executables without running them
-#   make test-recovery  fault-inject the running driver and check it recovers
+#   make test-recovery  fault-inject the installed driver and check it recovers
+#   make test-device    both of the above on the unit EMU_DEVICE names
 #
 # Needs: Xcode command line tools, and Rust (stable). Nothing else.
 
@@ -208,6 +209,11 @@ $(BIN)/hal-check: tools/hal-check/main.c
 	@mkdir -p $(BIN)
 	@clang $(CFLAGS) -o $@ $< -framework CoreAudio -framework CoreFoundation
 
+# Only the two-part install uses it; the release recipe is as it was.
+$(BIN)/hal-defaults: tools/hal-defaults/main.c
+	@mkdir -p $(BIN)
+	@clang $(CFLAGS) -o $@ $< -framework CoreAudio -framework CoreFoundation
+
 $(BIN)/hal-record: tools/hal-record/main.c
 	@mkdir -p $(BIN)
 	@clang $(CFLAGS) -o $@ $< $(AUDIO_FRAMEWORKS)
@@ -235,10 +241,12 @@ $(BIN)/hal-loopback: tools/hal-loopback/*.c tools/hal-loopback/*.h
 # the engine service is registered before a HAL that needs it is loaded, and
 # removed before a HAL that owns USB itself is.
 
-install: $(HAL_BUILT) $(MIDI_BUNDLE) $(if $(filter two-part,$(MODE)),$(ENGINE))
+install: $(HAL_BUILT) $(MIDI_BUNDLE) $(if $(filter two-part,$(MODE)),$(ENGINE) $(BIN)/hal-defaults)
 	@echo "installing to $(INSTALL_DIR) (this needs your password)"
 	@codesign --verify --strict $(HAL_BUNDLE)
 ifeq ($(MODE),two-part)
+	@echo "the system's sound selections, to put back afterwards:"
+	@$(BIN)/hal-defaults save $(BUILD)/audio-defaults.txt
 	sudo ./scripts/engine-service.sh install "$(abspath $(ENGINE))" "$$(id -un)"
 else
 	@if [ -e $(ENGINE_PLIST) ]; then sudo ./scripts/engine-service.sh remove; fi
@@ -253,6 +261,8 @@ endif
 	@echo
 	@echo "installed. Select the device in System Settings > Sound."
 ifeq ($(MODE),two-part)
+	@echo "sound selections:"
+	@$(BIN)/hal-defaults restore $(BUILD)/audio-defaults.txt || echo "  (some could not be put back; see above)"
 	@echo "The engine runs from $(abspath $(ENGINE)): do not move this checkout."
 	@echo "After changing the engine: make reload    To go back: make install"
 endif
@@ -311,10 +321,22 @@ loopback: $(BIN)/hal-loopback
 	@$(BIN)/hal-loopback -w $(BUILD)/loopback.wav
 
 # Injects a transport fault into the installed driver and checks the engine
-# rebuilds, gives up when it should, and comes back. Needs the driver installed
-# and audio playing to it -- a fault can only go into a stream that exists.
-test-recovery: $(BIN)/hal-check
+# rebuilds, gives up when it should, and comes back. Needs the driver
+# installed. It opens its own silent stream on the unit EMU_DEVICE names -- a
+# fault can only go into a stream that exists -- so nothing has to be playing
+# and no default device changes.
+test-recovery: $(BIN)/hal-check $(BIN)/hal-stream
 	@./scripts/test-recovery.sh
+
+# Everything that runs unattended against one installed unit, named by UID:
+# the restart and startup-fault suites, then recovery. No cables.
+.PHONY: test-device
+test-device: test-integration
+	@$(MAKE) --no-print-directory test-recovery
+
+$(BIN)/hal-stream: tests/integration/hal-stream.c
+	@mkdir -p $(BIN)
+	@clang $(CFLAGS) -o $@ $< -framework CoreAudio -framework CoreFoundation
 
 # Hardware-free suite: safe to run without installing or opening a device.
 .PHONY: test-rust test-analysis test-regression test-build test-integration test-hal-startup
@@ -331,17 +353,24 @@ test-regression: test-usb-abort test-hal-surface
 
 # Build-only entry point for contributors; never installs a driver.
 test-build: $(BIN)/hal-loopback $(BIN)/usb-abort-test $(BIN)/hal-surface-test $(BIN)/hal-restart-test \
+            $(BIN)/hal-stream \
             $(TWO)/test/fake-engine $(TWO)/test/split-engine-test two-part
 
 # Run sequentially even under make -j: both tests use the same installed unit.
 # Recovery (active playback) and analog loopback (cables) have separate setup;
 # see tests/README.md rather than silently including them here.
-test-integration: $(BIN)/hal-restart-test
-	@$(BIN)/hal-restart-test
-	@$(BIN)/hal-restart-test --startup-stale
+#
+# The unit is resolved to its full UID first and the tests are given that:
+# with two units attached, "the first one found" is the wrong one half the
+# time, and hal-stream refuses to choose.
+test-integration: $(BIN)/hal-restart-test $(BIN)/hal-stream
+	@uid="$$($(BIN)/hal-stream --uid)" || exit 2; echo "unit: $$uid"; \
+	 EMU_DEVICE="$$uid" $(BIN)/hal-restart-test && \
+	 EMU_DEVICE="$$uid" $(BIN)/hal-restart-test --startup-stale
 
-test-hal-startup: $(BIN)/hal-restart-test
-	@$(BIN)/hal-restart-test --startup-stale
+test-hal-startup: $(BIN)/hal-restart-test $(BIN)/hal-stream
+	@uid="$$($(BIN)/hal-stream --uid)" || exit 2; echo "unit: $$uid"; \
+	 EMU_DEVICE="$$uid" $(BIN)/hal-restart-test --startup-stale
 
 # An installed two-part engine runs from this build directory, and launchd
 # keeps restarting it from there: removing it out from under the service leaves
@@ -405,8 +434,9 @@ $(TWO)/test/split-engine-test: tests/regression/split-engine-test.c driver/plugi
 
 # Requires an idle, installed E-MU. Streams silence; no default/rate changes.
 .PHONY: test-hal-restart
-test-hal-restart: $(BIN)/hal-restart-test
-	@$(BIN)/hal-restart-test
+test-hal-restart: $(BIN)/hal-restart-test $(BIN)/hal-stream
+	@uid="$$($(BIN)/hal-stream --uid)" || exit 2; echo "unit: $$uid"; \
+	 EMU_DEVICE="$$uid" $(BIN)/hal-restart-test
 
 $(BIN)/hal-restart-test: tests/integration/hal-restart-test.c tools/hal-check/main.c
 	@mkdir -p $(BIN)

@@ -477,7 +477,10 @@ static int mode_main(void)
     long long sent = diag(tracker, "framesToOutput");
     check(gEMUInterface.StopIO(D, tracker, 1) == 0, "StopIO");
     check(diag(tracker, "engineRunning") == 0 && diag(tracker, "engineStreaming") == 0, "engine reports stopped");
-    check(diag(tracker, "framesBound") + diag(tracker, "unmappedFrames") == sent && sent > 0,
+    /* The oversized write above is part of what was handed over, and is
+     * accounted for as dropped. */
+    check(diag(tracker, "framesDropped") == EMU_SHARED_MAX_IO + 1, "the refused write is counted as dropped frames");
+    check(diag(tracker, "framesBound") + diag(tracker, "unmappedFrames") + diag(tracker, "framesDropped") == sent && sent > 0,
           "every frame handed over is accounted for after the stop (%lld)", sent);
     check(diag(tracker, "framesPlayed") > 40000, "the last session's figures survive it");
     check(gEMUInterface.StartIO(D, tracker, 1) == 0, "StartIO again");
@@ -485,7 +488,57 @@ static int mode_main(void)
     report("second session", &r);
     check(r.seed > seed1, "a new session is a new timeline (seed %llu -> %llu)",
           (unsigned long long)seed1, (unsigned long long)r.seed);
+
+    /* The hardware suites compare what Core Audio wrote with what was bound
+     * between two readings of the diagnostics. The HAL counted the first
+     * itself, at once; the second came from the engine's figures, published
+     * every 50 ms -- so a reading taken straight after a write showed frames
+     * written and not bound that had in fact been bound, and 10 of 12 restart
+     * cycles on the Tracker Pre failed with no audio lost. One write, read at
+     * once and again after the engine has published. */
+    printf("Written and bound, read across the process boundary\n");
+    {
+        usleep(150000);                 /* everything from the run above is published */
+        long long w0 = diag(tracker, "framesToOutput"), b0 = diag(tracker, "framesBound");
+        long long u0 = diag(tracker, "unmappedFrames"), d0 = diag(tracker, "framesDropped");
+        uint64_t frames = 0, host = 0;
+        emu_engine_timeline(dev->engine, &frames, &host);
+        static float buffer[512 * 2];
+        AudioServerPlugInIOCycleInfo cycle;
+        memset(&cycle, 0, sizeof cycle);
+        cycle.mOutputTime.mSampleTime = (Float64)(frames + 4096);
+        gEMUInterface.DoIOOperation(D, tracker, tracker + kRole_StreamOutput, 0,
+                                    kAudioServerPlugInIOOperationWriteMix, 512, &cycle, buffer, NULL);
+        unsigned torn = 0, readings = 0;
+        long long w = w0, b = b0, u = u0;
+        for (; readings < 60; readings++) {     /* ~120 ms: across at least two publications */
+            w = diag(tracker, "framesToOutput") - w0;
+            b = diag(tracker, "framesBound") - b0;
+            u = diag(tracker, "unmappedFrames") - u0;
+            if (w != b + u || (w != 0 && w != 512)) torn++;
+            usleep(2000);
+        }
+        check(torn == 0, "no reading shows the write as written and not bound (%u of %u did)", torn, readings);
+        check(w == 512 && b + u == 512, "...and it is all there once the engine has published (%lld written, %lld bound)", w, b);
+        check(diag(tracker, "framesQueued") == 0 && diag(tracker, "framesDropped") == d0,
+              "nothing is left in flight and nothing was dropped");
+    }
     gEMUInterface.StopIO(D, tracker, 1);
+
+    /* The other half: a frame that really is lost must not be hidden by the
+     * same bookkeeping. With no session, Core Audio's writes go nowhere. */
+    {
+        long long w0 = diag(tracker, "framesToOutput"), b0 = diag(tracker, "framesBound");
+        static float buffer[256 * 2];
+        AudioServerPlugInIOCycleInfo cycle;
+        memset(&cycle, 0, sizeof cycle);
+        cycle.mOutputTime.mSampleTime = 1024;
+        gEMUInterface.DoIOOperation(D, tracker, tracker + kRole_StreamOutput, 0,
+                                    kAudioServerPlugInIOOperationWriteMix, 256, &cycle, buffer, NULL);
+        check(diag(tracker, "framesToOutput") - w0 == 256 && diag(tracker, "framesBound") == b0 &&
+              diag(tracker, "framesDropped") >= 256,
+              "a write the engine never received is written, unbound and counted as dropped");
+    }
 
     printf("Two devices at once: 44.1 kHz / 64 and 96 kHz / 512\n");
     set_rate(tracker, 44100);
@@ -620,6 +673,55 @@ static int mode_main(void)
     }
     gEMUInterface.StopIO(D, tracker, 2);
     check(!emu_engine_running(dev->engine), "the second client's stop does");
+
+    /* Work the engine took and never reported. Its figures reach the HAL
+     * every 50 ms; an engine that dies in between has bound frames -- or
+     * not -- that no figures will ever cover. They must not simply vanish
+     * from the count: the HAL knows how much of the store the last figures
+     * accounted for and how much the engine had taken. */
+    printf("The engine dies after binding a write, before publishing it\n");
+    check(gEMUInterface.StartIO(D, tracker, 3) == 0, "StartIO");
+    {
+        usleep(150000);
+        long long submitted0 = diag(tracker, "framesSubmitted");
+        long long written0 = diag(tracker, "framesToOutput"), bound0 = diag(tracker, "framesBound");
+        long long unreconciled0 = diag(tracker, "framesUnreconciled");
+        xpc_object_t msg = unit_message(dev->engine, "test-crash");
+        xpc_dictionary_set_bool(msg, "after_record", true);
+        xpc_object_t reply = NULL;
+        request(msg, 300, &reply);              /* never answered: it is waiting for the write */
+        if (reply) xpc_release(reply);
+
+        uint64_t frames = 0, host = 0;
+        emu_engine_timeline(dev->engine, &frames, &host);
+        static float buffer[256 * 2];
+        AudioServerPlugInIOCycleInfo cycle;
+        memset(&cycle, 0, sizeof cycle);
+        cycle.mOutputTime.mSampleTime = (Float64)(frames + 4096);
+        gEMUInterface.DoIOOperation(D, tracker, tracker + kRole_StreamOutput, 0,
+                                    kAudioServerPlugInIOOperationWriteMix, 256, &cycle, buffer, NULL);
+        check(WAIT_FOR(u32(tracker, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal) == 0, 3.0),
+              "the device goes offline");
+        long long submitted = diag(tracker, "framesSubmitted") - submitted0;
+        long long written = diag(tracker, "framesToOutput") - written0;
+        long long bound = diag(tracker, "framesBound") - bound0;
+        long long unreconciled = diag(tracker, "framesUnreconciled") - unreconciled0;
+        long long queued = diag(tracker, "framesQueued");
+        check(submitted == 256 && written == 0 && bound == 0,
+              "the write was submitted and is in nobody's published figures (%lld submitted, %lld written, %lld bound)",
+              submitted, written, bound);
+        check(unreconciled == 256 && queued == 0 && diag(tracker, "framesUnpublished") == 0,
+              "...and is reported as unreconciled, not as nothing (%lld unreconciled, %lld queued)",
+              unreconciled, queued);
+        check(submitted == written + unreconciled + queued, "the producer's count reconciles with the rest");
+    }
+    check(WAIT_FOR(atomic_load(&gEpoch) != 0, 15.0), "the HAL reconnects to the replacement");
+    gEMUInterface.StopIO(D, tracker, 3);
+    check(gEMUInterface.StartIO(D, tracker, 3) == 0 &&
+          u32(tracker, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal) == 1,
+          "and a client that reopens gets a stream");
+    gEMUInterface.StopIO(D, tracker, 3);
+    pid1 = engine_pid();
 
     printf("A clean engine reload: emu-engine ctl shutdown\n");
     {

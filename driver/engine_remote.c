@@ -73,6 +73,7 @@ struct Engine {
     _Atomic uint64_t generation;         /* of the running session */
     _Atomic uint32_t fault;
     _Atomic uint32_t gain_bits;
+    _Atomic uint64_t unsent_frames;      /* written by Core Audio with no session to take them */
     void (* _Atomic failed)(void*);
     void* _Atomic failed_context;
 
@@ -80,7 +81,11 @@ struct Engine {
     EmuEngineStats final;                /* last session's, as usb_engine.h promises */
     bool           have_final;
     EmuEngineStats recent;               /* last snapshot read whole, while running */
+    uint64_t       recent_tail;          /* ...and how much of `play` it accounts for */
     bool           have_recent;
+    /* Frames the engine took from `play` that no published figures ever
+     * covered: its session ended first. Bound or not, nobody can say. */
+    _Atomic uint64_t unreconciled;
 };
 
 static struct Engine  gProxies[MAX_PROXIES];
@@ -185,12 +190,19 @@ static void capture_final(struct Engine* e)
 {
     EmuShared* shm = atomic_load(&e->shm);
     EmuEngineStats stats;
-    bool fresh = shm && emu_shared_read_stats(shm, &stats);
+    uint64_t covered = 0;
+    bool fresh = shm && emu_shared_read_stats(shm, &stats, &covered);
     os_unfair_lock_lock(&e->stats_lock);
     /* An engine that died inside a publication left nothing readable; the
      * copy taken while it was still running is at most half a second old. */
-    if (!fresh && e->have_recent) { stats = e->recent; fresh = true; }
+    if (!fresh && e->have_recent) { stats = e->recent; covered = e->recent_tail; fresh = true; }
     if (fresh) {
+        /* After a clean stop the last figures cover everything the engine
+         * took. After anything else they may not, and what they miss is
+         * kept as its own number rather than left to look like nothing. */
+        uint64_t taken = atomic_load_explicit(&shm->pcm_tail, memory_order_acquire);
+        if (taken - covered <= EMU_RING_FRAMES)
+            atomic_fetch_add_explicit(&e->unreconciled, taken - covered, memory_order_relaxed);
         stats.engine_streaming = 0;
         e->final = stats;
         e->have_final = true;
@@ -202,15 +214,17 @@ static void capture_final(struct Engine* e)
 
 /* Keeps a whole copy of a running session's figures on this side of the
  * boundary. Control threads only. */
-static bool read_live(struct Engine* e, EmuShared* shm, EmuEngineStats* out)
+static bool read_live(struct Engine* e, EmuShared* shm, EmuEngineStats* out, uint64_t* tail)
 {
     EmuEngineStats stats;
-    bool ok = emu_shared_read_stats(shm, &stats);
+    uint64_t covered = 0;
+    bool ok = emu_shared_read_stats(shm, &stats, &covered);
     os_unfair_lock_lock(&e->stats_lock);
-    if (ok) { e->recent = stats; e->have_recent = true; }
-    else if (e->have_recent) { stats = e->recent; ok = true; }
+    if (ok) { e->recent = stats; e->recent_tail = covered; e->have_recent = true; }
+    else if (e->have_recent) { stats = e->recent; covered = e->recent_tail; ok = true; }
     os_unfair_lock_unlock(&e->stats_lock);
     if (ok && out) *out = stats;
+    if (ok && tail) *tail = covered;
     return ok;
 }
 
@@ -473,7 +487,7 @@ static void watchdog_on_queue(void)
         struct Engine* e = &gProxies[i];
         EmuShared* shm = atomic_load(&e->shm);
         if (!shm || !atomic_load(&e->running)) continue;
-        read_live(e, shm, NULL);
+        read_live(e, shm, NULL, NULL);
         uint64_t beat = atomic_load_explicit(&shm->heartbeat, memory_order_relaxed);
         uint64_t now = mach_absolute_time();          /* sampled after the read */
         if (beat && now > beat && now - beat > limit) {
@@ -684,9 +698,38 @@ bool emu_engine_streaming(EmuEngine* e)
 /* IO thread. */
 void emu_engine_write_output(EmuEngine* e, const float* frames, uint32_t count, uint64_t sample_pos)
 {
-    if (!e || !atomic_load_explicit(&e->running, memory_order_relaxed)) return;
+    if (!e) return;
     EmuShared* shm = atomic_load_explicit(&e->shm, memory_order_relaxed);
-    if (shm) emu_shared_write(shm, frames, count, sample_pos);
+    if (shm && atomic_load_explicit(&e->running, memory_order_relaxed)) {
+        emu_shared_write(shm, frames, count, sample_pos);
+    } else {
+        /* No session to send them to. Counted, as the one-part engine counts
+         * a write it has no session for. */
+        atomic_fetch_add_explicit(&e->unsent_frames, count, memory_order_relaxed);
+    }
+}
+
+/* What never reached the engine's books, and what has not reached them yet.
+ * Read live: a loss shows at once, and frames still in flight are reported as
+ * in flight rather than as written and unbound. */
+static void add_boundary_books(struct Engine* e, EmuShared* shm, EmuEngineStats* stats,
+                               bool have_covered, uint64_t covered)
+{
+    uint64_t dropped = atomic_load_explicit(&e->unsent_frames, memory_order_relaxed);
+    uint64_t queued = 0, unpublished = 0;
+    if (shm) {
+        dropped += atomic_load_explicit(&shm->hal_dropped_frames, memory_order_relaxed)
+                 + atomic_load_explicit(&shm->hal_oversize_frames, memory_order_relaxed)
+                 + atomic_load_explicit(&shm->pump.discarded_frames, memory_order_relaxed);
+        uint64_t head = atomic_load_explicit(&shm->pcm_head, memory_order_relaxed);
+        uint64_t tail = atomic_load_explicit(&shm->pcm_tail, memory_order_acquire);
+        if (head - tail <= EMU_RING_FRAMES) queued = head - tail;
+        if (have_covered && tail - covered <= EMU_RING_FRAMES) unpublished = tail - covered;
+    }
+    stats->frames_dropped      = dropped;
+    stats->frames_queued       = queued;
+    stats->frames_unpublished  = unpublished;
+    stats->frames_unreconciled = atomic_load_explicit(&e->unreconciled, memory_order_relaxed);
 }
 
 /* IO thread. */
@@ -734,7 +777,8 @@ void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
     EmuShared* shm = atomic_load(&e->shm);
     bool running = atomic_load(&e->running);
 
-    bool have = false;
+    bool have = false, have_covered = false;
+    uint64_t covered = 0;
     if (!running) {
         os_unfair_lock_lock(&e->stats_lock);
         if (e->have_final) { *stats = e->final; have = true; }
@@ -742,12 +786,16 @@ void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
     }
     if (!have && shm) {
         EmuEngineStats live;
-        if (running ? read_live(e, shm, &live) : emu_shared_read_stats(shm, &live)) *stats = live;
+        if (running ? read_live(e, shm, &live, &covered) : emu_shared_read_stats(shm, &live, &covered)) {
+            *stats = live;
+            have_covered = running;     /* stopped: what was missed is already in `unreconciled` */
+        }
     }
     if (!running) {
         stats->engine_streaming = 0;
         stats->fault_mode = atomic_load(&e->fault);
     }
+    add_boundary_books(e, shm, stats, have_covered, covered);
 }
 
 uint64_t emu_engine_frames_played(EmuEngine* e)
@@ -769,7 +817,10 @@ void emu_engine_reset_counters(EmuEngine* e)
         atomic_store_explicit(&shm->hal_dropped, 0, memory_order_relaxed);
         atomic_store_explicit(&shm->hal_dropped_frames, 0, memory_order_relaxed);
         atomic_store_explicit(&shm->hal_oversize, 0, memory_order_relaxed);
+        atomic_store_explicit(&shm->hal_oversize_frames, 0, memory_order_relaxed);
     }
+    atomic_store_explicit(&e->unsent_frames, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->unreconciled, 0, memory_order_relaxed);
     os_unfair_lock_lock(&e->stats_lock);
     e->have_final = false;
     os_unfair_lock_unlock(&e->stats_lock);

@@ -64,7 +64,11 @@ EMU_DEVICE=3F0A make test-integration   # Tracker Pre
 ```
 
 Use a unique UID or serial substring instead when multiple units have the same
-product ID. Without `EMU_DEVICE`, the first matching E-MU is selected.
+product ID. `EMU_DEVICE` is resolved to one full UID before anything runs
+(`build/bin/hal-stream --uid`); with several units attached and no
+`EMU_DEVICE`, or one that matches more than one, the tests stop and list the
+UIDs rather than pick one. `EMU_DEVICE=<uid> make test-device` runs
+`test-integration` and then `test-recovery` on that unit.
 
 `test-integration` runs the following two tests **sequentially**, also under
 `make -j`. It takes roughly a minute per unit. No loopback cables are needed.
@@ -89,11 +93,14 @@ These are explicit commands, excluded from `test-integration` because they need
 different starting conditions. There is no unattended command for every physical
 and listening check.
 
-- **Recovery:** play audio to the selected unit, then run
-  `EMU_DEVICE=3F04 make test-recovery`. The existing
-  `scripts/test-recovery.sh` injects transient and persistent transport failures,
-  checks recovery/dead-device reporting and clears the fault. Playback is
-  interrupted; restart it afterward and confirm sound returns.
+- **Recovery:** `EMU_DEVICE=3F04 make test-recovery`. The existing
+  `scripts/test-recovery.sh` opens its own silent stream on that unit
+  (`tests/integration/hal-stream.c`), injects transient and persistent
+  transport failures, checks recovery/dead-device reporting, clears the fault,
+  then reopens the stream and checks audio flows and the transport goes idle
+  with no client left. Nothing needs to be playing and no default device is
+  changed; anything else playing on that unit is interrupted. `EMU_RATE` and
+  `EMU_BUFFER` run it at a given rate and buffer size and restore both.
 - **Analog loopback:** connect and set levels as described in the
   [README diagnostics](../README.md#optional-diagnostics-and-troubleshooting),
   then use `make loopback` or the documented `hal-loopback` commands. Unlike the

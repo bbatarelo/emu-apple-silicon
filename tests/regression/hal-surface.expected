@@ -51,16 +51,19 @@ device object 2
   emuR resets: 0
   emuV is this build's version: 1
   emuS output safety: 4000 us
-  emuD diagnostics: 51 keys
-    anchorJitterMaxNs anchorJitterNs anchorUpdates bindRaces clockSourceIsHost counterResets
-    deadFrames emptyCapture engineAlive engineRunning engineStreaming faultInjected
-    feedbackChanges feedbackErrors feedbackMaxQ16 feedbackMinQ16 feedbackNominalQ16 feedbackOverflows
-    feedbackPackets feedbackQ16 feedbackRejected feedbackSilent feedbackStarved frameDeficit
-    framesBound framesCaptured framesPlayed framesToOutput inputDepth inputEnabled
-    inputOverruns inputUnderruns ioClients ioCycles outputLead outputUnderruns
-    recoveries recoveryFailures resyncs safetyOffsetUS scheduleClamped scheduleRequests
-    shortPlayback startIOCalls tsFallbacks tsResets unfilledPlayback unmappedAhead
-    unmappedFrames usbErrors writeLeadMax
+  emuD diagnostics: 67 keys
+    anchorJitterMaxNs anchorJitterNs anchorUpdates bindRaces clientAdds clientRemoves
+    clockSourceIsHost counterResets deadFrames emptyCapture engineAlive engineRunning
+    engineStreaming faultInjected feedbackChanges feedbackErrors feedbackMaxQ16 feedbackMinQ16
+    feedbackNominalQ16 feedbackOverflows feedbackPackets feedbackQ16 feedbackRejected feedbackSilent
+    feedbackStarved foreignStops frameDeficit framesBound framesCaptured framesDropped
+    framesPlayed framesQueued framesRefused framesSubmitted framesToOutput framesUnpublished
+    framesUnreconciled inputDepth inputEnabled inputOverruns inputUnderruns ioClients
+    ioCycles lastStartClient lastStopClient outputLead outputUnderruns recoveries
+    recoveryFailures registeredClients resyncs safetyOffsetUS scheduleClamped scheduleRequests
+    sessionsReaped shortPlayback staleStops startIOCalls startersRemoved stopIOCalls
+    tsFallbacks tsResets unfilledPlayback unmappedAhead unmappedFrames usbErrors
+    writeLeadMax
 == 0404 USB, slot 1
 device object 7
   name: E-MU 0404 USB
@@ -195,6 +198,28 @@ device object 7
   client 11's stop arrives late:
   engine running 1, clients 1
   engine: stop product=3f0a
+== clients as Core Audio sends them
+  clients 11 and 22 open the device; 11 starts first, 22 stops last:
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  engine: stop product=3f0a
+  engine running 0, clients 0
+  both start; 11 goes without stopping; 22 stops:
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  engine running 1, clients 1
+  engine: stop product=3f0a
+  engine running 0, clients 0
+  11 starts, then goes without stopping while 22 is still open:
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  engine running 1, unowned 1
+  engine: stop product=3f0a
+  22 starts and is the only client left when it goes without stopping:
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  engine: stop product=3f0a
+  engine running 0, clients 0
 == one unit starting while another plays
   engine: start product=3f0a rate=48000 safety_us=4000 input=1
   engine: gain product=3f0a 1.000000

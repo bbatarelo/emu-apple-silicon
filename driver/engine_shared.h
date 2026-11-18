@@ -67,7 +67,7 @@
 /* Bumped for any change to the region layout, EmuEngineStats, or the meaning
  * of a control message. A mismatch is refused at hello and at open; nothing is
  * reinterpreted. */
-#define EMU_ENGINE_ABI 1u
+#define EMU_ENGINE_ABI 2u
 
 #define EMU_SHARED_MAGIC UINT64_C(0x31304d4853554d45)   /* "EMUSHM01" */
 
@@ -108,7 +108,8 @@ typedef struct {
     _Atomic uint64_t records;           /* WriteMix calls forwarded */
     _Atomic uint64_t frames;            /* ...and the frames in them */
     _Atomic uint64_t invalid;           /* records refused: bad count */
-    _Atomic uint64_t reserved_count;    /* was: records lapped before the copy; cannot happen */
+    _Atomic uint64_t discarded_frames;  /* frames the HAL appended that were given back unbound:
+                                           an invalid record, a resync, a new session's start */
     _Atomic uint64_t resyncs;           /* queue indices found inconsistent */
     _Atomic uint32_t queue_depth_max;
     _Atomic uint32_t reserved;
@@ -143,6 +144,7 @@ typedef struct {
     _Atomic uint64_t hal_dropped;       /* writes refused: no record slot or no room in `play` */
     _Atomic uint64_t hal_dropped_frames;/* ...and the frames in them */
     _Atomic uint64_t hal_oversize;      /* writes refused: > EMU_SHARED_MAX_IO */
+    _Atomic uint64_t hal_oversize_frames;
 
     /* --- engine-written --------------------------------------------------- */
     _Alignas(64) _Atomic uint64_t q_tail;   /* first record the pump has not finished with */
@@ -156,6 +158,11 @@ typedef struct {
     _Atomic uint32_t stats_seq;         /* even: stable */
     _Atomic uint32_t stats_count;       /* snapshots published; 0 = none yet */
     EmuEngineStats   stats;
+    /* How much of `play` those figures account for: pcm_tail as it stood when
+     * they were taken, with no record half way through. Frames the engine has
+     * taken since (pcm_tail beyond this) are bound or discarded but not yet
+     * in the published books -- and never will be, if the engine dies first. */
+    _Atomic uint64_t stats_tail;
     EmuPumpStats     pump;
 
     /* --- records and PCM -------------------------------------------------- */
@@ -202,6 +209,7 @@ static inline void emu_shared_write(EmuShared* s, const float* frames, uint32_t 
     if (count == 0) return;
     if (count > EMU_SHARED_MAX_IO) {
         atomic_fetch_add_explicit(&s->hal_oversize, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s->hal_oversize_frames, count, memory_order_relaxed);
         return;
     }
     uint64_t head     = atomic_load_explicit(&s->q_head, memory_order_relaxed);
@@ -241,6 +249,17 @@ static inline void emu_shared_write(EmuShared* s, const float* frames, uint32_t 
 
 /* --- playback: engine side (the pump thread) -------------------------------- */
 
+/* Returns the frames of `play` up to `upto` to the HAL without binding them,
+ * and counts them: they were written by Core Audio and will not be heard. A
+ * distance no two honest sides can produce is not believed as a count. */
+static inline void emu_shared_give_back(EmuShared* s, uint64_t upto)
+{
+    uint64_t tail = atomic_load_explicit(&s->pcm_tail, memory_order_relaxed);
+    if (upto - tail <= EMU_RING_FRAMES)
+        atomic_fetch_add_explicit(&s->pump.discarded_frames, upto - tail, memory_order_relaxed);
+    atomic_store_explicit(&s->pcm_tail, upto, memory_order_release);
+}
+
 /* Looks at the oldest record without giving it up: its frames stay the
  * pump's, and the HAL will not write over them, until emu_shared_done. False
  * when there is none. A record that cannot be what the HAL wrote -- a count
@@ -256,7 +275,7 @@ static inline bool emu_shared_peek(EmuShared* s, EmuWriteRecord* out)
         if (head - tail > EMU_WRITE_QUEUE) {
             /* Not a state the two sides can reach together. Start again from
              * where the HAL is rather than read slots it may be rewriting. */
-            atomic_store_explicit(&s->pcm_tail, pcm_head, memory_order_release);
+            emu_shared_give_back(s, pcm_head);
             atomic_store_explicit(&s->q_tail, head, memory_order_release);
             atomic_fetch_add_explicit(&s->pump.resyncs, 1, memory_order_relaxed);
             return false;
@@ -270,7 +289,7 @@ static inline bool emu_shared_peek(EmuShared* s, EmuWriteRecord* out)
         atomic_fetch_add_explicit(&s->pump.invalid, 1, memory_order_relaxed);
         uint64_t resume = tail + 1 == head ? pcm_head
                                            : s->queue[(tail + 1) & EMU_WRITE_QUEUE_MASK].at;
-        atomic_store_explicit(&s->pcm_tail, resume, memory_order_release);
+        emu_shared_give_back(s, resume);
         atomic_store_explicit(&s->q_tail, tail + 1, memory_order_release);
     }
 }
@@ -289,8 +308,7 @@ static inline void emu_shared_done(EmuShared* s, const EmuWriteRecord* r)
  * side, with no pump running. */
 static inline void emu_shared_discard(EmuShared* s)
 {
-    atomic_store_explicit(&s->pcm_tail, atomic_load_explicit(&s->pcm_head, memory_order_acquire),
-                          memory_order_release);
+    emu_shared_give_back(s, atomic_load_explicit(&s->pcm_head, memory_order_acquire));
     atomic_store_explicit(&s->q_tail, atomic_load_explicit(&s->q_head, memory_order_acquire),
                           memory_order_release);
 }
@@ -331,23 +349,26 @@ static inline bool emu_shared_read_timeline(EmuShared* s, uint64_t* frames, uint
 
 /* --- stats ------------------------------------------------------------------ */
 
-static inline void emu_shared_publish_stats(EmuShared* s, const EmuEngineStats* stats)
+static inline void emu_shared_publish_stats(EmuShared* s, const EmuEngineStats* stats, uint64_t tail)
 {
     uint32_t seq = atomic_load_explicit(&s->stats_seq, memory_order_relaxed) | 1u;
     atomic_store_explicit(&s->stats_seq, seq, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
     memcpy(&s->stats, stats, sizeof *stats);
+    atomic_store_explicit(&s->stats_tail, tail, memory_order_relaxed);
     atomic_fetch_add_explicit(&s->stats_count, 1, memory_order_relaxed);
     atomic_store_explicit(&s->stats_seq, seq + 1, memory_order_release);
 }
 
-static inline bool emu_shared_read_stats(EmuShared* s, EmuEngineStats* out)
+static inline bool emu_shared_read_stats(EmuShared* s, EmuEngineStats* out, uint64_t* tail)
 {
     for (int attempt = 0; attempt < 8; attempt++) {
         uint32_t before = atomic_load_explicit(&s->stats_seq, memory_order_acquire);
         if (before & 1u) continue;
         if (atomic_load_explicit(&s->stats_count, memory_order_relaxed) == 0) return false;
         memcpy(out, &s->stats, sizeof *out);
+        uint64_t covered = atomic_load_explicit(&s->stats_tail, memory_order_relaxed);
+        if (tail) *tail = covered;
         atomic_thread_fence(memory_order_acquire);
         if (atomic_load_explicit(&s->stats_seq, memory_order_relaxed) == before) return true;
     }

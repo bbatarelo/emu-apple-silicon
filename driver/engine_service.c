@@ -71,6 +71,10 @@ typedef struct Unit {
     uint64_t   generation;
     pthread_t  pump;
     _Atomic bool pump_stop;
+    /* Odd while the pump is between binding a record and giving it back, so
+     * the published figures and the position they claim to cover are taken
+     * with no record counted in one and not the other. */
+    _Atomic uint32_t book_seq;
 } Unit;
 
 static Unit             gUnits[MAX_UNITS];
@@ -197,6 +201,8 @@ static void* pump_thread(void* arg)
                 bucket++;
             atomic_fetch_add_explicit(&s->pump.copy_delay[bucket], 1, memory_order_relaxed);
 
+            atomic_fetch_add_explicit(&u->book_seq, 1, memory_order_relaxed);
+            atomic_thread_fence(memory_order_release);
             /* The frames are this record's until emu_shared_done: the HAL
              * does not write where they are, however far ahead it gets. */
             uint32_t slot  = (uint32_t)(r.at & EMU_RING_MASK);
@@ -206,6 +212,7 @@ static void* pump_thread(void* arg)
             if (first < r.count)
                 emu_engine_write_output(e, &s->play[0], r.count - first, r.pos + first);
             emu_shared_done(s, &r);
+            atomic_fetch_add_explicit(&u->book_seq, 1, memory_order_release);
 
             atomic_fetch_add_explicit(&s->pump.records, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&s->pump.frames, r.count, memory_order_relaxed);
@@ -235,9 +242,22 @@ static void unit_publish_stats(Unit* u)
 {
     if (!u->shm || !u->engine) return;
     EmuEngineStats stats;
-    memset(&stats, 0, sizeof stats);
-    emu_engine_stats(u->engine, &stats);
-    emu_shared_publish_stats(u->shm, &stats);
+    uint64_t tail = 0, deadline = 0;
+    /* A record takes microseconds; retrying at once finds the pump between
+     * two. Given up after 2 ms, with whatever was read last. */
+    for (unsigned attempt = 0;; attempt++) {
+        uint32_t before = atomic_load_explicit(&u->book_seq, memory_order_acquire);
+        tail = atomic_load_explicit(&u->shm->pcm_tail, memory_order_relaxed);
+        memset(&stats, 0, sizeof stats);
+        emu_engine_stats(u->engine, &stats);
+        atomic_thread_fence(memory_order_acquire);
+        if (!(before & 1u) && atomic_load_explicit(&u->book_seq, memory_order_relaxed) == before) break;
+        uint64_t now = mach_absolute_time();
+        if (deadline == 0) deadline = now + (uint64_t)(2000000.0 * gTicksPerNs);
+        else if (now > deadline) break;
+        (void)attempt;
+    }
+    emu_shared_publish_stats(u->shm, &stats, tail);
 }
 
 static void unit_stop(Unit* u)
@@ -389,6 +409,8 @@ static void describe_unit(Unit* u, xpc_object_t d)
     PUT("halDropped", atomic_load(&s->hal_dropped));
     PUT("halDroppedFrames", atomic_load(&s->hal_dropped_frames));
     PUT("halOversize", atomic_load(&s->hal_oversize));
+    PUT("pumpDiscardedFrames", atomic_load(&p->discarded_frames));
+    PUT("framesQueued", atomic_load(&s->pcm_head) - atomic_load(&s->pcm_tail));
 #undef PUT
     xpc_object_t buckets = xpc_array_create(NULL, 0);
     for (unsigned i = 0; i < EMU_PUMP_DELAY_BUCKETS; i++)
@@ -400,7 +422,10 @@ static void describe_unit(Unit* u, xpc_object_t d)
     memset(&stats, 0, sizeof stats);
     emu_engine_stats(u->engine, &stats);
     xpc_dictionary_set_uint64(d, "framesPlayed", stats.frames_played);
+    xpc_dictionary_set_uint64(d, "framesOffered", stats.frames_offered);
+    xpc_dictionary_set_uint64(d, "framesRefused", stats.frames_refused);
     xpc_dictionary_set_uint64(d, "framesBound", stats.frames_bound);
+    xpc_dictionary_set_uint64(d, "unmappedFrames", stats.unmapped_frames);
     xpc_dictionary_set_uint64(d, "outputUnderruns", stats.underruns);
     xpc_dictionary_set_uint64(d, "unfilledPlayback", stats.unfilled_playback);
     xpc_dictionary_set_uint64(d, "bindRaces", stats.bind_races);
@@ -676,9 +701,18 @@ static void handle_message(xpc_connection_t peer, xpc_object_t msg, int role)
         Unit* u = find_unit(xpc_dictionary_get_uint64(msg, "product"),
                             xpc_dictionary_get_uint64(msg, "location"));
         bool mid = xpc_dictionary_get_bool(msg, "mid_publication");
+        bool after_record = xpc_dictionary_get_bool(msg, "after_record");
         xpc_release(reply);
         if (u && u->queue) {
             dispatch_async(u->queue, ^{
+                if (after_record && u->shm) {
+                    /* Dies with a record bound and no figures published that
+                     * cover it: publication happens on this queue, which is
+                     * held here until the pump has taken one more. */
+                    uint64_t before = atomic_load(&u->shm->pump.frames);
+                    for (int i = 0; i < 50000 && atomic_load(&u->shm->pump.frames) == before; i++)
+                        usleep(100);
+                }
                 if (mid && u->shm) {
                     atomic_store(&u->pump_stop, true);
                     if (u->running) pthread_join(u->pump, NULL);

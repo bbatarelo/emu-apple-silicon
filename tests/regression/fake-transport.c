@@ -61,6 +61,11 @@ struct Engine {
     uint8_t          store[EMU_RING_FRAMES * BYTES_PER_FRAME];
     _Atomic uint64_t frontier;          /* first frame the writer has not reached */
     _Atomic uint64_t played;
+    _Atomic uint32_t books_seq;
+    _Atomic uint64_t offered, refused, ahead;
+    /* The books at the last reset; _Atomic only so two control threads may
+     * touch them, each is written whole from one coherent reading. */
+    _Atomic uint64_t base_offered, base_refused, base_ahead, base_bound, base_late;
     _Atomic uint64_t bound;
     _Atomic uint64_t late;              /* written after they were transmitted */
     _Atomic uint64_t underruns;         /* transmitted before they were written */
@@ -273,7 +278,13 @@ bool emu_engine_start(EmuEngine* e, uint32_t sample_rate, uint32_t output_safety
     atomic_store(&e->frontier, 0);
     atomic_store(&e->played, 0);
     atomic_store(&e->bound, 0);
+    atomic_store(&e->offered, 0);
+    atomic_store(&e->ahead, 0);
     atomic_store(&e->late, 0);
+    atomic_store(&e->base_offered, 0);
+    atomic_store(&e->base_bound, 0);
+    atomic_store(&e->base_ahead, 0);
+    atomic_store(&e->base_late, 0);
     atomic_store(&e->underruns, 0);
     atomic_store(&e->write_lead_max, 0);
     atomic_store(&e->stop, false);
@@ -308,9 +319,31 @@ bool emu_engine_timeline(EmuEngine* e, uint64_t* frames, uint64_t* host_time)
     return *host_time != 0;
 }
 
+/* The books as of one moment between writes. */
+static void books(EmuEngine* e, uint64_t* offered, uint64_t* refused, uint64_t* bound,
+                  uint64_t* ahead, uint64_t* late)
+{
+    for (int attempt = 0; attempt < 100000; attempt++) {
+        uint32_t before = atomic_load(&e->books_seq);
+        *offered = atomic_load(&e->offered);
+        *refused = atomic_load(&e->refused);
+        *bound   = atomic_load(&e->bound);
+        *ahead   = atomic_load(&e->ahead);
+        *late    = atomic_load(&e->late);
+        if (!(before & 1u) && atomic_load(&e->books_seq) == before) return;
+    }
+}
+
 void emu_engine_write_output(EmuEngine* e, const float* frames, uint32_t count, uint64_t sample_pos)
 {
-    if (!atomic_load(&e->running)) return;
+    /* The same books, kept the same way, as the real engine: see bind_seq in
+     * usb_engine.c. */
+    atomic_fetch_add(&e->books_seq, 1);
+    if (!atomic_load(&e->running)) {
+        atomic_fetch_add(&e->refused, count);
+        atomic_fetch_add(&e->books_seq, 1);
+        return;
+    }
     float gain;
     uint32_t bits = atomic_load(&e->gain_bits);
     memcpy(&gain, &bits, sizeof gain);
@@ -322,12 +355,14 @@ void emu_engine_write_output(EmuEngine* e, const float* frames, uint32_t count, 
     for (uint32_t i = 0; i < count; i++) {
         uint64_t frame = sample_pos + i;
         if (frame < played) { atomic_fetch_add(&e->late, 1); continue; }
-        if (frame - played >= EMU_RING_FRAMES) continue;        /* beyond the schedule */
+        if (frame - played >= EMU_RING_FRAMES) { atomic_fetch_add(&e->ahead, 1); continue; }
         emu_pack_s24(&e->store[(size_t)(frame & EMU_RING_MASK) * BYTES_PER_FRAME],
                      frames + (size_t)i * 2, 1, gain);
         atomic_fetch_add(&e->bound, 1);
     }
     if (sample_pos + count > atomic_load(&e->frontier)) atomic_store(&e->frontier, sample_pos + count);
+    atomic_fetch_add(&e->offered, count);
+    atomic_fetch_add(&e->books_seq, 1);
 }
 
 void emu_engine_set_output_gain(EmuEngine* e, float gain)
@@ -342,9 +377,14 @@ void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
     memset(stats, 0, sizeof *stats);
     stats->frames_played    = atomic_load(&e->played);
     stats->frames_captured  = e->with_input ? stats->frames_played : 0;
-    stats->frames_bound     = atomic_load(&e->bound);
+    uint64_t offered, refused, bound, ahead, late;
+    books(e, &offered, &refused, &bound, &ahead, &late);
+    stats->frames_offered  = offered - atomic_load(&e->base_offered);
+    stats->frames_refused  = refused - atomic_load(&e->base_refused);
+    stats->frames_bound    = bound - atomic_load(&e->base_bound);
+    stats->unmapped_ahead  = ahead - atomic_load(&e->base_ahead);
+    stats->unmapped_frames = late - atomic_load(&e->base_late) + stats->unmapped_ahead;
     stats->underruns        = atomic_load(&e->underruns);
-    stats->unmapped_frames  = atomic_load(&e->late);
     stats->write_lead_max   = atomic_load(&e->write_lead_max);
     stats->input_enabled    = e->with_input;
     stats->input_underruns  = (uint32_t)atomic_load(&e->ring->missing);
@@ -356,8 +396,15 @@ void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
 
 void emu_engine_reset_counters(EmuEngine* e)
 {
-    atomic_store(&e->bound, 0);
-    atomic_store(&e->late, 0);
+    /* Rebased from one reading, never zeroed under a write: see bind_base
+     * in usb_engine.c. */
+    uint64_t offered, refused, bound, ahead, late;
+    books(e, &offered, &refused, &bound, &ahead, &late);
+    atomic_store(&e->base_offered, offered);
+    atomic_store(&e->base_refused, refused);
+    atomic_store(&e->base_bound, bound);
+    atomic_store(&e->base_ahead, ahead);
+    atomic_store(&e->base_late, late);
     atomic_store(&e->underruns, 0);
     atomic_store(&e->write_lead_max, 0);
     atomic_store(&e->ring->missing, 0);
