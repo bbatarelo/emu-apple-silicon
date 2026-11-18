@@ -257,6 +257,9 @@ typedef enum {
  * and a role by arithmetic.
  */
 #define EMU_MAX_DEVICES      4u
+/* Far more simultaneous IO clients than one device ever has; a start beyond
+ * it is refused rather than left uncounted. */
+#define EMU_MAX_IO_CLIENTS   64u
 #define DEVICE_OBJECT_BASE   2u
 #define DEVICE_OBJECT_STRIDE 5u
 
@@ -280,7 +283,16 @@ struct Device {
     EmuEngine* engine;
     _Atomic bool deviceAlive;
     Float64 sampleRate;
+    /* The clients that have started IO and not stopped it, by the ID Core
+     * Audio gave each. A count alone cannot tell whose stop is arriving, and
+     * a stop can arrive late -- after the engine was lost and another client
+     * restarted it, or after the unit was unplugged and this slot adopted
+     * again -- where a bare decrement would stop a session that is not the
+     * caller's. iOClients is how many of ioClientIDs are in use. */
     UInt32 iOClients;
+    UInt32 ioClientIDs[EMU_MAX_IO_CLIENTS];
+    /* Which adoption of this slot this is; see StartIO. */
+    UInt64 incarnation;
     Boolean inputActive;
     Boolean outputActive;
     InputMode inputMode;
@@ -304,6 +316,44 @@ struct Device {
 
 static Device   gDevices[EMU_MAX_DEVICES];
 static unsigned gDeviceCount;
+static UInt64   gAdoptions;         /* under gStateMutex */
+
+/*
+ * One per slot: held for the whole of a StartIO or StopIO on that slot's
+ * device, the engine's start and stop included, and by whatever else must not
+ * overlap one (a rate change; retiring the slot's engine).
+ *
+ * gStateMutex used to cover this, and it is the wrong lock for it: an engine
+ * start blocks for as long as the device takes to come up -- tens of
+ * milliseconds normally, seconds when it does not -- and gStateMutex is also
+ * what GetZeroTimeStamp takes on every device's IO thread. One unit starting
+ * therefore froze the clock of another unit that was already playing. Start
+ * and stop still have to be indivisible *per device*, so the client set and
+ * the engine cannot disagree; they have no reason to exclude anything else.
+ *
+ * Order: a slot's lifecycle lock, then gStateMutex. gStateMutex is never held
+ * while waiting for one of these, and never across an engine call that can
+ * block. Static because Device is cleared on adoption and a mutex must not be.
+ */
+static pthread_mutex_t gLifecycle[EMU_MAX_DEVICES] = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_MUTEX_INITIALIZER,
+};
+_Static_assert(EMU_MAX_DEVICES == 4, "gLifecycle has one initializer per slot");
+
+static inline pthread_mutex_t* device_lifecycle(const Device* dev)
+{
+    return &gLifecycle[dev - gDevices];
+}
+
+/* Position of `client` among the started clients, or -1. gStateMutex held. */
+static int io_client_index(const Device* dev, UInt32 client)
+{
+    for (UInt32 i = 0; i < dev->iOClients; i++) {
+        if (dev->ioClientIDs[i] == client) return (int)i;
+    }
+    return -1;
+}
 
 static inline AudioObjectID device_object(const Device* dev, DeviceRole role)
 {
@@ -614,6 +664,7 @@ static void device_adopt(Device* dev, unsigned index, const EmuUnit* unit)
     dev->muted          = false;
     dev->outputSafetyUS = OUTPUT_SAFETY_DEFAULT_US;
     dev->timelineSeed   = 1;
+    dev->incarnation    = ++gAdoptions;
     atomic_init(&dev->deviceAlive, true);
 
     dev->engine = emu_engine_create(dev->unitProductID, dev->unitLocationID);
@@ -648,6 +699,7 @@ static bool reconcile_devices(void)
     unsigned n = emu_enumerate_units(units, EMU_MAX_DEVICES);
 
     EmuEngine* retired[EMU_MAX_DEVICES];
+    unsigned   retired_slot[EMU_MAX_DEVICES];
     unsigned   retired_n = 0;
     bool changed = false;
 
@@ -661,6 +713,7 @@ static bool reconcile_devices(void)
             if (units[u].location_id == dev->unitLocationID) { still_there = true; break; }
         }
         if (!still_there) {
+            retired_slot[retired_n] = i;
             retired[retired_n++] = device_retire_locked(dev);
             changed = true;
         }
@@ -683,8 +736,14 @@ static bool reconcile_devices(void)
     pthread_mutex_unlock(&gStateMutex);
 
     /* Outside the lock: stop joins the engine thread, and that thread may be
-     * inside a callback that wants the same lock. */
-    for (unsigned i = 0; i < retired_n; i++) emu_engine_destroy(retired[i]);
+     * inside a callback that wants the same lock. Under the slot's lifecycle
+     * lock: a StartIO that took this engine before the slot was retired may
+     * still be inside its start, and the engine must outlive that call. */
+    for (unsigned i = 0; i < retired_n; i++) {
+        pthread_mutex_lock(&gLifecycle[retired_slot[i]]);
+        emu_engine_destroy(retired[i]);
+        pthread_mutex_unlock(&gLifecycle[retired_slot[i]]);
+    }
 
     return changed;
 }
@@ -849,6 +908,9 @@ static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d,
     }
     if (!known) return kAudioHardwareUnsupportedOperationError;
 
+    /* Not underneath a start: the engine must come up at the rate the device
+     * then reports. */
+    pthread_mutex_lock(device_lifecycle(dev));
     pthread_mutex_lock(&gStateMutex);
     Boolean was = input_wanted_locked(dev);
     dev->sampleRate = rate;
@@ -858,6 +920,7 @@ static OSStatus PerformDeviceConfigurationChange(AudioServerPlugInDriverRef d,
     dev->timelineSeed++;
     Boolean now = input_wanted_locked(dev);
     pthread_mutex_unlock(&gStateMutex);
+    pthread_mutex_unlock(device_lifecycle(dev));
 
     /* Under `auto` the rate decides the input direction, so crossing 176.4 kHz
      * changes whether the input stream is running. Nothing re-queries a stream
@@ -2026,70 +2089,121 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 c
 {
     DeviceRole role_ = kRole_Device;
     Device* dev = device_for_object(id, &role_);
-    (void)d; (void)client;
+    (void)d;
     if ((!dev || role_ != kRole_Device)) return kAudioHardwareBadObjectError;
 
     atomic_fetch_add_explicit(&dev->startIOCount, 1, memory_order_relaxed);
 
-    bool revived = false;
+    pthread_mutex_lock(device_lifecycle(dev));
+
     pthread_mutex_lock(&gStateMutex);
-    if (dev->iOClients == 0) {
+    if (!dev->present) {
+        pthread_mutex_unlock(&gStateMutex);
+        pthread_mutex_unlock(device_lifecycle(dev));
+        return kAudioHardwareBadObjectError;
+    }
+    EmuEngine* engine      = dev->engine;
+    UInt64     incarnation = dev->incarnation;
+    /* A session is needed for the first client -- and for any client that
+     * finds the engine not running. The engine ends a session on its own
+     * when it gives up on the device (and, in the two-part build, when the
+     * engine process goes away), and clients that had started may still be
+     * counted then; answering this start with success while nothing is on
+     * the bus is the "playing into a void" state. */
+    bool needsSession = dev->iOClients == 0 || !emu_engine_running(engine);
+    uint32_t rate   = (uint32_t)dev->sampleRate;
+    uint32_t safety = dev->outputSafetyUS;
+    bool withInput  = input_wanted_locked(dev);
+    pthread_mutex_unlock(&gStateMutex);
+
+    if (needsSession) {
         /* Blocks -- tens of milliseconds -- until the streams are scheduled on
          * the bus and the engine has published the timeline anchor for sample
          * 0. StartIO is off the IO path, so a slow start here is the sanctioned
          * kind, and it buys the property that matters: the very first
          * GetZeroTimeStamp is already on the device's clock. A host-clock
          * guess spliced to the device clock later stalls coreaudiod's IO
-         * thread for the length of the discrepancy (FINDINGS). */
-        /* gStateMutex is held here, so the effective answer is read against
-         * the same rate the engine is about to be started at. */
-        if (!emu_engine_start(dev->engine, (uint32_t)dev->sampleRate, dev->outputSafetyUS,
-                              input_wanted_locked(dev))) {
-            pthread_mutex_unlock(&gStateMutex);
+         * thread for the length of the discrepancy (FINDINGS).
+         *
+         * Without gStateMutex: see gLifecycle. The rate and the input choice
+         * were read together above and cannot change underneath, because a
+         * rate change takes this slot's lifecycle lock too. */
+        if (!emu_engine_start(engine, rate, safety, withInput)) {
+            pthread_mutex_unlock(device_lifecycle(dev));
             EMU_LOG("IO start failed: USB engine did not come up");
             return kAudioHardwareNotRunningError;
         }
-
-        /* Seed the host-clock fallback from the same anchor, so even the
-         * diagnostic "host" clock source starts on the device's timeline
-         * rather than at whatever mach_absolute_time StartIO ran at. */
-        uint64_t frames = 0, host = 0;
-        dev->anchorHostTime = emu_engine_timeline(dev->engine, &frames, &host) ? host : mach_absolute_time();
-        dev->periodCount = 0;
-        /* The one legitimate new timeline: a new session. Mid-stream the
-         * engine keeps its line continuous through anything the bus does,
-         * so nothing else ever changes the seed. */
-        dev->timelineSeed++;
-        push_gain_to_engine(dev);
-        EMU_LOG("IO started at %{public}.0f Hz", dev->sampleRate);
-        revived = true;
     }
-    dev->iOClients++;
-    pthread_mutex_unlock(&gStateMutex);
 
-    /* Outside the lock: PropertiesChanged re-enters the plug-in. A device the
+    OSStatus status = kAudioHardwareNoError;
+    pthread_mutex_lock(&gStateMutex);
+    if (!dev->present || dev->incarnation != incarnation) {
+        /* Unplugged while it was starting. The engine just started is the
+         * retired one; reconcile_devices is waiting on the lifecycle lock to
+         * destroy it, which stops it. This slot's device is not the one the
+         * caller asked for any more. */
+        status = kAudioHardwareBadObjectError;
+    } else {
+        if (needsSession) {
+            /* Seed the host-clock fallback from the same anchor, so even the
+             * diagnostic "host" clock source starts on the device's timeline
+             * rather than at whatever mach_absolute_time StartIO ran at. */
+            uint64_t frames = 0, host = 0;
+            dev->anchorHostTime = emu_engine_timeline(engine, &frames, &host) ? host : mach_absolute_time();
+            dev->periodCount = 0;
+            /* The one legitimate new timeline: a new session. Mid-stream the
+             * engine keeps its line continuous through anything the bus does,
+             * so nothing else ever changes the seed. */
+            dev->timelineSeed++;
+            push_gain_to_engine(dev);
+            EMU_LOG("IO started at %{public}.0f Hz", dev->sampleRate);
+        }
+        if (io_client_index(dev, client) < 0) {
+            if (dev->iOClients < EMU_MAX_IO_CLIENTS) {
+                dev->ioClientIDs[dev->iOClients++] = client;
+            } else {
+                /* Uncounted, this client's stop could never be told from a
+                 * stranger's. With clients already started the session is
+                 * theirs and stays; with none it cannot happen. */
+                status = kAudioHardwareIllegalOperationError;
+            }
+        }
+    }
+    pthread_mutex_unlock(&gStateMutex);
+    pthread_mutex_unlock(device_lifecycle(dev));
+
+    /* Outside the locks: PropertiesChanged re-enters the plug-in. A device the
      * engine gave up on is alive again the moment a fresh engine is on the
      * bus, which is what makes a client re-open the way back. */
-    if (revived) device_set_alive(dev, true);
-    return kAudioHardwareNoError;
+    if (needsSession && status == kAudioHardwareNoError) device_set_alive(dev, true);
+    return status;
 }
 
 static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID id, UInt32 client)
 {
     DeviceRole role_ = kRole_Device;
     Device* dev = device_for_object(id, &role_);
-    (void)d; (void)client;
+    (void)d;
     if ((!dev || role_ != kRole_Device)) return kAudioHardwareBadObjectError;
 
+    /* The client set's transition to empty and the engine's stop are
+     * indivisible from a new StartIO on this device -- that is what the
+     * lifecycle lock is -- without holding up any other device. */
+    pthread_mutex_lock(device_lifecycle(dev));
     pthread_mutex_lock(&gStateMutex);
-    bool last = (dev->iOClients > 0 && --dev->iOClients == 0);
-    if (last) {
-        /* Keep the client-count transition and the join indivisible from a
-         * new StartIO. The engine does not acquire plug-in state, and StopIO
-         * is already the control-thread operation that joins it. */
-        emu_engine_stop(dev->engine);
+    bool last = false;
+    EmuEngine* engine = dev->engine;
+    int at = dev->present ? io_client_index(dev, client) : -1;
+    if (at >= 0) {
+        dev->ioClientIDs[at] = dev->ioClientIDs[--dev->iOClients];
+        last = dev->iOClients == 0;
     }
+    /* Otherwise: a stop from a client that never started here, or whose
+     * start belonged to an earlier adoption of this slot. It has nothing to
+     * stop, and must not stop someone else's session. */
     pthread_mutex_unlock(&gStateMutex);
+    if (last) emu_engine_stop(engine);
+    pthread_mutex_unlock(device_lifecycle(dev));
     if (last) EMU_LOG("IO stopped");
     return kAudioHardwareNoError;
 }

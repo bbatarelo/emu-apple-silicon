@@ -530,7 +530,10 @@ struct Engine {
 
     /* ---- was file-scope state; per device now, so a second engine is a
      * second instance rather than a second copy of the driver. ---- */
-    EmuRing input_ring;
+    /* Where capture is written. The engine's own ring unless the owner has
+     * supplied one (emu_engine_set_input_ring); only changed while stopped. */
+    EmuRing* in_ring;
+    EmuRing own_ring;
     pthread_t thread;
     _Atomic bool running;
     bool thread_joinable;
@@ -762,6 +765,7 @@ EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id)
     if (!e) return NULL;
     e->unit_product_id  = product_id;
     e->unit_location_id = location_id;
+    e->in_ring = &e->own_ring;
     pthread_mutex_init(&e->lifecycle_lock, NULL);
     pthread_mutex_init(&e->stats_lock, NULL);
     pthread_mutex_init(&e->start_lock, NULL);
@@ -777,6 +781,18 @@ EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id)
     e->safety_us = 10000;
     e->with_input = true;
     return e;
+}
+
+bool emu_engine_set_input_ring(EmuEngine* e, struct EmuRing* ring)
+{
+    if (!e) return false;
+    pthread_mutex_lock(&e->lifecycle_lock);
+    /* thread_joinable, not running: a session that ended on its own still has
+     * a thread to reap, and only a stop proves nothing is writing the ring. */
+    bool idle = !e->thread_joinable;
+    if (idle) e->in_ring = ring ? ring : &e->own_ring;
+    pthread_mutex_unlock(&e->lifecycle_lock);
+    return idle;
 }
 
 void emu_engine_destroy(EmuEngine* e)
@@ -1036,7 +1052,7 @@ void emu_engine_read_input(EmuEngine* e, float* frames, uint32_t count, uint64_t
      * engine pointers the engine thread owns. Nothing writes the ring in this
      * mode, so reading it would only count underruns. */
     if (atomic_load_explicit(&e->running, memory_order_relaxed) && e->with_input) {
-        emu_ring_read_f32(&e->input_ring, sample_pos, frames, count);
+        emu_ring_read_f32(e->in_ring, sample_pos, frames, count);
     } else {
         memset(frames, 0, (size_t)count * EMU_RING_CHANNELS * sizeof(float));
     }
@@ -1083,8 +1099,8 @@ void emu_engine_reset_counters(EmuEngine* e)
 {
     if (!e) return;
     pthread_mutex_lock(&e->stats_lock);
-    atomic_store_explicit(&e->input_ring.missing, 0, memory_order_relaxed);
-    atomic_store_explicit(&e->input_ring.discarded, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->in_ring->missing, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->in_ring->discarded, 0, memory_order_relaxed);
     atomic_store_explicit(&e->usb_errors, 0, memory_order_relaxed);
     atomic_store_explicit(&e->ts_fallbacks, 0, memory_order_relaxed);
     /* Recovery history is diagnostics like the rest: without this a second
@@ -1189,9 +1205,9 @@ void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
 
     stats->input_enabled   = e->with_input;
     stats->frames_captured = atomic_load_explicit(&e->frames_captured, memory_order_relaxed);
-    stats->input_depth     = emu_ring_depth(&e->input_ring);
-    stats->input_underruns = atomic_load_explicit(&e->input_ring.missing, memory_order_relaxed);
-    stats->input_overruns  = atomic_load_explicit(&e->input_ring.discarded, memory_order_relaxed);
+    stats->input_depth     = emu_ring_depth(e->in_ring);
+    stats->input_underruns = atomic_load_explicit(&e->in_ring->missing, memory_order_relaxed);
+    stats->input_overruns  = atomic_load_explicit(&e->in_ring->discarded, memory_order_relaxed);
     stats->empty_capture   = atomic_load_explicit(&e->empty_capture, memory_order_relaxed);
     pthread_mutex_unlock(&e->stats_lock);
     stats->engine_streaming   = emu_engine_streaming(e) ? 1u : 0u;
@@ -1581,7 +1597,7 @@ static void reschedule(Engine* e)
      * stale immediately and would report a rebuild on every call. */
     if (e->in_intf && e->next_in_frame < start) {
         uint64_t gap = frames_in_ms(e, start - e->next_in_frame);
-        emu_ring_write_silence(&e->input_ring, e->in_cursor, (uint32_t)gap);
+        emu_ring_write_silence(e->in_ring, e->in_cursor, (uint32_t)gap);
         e->in_cursor += gap;
         atomic_fetch_add_explicit(&e->frames_captured, gap, memory_order_relaxed);
         e->next_in_frame = start;
@@ -1660,7 +1676,7 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
              * rate up to 96 kHz. The read stays inside the packet either way:
              * lead + frames x bytes_per_frame is frActCount exactly. */
             uint32_t lead = f->frActCount % e->bytes_per_frame;
-            emu_ring_write_s24(&e->input_ring, e->in_cursor,
+            emu_ring_write_s24(e->in_ring, e->in_cursor,
                                (const uint8_t*)req->buffer + offset + lead, frames);
         } else {
             /* Nothing usable for this interval: an error, or one of the empty
@@ -1673,7 +1689,7 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
              * One pop draws the nominal instead, which is within a frame of
              * what the measurement would have said. */
             frames = e->nominal_frames;
-            emu_ring_write_silence(&e->input_ring, e->in_cursor, frames);
+            emu_ring_write_silence(e->in_ring, e->in_cursor, frames);
             if (!atomic_load_explicit(&e->stopping, memory_order_relaxed))
                 atomic_fetch_add_explicit(&e->empty_capture, 1, memory_order_relaxed);
         }
@@ -2223,7 +2239,7 @@ typedef enum { kSessionSetupFailed = -1, kSessionStopped = 0, kSessionFaulted = 
 static SessionEnd stream_session(Engine* e, bool announced)
 {
     e->draining = false;
-    emu_ring_reset(&e->input_ring);
+    emu_ring_reset(e->in_ring);
 
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);

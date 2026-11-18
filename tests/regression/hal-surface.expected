@@ -1,0 +1,222 @@
+== factory and initialize
+  engine: create product=3f0a location=14100000
+  engine: create product=3f04 location=14200000
+== plug-in object 1
+  class aplg manufacturer: E-MU Systems (revival)
+  device list: 2 7
+  owned: 2 7
+== Tracker Pre, slot 0
+device object 2
+  name: E-MU Tracker Pre
+  uid: net.batarelo.EMUTrackerPre.E-MU-C7-3F0A-FAKE0001
+  model uid: E-MU Tracker Pre
+  manufacturer: E-MU Systems (revival)
+  class adev base aobj owner 1
+  streams global: 3 4
+  streams input: 3
+  streams output: 4
+  owned global: 3 4 5 6
+  owned input: 3
+  owned output: 4 5 6
+  controls: 5 6
+  transport usb  clock domain 0
+  alive 1 running 0 default 1 system default 1 hidden 0
+  zero timestamp period 8192
+  buffer frame size published 0, range published 0
+  related devices: size query 4 bytes, data 0 bytes
+  preferred stereo channels 1 2
+  nominal rate 48000 settable 1
+  available rates: 44100 48000 88200 96000 176400 192000
+  stream 3: class astr owner 2 direction 1 terminal micr start channel 1 latency 0 active 1 (settable 1)
+    virtual format: lpcm 48000 Hz flags=0x9 2 ch 32 bits 8 bytes/frame
+    physical format: lpcm 48000 Hz flags=0x9 2 ch 32 bits 8 bytes/frame
+    available formats: 6 virtual, 6 physical
+  stream 4: class astr owner 2 direction 0 terminal spkr start channel 1 latency 0 active 1 (settable 1)
+    virtual format: lpcm 48000 Hz flags=0x9 2 ch 32 bits 8 bytes/frame
+    physical format: lpcm 48000 Hz flags=0x9 2 ch 32 bits 8 bytes/frame
+    available formats: 6 virtual, 6 physical
+  volume 5: class vlme base levl scope outp element 0 scalar 1.000 dB 0.0 range -96.0..0.0 settable 1
+  mute 6: class mute base togl scope outp value 0 settable 1
+  custom properties:
+    emuD type plst qualifier none settable 0
+    emuK type cfst qualifier none settable 1
+    emuR type cfst qualifier none settable 1
+    emuS type plst qualifier none settable 1
+    emuI type cfst qualifier none settable 1
+    emuV type cfst qualifier none settable 0
+    emuX type cfst qualifier none settable 1
+  emuK clock source: device
+  emuI input mode: on
+  emuX fault: none
+  emuR resets: 0
+  emuV is this build's version: 1
+  emuS output safety: 4000 us
+  emuD diagnostics: 51 keys
+    anchorJitterMaxNs anchorJitterNs anchorUpdates bindRaces clockSourceIsHost counterResets
+    deadFrames emptyCapture engineAlive engineRunning engineStreaming faultInjected
+    feedbackChanges feedbackErrors feedbackMaxQ16 feedbackMinQ16 feedbackNominalQ16 feedbackOverflows
+    feedbackPackets feedbackQ16 feedbackRejected feedbackSilent feedbackStarved frameDeficit
+    framesBound framesCaptured framesPlayed framesToOutput inputDepth inputEnabled
+    inputOverruns inputUnderruns ioClients ioCycles outputLead outputUnderruns
+    recoveries recoveryFailures resyncs safetyOffsetUS scheduleClamped scheduleRequests
+    shortPlayback startIOCalls tsFallbacks tsResets unfilledPlayback unmappedAhead
+    unmappedFrames usbErrors writeLeadMax
+== 0404 USB, slot 1
+device object 7
+  name: E-MU 0404 USB
+  uid: net.batarelo.EMUTrackerPre.E-MU-69-3F04-FAKE0002
+  model uid: E-MU 0404 USB
+  manufacturer: E-MU Systems (revival)
+  class adev base aobj owner 1
+  streams global: 8 9
+  streams input: 8
+  streams output: 9
+  owned global: 8 9 10 11
+  owned input: 8
+  owned output: 9 10 11
+  controls: 10 11
+  uid translates to object 7
+  bare prefix translates to object 0
+== rates, Tracker Pre
+  rate | latency in/out | safety in/out (frames)
+  host: configuration change requested object=2 action=44100
+   44100 | 146 / 108 | 220 / 176
+  host: configuration change requested object=2 action=48000
+   48000 | 154 / 116 | 240 / 192
+  host: configuration change requested object=2 action=88200
+   88200 | 239 / 201 | 441 / 352
+  host: configuration change requested object=2 action=96000
+   96000 | 256 / 218 | 480 / 384
+  host: configuration change requested object=2 action=176400
+  176400 | 426 / 388 | 882 / 705
+  host: configuration change requested object=2 action=192000
+  192000 | 459 / 421 | 960 / 768
+  host: configuration change requested object=2 action=48000
+== output safety offset 'emuS', Tracker Pre
+  host: changed object=2 saft/outp emuS/glob
+  asked 1000 us: output safety 192 frames at 48000
+  host: changed object=2 saft/outp emuS/glob
+  asked 10000 us: output safety 480 frames at 48000
+  host: changed object=2 saft/outp emuS/glob
+  asked 50000 us: output safety 960 frames at 48000
+  host: changed object=2 saft/outp emuS/glob
+  asked 4000 us: output safety 192 frames at 48000
+== input mode 'emuI', Tracker Pre
+  host: changed object=2 stm#/glob stm#/inpt ownd/glob
+  host: changed object=3 sact/glob
+  host: configuration change requested object=2 action=48000
+  off: streams input: (none)
+  off: owned global: 4 5 6
+  host: changed object=2 stm#/glob stm#/inpt ownd/glob
+  host: changed object=3 sact/glob
+  host: configuration change requested object=2 action=48000
+  auto at 48000: streams input: 3
+  host: changed object=2 stm#/glob stm#/inpt ownd/glob
+  host: changed object=3 sact/glob
+  host: configuration change requested object=2 action=176400
+  auto at 176400: streams input: (none)
+  host: changed object=2 stm#/glob stm#/inpt ownd/glob
+  host: changed object=3 sact/glob
+  host: configuration change requested object=2 action=48000
+== input mode on the 0404, slot 1
+  host: changed object=2 stm#/glob stm#/inpt ownd/glob
+  host: changed object=3 sact/glob
+  host: configuration change requested object=7 action=48000
+  0404 streams input: (none)
+  Tracker Pre streams input: 3
+  host: changed object=2 stm#/glob stm#/inpt ownd/glob
+  host: changed object=3 sact/glob
+  host: configuration change requested object=7 action=48000
+== clock source, fault and reset, Tracker Pre
+  clock source: host
+  engine: fault product=3f0a mode=3
+  fault: startup-stale
+  engine: fault product=3f0a mode=0
+  engine: reset counters product=3f0a
+  resets: 1
+== volume and mute, Tracker Pre
+  engine: gain product=3f0a 0.125000
+  host: changed object=5 lcsv/glob lcdv/glob
+  engine: gain product=3f0a 0.000000
+  host: changed object=6 bcvl/glob
+  engine: gain product=3f0a 0.125000
+  host: changed object=6 bcvl/glob
+  engine: gain product=3f0a 1.000000
+  host: changed object=5 lcsv/glob lcdv/glob
+== IO seam, Tracker Pre
+  operations done: ReadInput (in place) WriteMix (in place)
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  running 1 after two StartIO
+  zero timestamp at start: sample 0 seed 15
+  zero timestamp after 2 periods + 100 frames: sample 16384 seed 15
+  zero timestamp asked again: sample 16384 seed 15
+  write at 4096 reached the engine at 4096, read at 2048 at 2048, input sample 0.25
+  negative sample time: engine writes 1 reads 1, input sample 0.00
+  engine reports failure:
+  host: changed object=2 livn/glob goin/glob
+  alive 0
+  zero timestamp with the engine gone: host clock, seed 15
+  engine: stop product=3f0a
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  host: changed object=2 livn/glob goin/glob
+  alive 1
+  zero timestamp new session: sample 0 seed 16
+  engine: stop product=3f0a
+== clients and sessions, Tracker Pre
+  client 11 starts:
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  the engine is lost while client 11 is still open:
+  host: changed object=2 livn/glob goin/glob
+  client 22 starts:
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  host: changed object=2 livn/glob goin/glob
+  engine running 1, alive 1, clients 2
+  client 11 stops, then stops again:
+  engine running 1, clients 1
+  a client that never started stops:
+  client 22 stops:
+  engine: stop product=3f0a
+  client 11 starts, the unit is unplugged and plugged back, client 33 starts:
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  engine: destroy product=3f0a (was running)
+  host: changed object=1 dev#/glob ownd/glob
+  host: changed object=7 lnam/glob
+  engine: create product=3f0a location=14100000
+  host: changed object=1 dev#/glob ownd/glob
+  host: changed object=2 lnam/glob
+  host: changed object=7 lnam/glob
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  client 11's stop arrives late:
+  engine running 1, clients 1
+  engine: stop product=3f0a
+== one unit starting while another plays
+  engine: start product=3f0a rate=48000 safety_us=4000 input=1
+  engine: gain product=3f0a 1.000000
+  while the other unit spent 250 ms starting: clock asked throughout, slowest answer under 20 ms
+  engine: stop product=3f0a
+  engine: stop product=3f04
+== hot-plug
+  Tracker Pre unplugged:
+  engine: destroy product=3f0a
+  host: changed object=1 dev#/glob ownd/glob
+  host: changed object=7 lnam/glob
+  device list: 7
+  Tracker Pre back, on another port:
+  engine: create product=3f0a location=14300000
+  host: changed object=1 dev#/glob ownd/glob
+  host: changed object=2 lnam/glob
+  host: changed object=7 lnam/glob
+  device list: 2 7
+  object 2 uid: net.batarelo.EMUTrackerPre.E-MU-C7-3F0A-FAKE0001
+  everything unplugged:
+  engine: destroy product=3f0a
+  engine: destroy product=3f04
+  host: changed object=1 dev#/glob ownd/glob
+  device list: (none)
+== done

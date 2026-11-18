@@ -11,7 +11,10 @@ Tests return a nonzero exit status on failure or unmet prerequisites.
 make test
 ```
 
-This never installs a driver, opens USB hardware, or starts audio. It runs:
+This never installs a driver, opens USB hardware, or starts audio. `make
+test-split` does start a process: a test engine, as a launchd service under a
+throwaway name in your own user domain, removed again when the test ends. It
+runs:
 
 | Command | Coverage | Source |
 | --- | --- | --- |
@@ -19,6 +22,8 @@ This never installs a driver, opens USB hardware, or starts audio. It runs:
 | `make test-analysis` | Synthetic signals exercising the loopback analyser | `tools/hal-loopback/` (`selftest`) |
 | `make test-regression` | Production USB callbacks and startup retries with a fake USB interface | `tests/regression/` |
 | `make test-usb-abort` | One regression: request ownership during cancellation, delayed completions, retries, and partial cleanup | `tests/regression/usb-abort-test.c` |
+| `make test-hal-surface` | Everything the HAL plug-in publishes and asks of the engine, compared with a recorded copy; whose session a start or stop belongs to; one unit starting while another plays | `tests/regression/hal-surface-test.c`, `hal-surface.expected` |
+| `make test-split` | The optional two-part driver across a real process boundary: sample placement, two units at once, engine crash, hang and reload, version mismatch, no engine | `tests/regression/split-engine-test.c`, `fake-transport.c`, `split-engine-test.sh` |
 
 The USB regression reproduces [issue #7](https://github.com/bbatarelo/emu-apple-silicon/issues/7)
 without relying on YouTube or timing luck. It includes the production engine
@@ -26,6 +31,25 @@ implementation so that it tests the real static callbacks, rather than a copy of
 their logic. See the [investigation](../docs/issue-investigations/ISSUE-7-INVESTIGATION.md)
 for the failure and fix. Passing this fake-interface test does not establish how
 the macOS USB stack behaves during unplug or sleep.
+
+`test-hal-surface` runs the production plug-in against a fake host, bus and
+engine and diffs what a client would see against `hal-surface.expected`. A
+change to a default, a property or a notification fails it; if the change is
+meant, `make hal-surface-accept` records the new surface and the diff goes in
+the same commit.
+
+`test-split` needs a login session, because launchd starts the test engine.
+From ssh or a CI runner without one it reports **NOT RUN** and fails;
+`EMU_ALLOW_SKIP=1` lets the rest of the suite pass without it. Its device is
+pretend -- host clock, playback looped into capture at the same sample index
+-- so it tests the boundary, not USB timing. For a sanitizer pass:
+
+```sh
+make test-regression test-split SANITIZE="-fsanitize=address,undefined -g" BUILD=build/asan
+```
+
+The two-part driver itself is described in
+[docs/SPLIT-DRIVER-PLAN.md](../docs/SPLIT-DRIVER-PLAN.md).
 
 ## After installing a change: hardware integration
 

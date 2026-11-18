@@ -163,10 +163,18 @@ bool emu_engine_set_identity_observer(void (*observer)(void));
  * setting 0, so no IN transaction reaches the bus, and playback is sized from
  * the explicit feedback endpoint instead of from capture (planner_next in
  * usb_engine.c). */
-/* One handle per attached device. Stage 1 permits exactly one; create returns
- * NULL if one is already outstanding. */
+/* One handle per attached unit; several may exist and run at once. */
 EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id);
 void       emu_engine_destroy(EmuEngine* engine);
+
+/* Points capture at a ring the caller owns instead of the engine's own, or
+ * back at its own with NULL. For an owner in another process: the ring can
+ * then live in memory both sides map, and capture lands in it on the same
+ * thread at the same moment it otherwise would. Only while stopped -- false,
+ * and nothing changes, if a session exists. The ring must outlive the engine
+ * or be replaced first. */
+struct EmuRing;
+bool       emu_engine_set_input_ring(EmuEngine* engine, struct EmuRing* ring);
 
 bool     emu_engine_start(EmuEngine* engine, uint32_t sample_rate, uint32_t output_safety_us,
                           bool with_input);
