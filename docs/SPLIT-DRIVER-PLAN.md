@@ -12,7 +12,7 @@ The source baseline is E-MU `fbf9595`. The local generic template at `29d81c7` s
 
 The user's architectural point 1 spans stages 1–5 below. Fable owns the implementation through a working optional two-part build, engine reload, and offline tests. Stage 1 only establishes the baseline. Codex owns stage 6 and the Tracker Pre comparison.
 
-The [independent verification log](issue-investigations/SPLIT-DRIVER-VERIFICATION.md) records reproducible intermediate findings. Resolve the playback-ownership, client-replacement and multi-device clock failures there before physical qualification.
+The playback-ownership, client-replacement and multi-device clock checks passed on the committed implementation. The [independent verification log](issue-investigations/SPLIT-DRIVER-VERIFICATION.md) records the original failures, retests and outstanding hardware checks.
 
 | Stage | Work | Evidence required |
 |---|---|---|

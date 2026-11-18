@@ -1,8 +1,23 @@
 # Optional split driver verification
 
-## Independent checks on the implementation in progress, November 18
+## Independent results for commit `3a17426`, November 18, 2026
 
-These results describe the working tree while the remote engine was being implemented. The final revision needs a rerun. Both tests use the production code with a fake audio source or host. Neither test starts USB streaming.
+Both modes built from a fresh clone of the feature commit. The default HAL, split HAL, engine executable and MIDI plug-in all passed `codesign --verify --strict`. Alternating the build modes preserved both HAL binary hashes. The two HALs expose the same bundle identifier and factory. Inspection of their imports found USB device access only in the one-part HAL and Mach-service calls only in the split HAL.
+
+| Check | Result |
+|---|---|
+| `make`, `make MODE=two-part`, then `make -j4 test-rust test-analysis test-regression test-build` | Passed. Includes 74 Rust tests, 15 signal-analysis checks, USB abort/startup invariants, the HAL surface snapshot and compilation of the hardware test programs. |
+| Direct lookup through the one-part HAL factory | The attached Tracker Pre and 0404 returned the same serial-based UIDs, six sample rates and 48 kHz safety offsets as before the change. |
+| Independent stalled-playback fixture | The production pump bound 32,768 correct frames. The producer rejected one 512-frame write when full. Zero frames reached the binder under the wrong timestamp. |
+| Independent HAL client replacement and clock fixtures | A replacement client successfully started a running transport. A late stop from the old client left it running. Tracker Pre's clock call took under 0.01 ms during a 250 ms start on the 0404. |
+| `make test-split` in Codex | Shared playback and missing-engine checks passed. The logged-in user's launchd namespace refused fixture bootstrap (error 5). The runner reported the affected cases as unexecuted and exited nonzero. |
+| Fable's two-process run in the logged-in session | Fable reported eight consecutive runs of 131 checks with zero failures. Both ASan and UBSan runs passed. TSan reported the pre-existing registry race and two reports on queue-serialized state that Fable judged instrumentation artifacts. Those two reports have not been independently resolved. |
+
+The installed HAL at verification time was the earlier `9b96335-dirty` build. The real Core Audio host, the system engine service, USB streaming and the analog A/B/A comparison still require a bench run. Historic forwarding measurements and the simulated pump timing cannot establish split-driver latency on hardware.
+
+## Defects reproduced during implementation
+
+These observations were taken during implementation. The three tests exercise production paths against a fake audio source or host without starting USB streaming.
 
 **Independent retest after Fable's PCM ownership and per-device lifecycle changes:** all three cases below passed. On the same 65-write stall, 64 records delivered 32,768 correct frames and one 512-frame write was refused when full. No incorrectly placed frame reached binding. `StartIO` for the new client returned success with an actually running transport, and the deferred old stop left the replacement running. The Tracker Pre clock call returned in under 0.01 ms while the 0404 start was still held for 250 ms. These are hardware-free correctness tests.
 
