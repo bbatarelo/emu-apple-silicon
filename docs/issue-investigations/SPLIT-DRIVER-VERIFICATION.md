@@ -1,5 +1,31 @@
 # Optional split driver verification
 
+## Tracker Pre hardware run on `14dd024`, November 18, 2026
+
+**Engine-only reload worked on the Mac. Latency parity is still open.** The new launchd process claimed USB and streamed real stereo audio. During reload, the engine PID changed from 45593 to 45681. The Core Audio daemon and HAL host kept PIDs 45615 and 45628. The original audio and MIDI bundles matched the preflight file hashes after the run, and the engine service plist was removed. [Reload log](../../captures/latency/2026-11-18-split/reload.log)
+
+The test measured the extra analog delay of forwarding input 2 through the Core Audio callback to output 1. All 18 recordings used 48 kHz, the requested buffer, device clock, 5 ms input and 4 ms output safety. All eight chirps returned on both channels in every recording. The two one-part legs used identical HAL binaries. The entries below give median delay in milliseconds and the number of recordings that passed every probe check. The last column uses the original frame estimates at 48 kHz to avoid millisecond rounding. [Raw recordings, settings and engine snapshots](../../captures/latency/2026-11-18-split)
+
+| Buffer | A1 one-part | B two-part | A2 one-part | B minus A1 / B minus A2 |
+|---|---|---|---|---|
+| 512 frames | 34.525 ms · 3/3 | 35.609 ms · 0/3 | 35.484 ms · 3/3 | +52 / +6 frames (+1.083 / +0.125 ms) |
+| 128 frames | 18.525 ms · 0/3 | 19.609 ms · 0/3 | 18.484 ms · 0/3 | +52 / +54 frames (+1.083 / +1.125 ms) |
+
+The A-to-A medians differed by 46 frames at 512 and 2 frames at 128. The HAL output-to-input callback separation was identical in all three legs at each buffer size (1456 and 688 frames respectively). At 128, the B result lay about 1.1 ms above both controls. The run cannot isolate how much of that came from the split.
+
+### Why the six B recordings are one transport session
+
+The split silent restart suite stopped at cycle 12 when the transport failed to become idle. Before the first chirp, and after every B recording, the Tracker Pre still had one HAL IO client and the engine was streaming. The engine reported generation 12 throughout, with its played-frame count advancing between recordings. A1 and A2 had zero clients and a stopped engine at every post-run checkpoint. On B, the 0404 was also the Mac's default output and was streaming in four of six post-run engine snapshots. The recorded data do not identify the client retaining the Tracker Pre. An application-level IOProc start in this state does not exercise a new USB session. [B preflight](../../captures/latency/2026-11-18-split/B/preflight.txt) · [B engine state after the last run](../../captures/latency/2026-11-18-split/B/128-3-engine.json)
+
+### What failed
+
+- All six one-part 128-frame recordings had one input and one output sample-time discontinuity. All six B recordings had continuous callback sample times. B was already streaming before the first recording, so startup behavior differed.
+- The live written/bound counter comparison failed in every B recording. The HAL reads its own written count live and the engine publishes its bound count roughly every 50 ms. Each later engine snapshot showed every pumped frame bound, zero HAL drops, zero bind races and a maximum queue depth of one. That establishes eventual equality at the checkpoint. It cannot prove every frame met its USB deadline. The largest observed per-recording pump delay was 0.482–0.542 ms. Playback underrun counters were already advancing with no benchmark IOProc running, so attributing the post-run totals to the chirps would overstate loss. [Counter comparison](../../captures/latency/2026-11-18-split/B/512-1.log) · [Engine readback](../../captures/latency/2026-11-18-split/B/512-1-engine.json)
+- One B recording at 512 recorded **120 input-underrun frames during the probe window**. Later statistics confirm the event. It merits investigation separately from the written/bound sampling issue. [Recording](../../captures/latency/2026-11-18-split/B/512-3.log) · [Engine readback](../../captures/latency/2026-11-18-split/B/512-3-engine.json)
+- Ordinary silent restarts passed 19/20 in A1. The failed check had one more 512-frame buffer bound than written in the sampled interval. In B, 2/12 completed cycles passed the live counter assertion, then the idle check timed out. The injected startup-fault suite never ran in either mode. The restart helper carried an older build stamp (`33fe611`), while the live HAL identified itself as `14dd024` and the helper source was identical across those revisions. [A1 restart log](../../captures/latency/2026-11-18-split/A1-silent-restarts.log) · [B restart log](../../captures/latency/2026-11-18-split/B-silent-restarts.log)
+
+Before attributing a fixed latency cost to the architecture, measure fresh Tracker Pre generations with zero clients and a stopped transport at both boundaries. Keep the 0404 idle for the single-device comparison. Run the restart stress separately from the chirps. If the Tracker stays active, record its owning client and start/stop events. Compare submitted and bound frames over the same completed work before evaluating transport loss, while retaining the independent capture-underrun and waveform checks.
+
 ## Independent results for commit `3a17426`, November 18, 2026
 
 Both modes built from a fresh clone of the feature commit. The default HAL, split HAL, engine executable and MIDI plug-in all passed `codesign --verify --strict`. Alternating the build modes preserved both HAL binary hashes. The two HALs expose the same bundle identifier and factory. Inspection of their imports found USB device access only in the one-part HAL and Mach-service calls only in the split HAL.
@@ -13,7 +39,7 @@ Both modes built from a fresh clone of the feature commit. The default HAL, spli
 | `make test-split` in Codex | Shared playback and missing-engine checks passed. The logged-in user's launchd namespace refused fixture bootstrap (error 5). The runner reported the affected cases as unexecuted and exited nonzero. |
 | Fable's two-process run in the logged-in session | Fable reported eight consecutive runs of 131 checks with zero failures. Both ASan and UBSan runs passed. TSan reported the pre-existing registry race and two reports on queue-serialized state that Fable judged instrumentation artifacts. Those two reports have not been independently resolved. |
 
-The installed HAL at verification time was the earlier `9b96335-dirty` build. The real Core Audio host, the system engine service, USB streaming and the analog A/B/A comparison still require a bench run. Historic forwarding measurements and the simulated pump timing cannot establish split-driver latency on hardware.
+At the time of the offline checks the installed HAL was the earlier `9b96335-dirty` build. The subsequent hardware results are recorded above.
 
 ## Defects reproduced during implementation
 

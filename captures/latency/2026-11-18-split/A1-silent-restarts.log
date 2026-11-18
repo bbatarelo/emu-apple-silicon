@@ -1,0 +1,25 @@
+  driver version    0.1.1 (git 14dd024)
+                    ** this build is 0.1.1 (git 33fe611) -- run: make install **
+Silent restart test: device 111, 20 cycles, startup fault off
+01 PASS callbacks=95 written=29184 bound=29184 unmapped=0 startIO=1
+02 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=2
+03 PASS callbacks=95 written=29184 bound=29184 unmapped=0 startIO=3
+04 PASS callbacks=95 written=29184 bound=29184 unmapped=0 startIO=4
+05 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=5
+06 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=6
+07 PASS callbacks=95 written=29184 bound=29184 unmapped=0 startIO=7
+08 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=8
+09 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=9
+10 PASS callbacks=95 written=28672 bound=28672 unmapped=0 startIO=10
+11 PASS callbacks=95 written=29184 bound=29184 unmapped=0 startIO=11
+12 PASS callbacks=95 written=28672 bound=28672 unmapped=0 startIO=12
+13 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=13
+14 PASS callbacks=94 written=29184 bound=29184 unmapped=0 startIO=14
+15 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=15
+16 PASS callbacks=95 written=28672 bound=28672 unmapped=0 startIO=16
+17 PASS callbacks=95 written=29184 bound=29184 unmapped=0 startIO=17
+18 FAIL callbacks=94 written=28672 bound=29184 unmapped=0 startIO=18
+19 PASS callbacks=95 written=28672 bound=28672 unmapped=0 startIO=19
+20 PASS callbacks=95 written=29184 bound=29184 unmapped=0 startIO=20
+1 failures out of 20 silent restarts
+make: *** [test-integration] Error 1

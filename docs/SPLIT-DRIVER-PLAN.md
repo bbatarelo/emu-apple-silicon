@@ -1,5 +1,21 @@
 # Optional split E-MU audio driver
 
+## Current milestone — a persistent, hardware-qualified development driver
+
+Install the optional split driver on the development Mac and leave it there for use. The README's plain `make` and `make install` remain the one-part release workflow. The first development install registers the service and loads the HAL. After that, an ordinary engine edit must build, reload and run against a named interface under the developer account while the Core Audio daemon and its HAL host keep their PIDs. A change to the installed HAL or shared ABI is a distinct deployment. Defer latency tuning and further A/B installs until this milestone passes.
+
+Claude Fable 5.2 owns driver implementation. Codex owns independent verification. Review the [November 18 hardware evidence](issue-investigations/SPLIT-DRIVER-VERIFICATION.md) and reproduce the two observed failures before choosing fixes. One compares different-time counter snapshots. The other is a Tracker Pre transport still running after its test IOProc stops. Trace the actual owning client and start/stop/remove sequence, including legitimate concurrent clients and late stops. Keep the existing assertions and one-part behavior. Diagnostics must count actual submitted, bound, unmapped and dropped work. A delayed, lost or unbound real frame must remain visible. Qualify stream teardown and the observed capture underrun separately.
+
+| Acceptance | Evidence needed |
+|---|---|
+| Out-of-box split install | Both attached serial UIDs publish, the selected device streams input and output, MIDI remains available on the 0404, and the system input/output/default sound-effect selections are preserved. |
+| Existing tests | `make test` passes. Run the existing ordinary restart and injected-startup suites (20 cycles each), recovery checks and the applicable existing analog checks on the Tracker Pre via its UID. Report failures as failures. Exercise the 0404 by UID for hardware-independent-of-cabling checks without using it as a substitute for the Tracker Pre. Analog and DIN loopback need their respective physical cables. |
+| No manual device switching | Open an IOProc on the selected UID, including the stream needed by the recovery test. Start and stop the test's own stream. Automate any required rate/buffer settings and restore them. Keep other clients and the system defaults intact. |
+| Daily engine-only loop | Reload the installed engine as the developer, record the new engine PID and identical Core Audio/HAL PIDs, then rerun the selected-device checks on that new engine. Leave the split driver installed. |
+| Release default | Plain `make` still builds the one-part HAL and MIDI driver. Run its existing offline checks. |
+
+For the first hardware diagnosis, use the loaded host's client lifecycle events and unit diagnostics. Distinguish an actual second client from a stale client entry. Check the 50 ms engine statistics publication against the HAL-local counter and reproduce the disagreement with the actual two-process path. Keep regression coverage for real dropped frames, a client disappearing, another valid client still playing, late stops and concurrent devices. Run the existing loopback and recovery fixtures directly with the selected UID. Record the revision and individual results. A hardware-free pass or a recorded chirp alone does not qualify the driver.
+
 ## Decision and starting point
 
 Keep the README's `make` and `make install` as the release path. The user should get today's in-process audio HAL, separate CoreMIDI bundle and tools, with the existing prerequisites. Add an opt-in development build with a resident HAL and a replaceable, unprivileged E-MU USB engine. The development benefit is the ability to replace that engine while Core Audio and unrelated audio devices stay up. Audio clients using the E-MU may need to reopen.
@@ -124,6 +140,8 @@ For the A/B: build A from this branch, since the plug-in changed. Keep the 0404 
 Two experiments that would change the design, neither attempted: aliasing the low-latency USB buffers into the HAL (the engine would publish its bind map and the IO thread would write the packets itself, removing the pump from the data path; it needs proof that a second mapping is visible to the controller), and waking the pump from the IO thread instead of polling.
 
 ## Tracker Pre verification
+
+The November 18 hardware run verified engine-only reload and stereo forwarding. The split transport stayed active between recordings, so the observed latency difference still needs a comparison across fresh engine sessions. [Hardware results and raw evidence](issue-investigations/SPLIT-DRIVER-VERIFICATION.md)
 
 1. Rebuild without mode selection and explicitly in split mode. Run `make test`, the new IPC/PCM tests, package/signature checks, and install/reload rehearsal. Inspect the split HAL for USB ownership and the default HAL for accidental runtime service dependencies. Repeat builds in alternating order. Include both device contexts in offline lifecycle races and genuine client/engine process termination.
 2. On the Mac with the Tracker Pre, record the exact installed bundle and engine hashes, unit UID, mode, reported offsets, volume, rate and **accepted** buffer size. Save the original installation and settings for restoration. The 0404 is also attached, so a first-device fallback is unsuitable. Verify both UIDs and, when available, simultaneous operation and 0404 MIDI coexistence. The existing silent integration tests exercise ordinary restarts and the one-shot stale-start fault.

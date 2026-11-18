@@ -1,0 +1,48 @@
+{
+  "defaults": {
+    "input": "BuiltInMicrophoneDevice",
+    "output": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03",
+    "system": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03"
+  },
+  "units": {
+    "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03": {
+      "audio": [
+        "48000",
+        "512",
+        "1",
+        "0"
+      ],
+      "controls": {
+        "clock": "device",
+        "safety": "4000",
+        "input": "on"
+      }
+    },
+    "net.batarelo.EMUTrackerPre.E-MU-C7-3F0A-07D8010E-0C39A-STATION 01": {
+      "audio": [
+        "48000",
+        "512",
+        "0.559828281",
+        "0"
+      ],
+      "controls": {
+        "clock": "device",
+        "safety": "4000",
+        "input": "on"
+      }
+    }
+  },
+  "originals": {
+    "EMUTrackerPre.driver": {
+      "Contents/Info.plist": "7434e04b2333cbc8f8aab7d50a985f421538b5a72eba6d28c796185067fdc82c",
+      "Contents/MacOS/EMUTrackerPre": "248dab7fb1d6048f281c920ec487eaa29fa20ce79412a36bf32b634b6dc466ba",
+      "Contents/_CodeSignature/CodeResources": "6686de10a28a2fe11b36cbb86dcbacc827cfc4ea116b4dabf1845e5aee629e9b"
+    },
+    "EMUMIDIDriver.plugin": {
+      "Contents/Info.plist": "ab6132dc563052246ca319b413d512f7b3a42a87ff83a9ef5cde7fd5b58ac9a8",
+      "Contents/MacOS/EMUMIDIDriver": "a75a67a2219f829af79d88cf73556ee12298edc9485da8f99af4af3bfa485d41",
+      "Contents/_CodeSignature/CodeResources": "6686de10a28a2fe11b36cbb86dcbacc827cfc4ea116b4dabf1845e5aee629e9b"
+    }
+  },
+  "stage": "/Library/Audio/.emu-split-bench.UQRTZJkb"
+}

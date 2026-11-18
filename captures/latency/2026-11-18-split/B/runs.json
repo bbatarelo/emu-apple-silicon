@@ -1,0 +1,69 @@
+[
+  {
+    "frames": 512,
+    "start": 1,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 35.609,
+    "failures": [
+      "FAIL every frame written was bound to a request framesToOutput 103936, framesBound 103424"
+    ]
+  },
+  {
+    "frames": 512,
+    "start": 2,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 35.609,
+    "failures": [
+      "FAIL every frame written was bound to a request framesToOutput 103424, framesBound 101888"
+    ]
+  },
+  {
+    "frames": 512,
+    "start": 3,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 35.609,
+    "failures": [
+      "FAIL the driver reports no glitch of its own    1 fault counters moved (above)",
+      "FAIL every frame written was bound to a request framesToOutput 103936, framesBound 102400"
+    ]
+  },
+  {
+    "frames": 128,
+    "start": 1,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 19.609,
+    "failures": [
+      "FAIL every frame written was bound to a request framesToOutput 103552, framesBound 102016"
+    ]
+  },
+  {
+    "frames": 128,
+    "start": 2,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 19.609,
+    "failures": [
+      "FAIL every frame written was bound to a request framesToOutput 103296, framesBound 103040"
+    ]
+  },
+  {
+    "frames": 128,
+    "start": 3,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 19.609,
+    "failures": [
+      "FAIL every frame written was bound to a request framesToOutput 103168, framesBound 101376"
+    ]
+  }
+]

@@ -1,0 +1,105 @@
+{
+  "image": {
+    "hal_sha256": "f9102732557a6e4d77072648ba385545af536cce1bfe7a239df4aa95ff2cf733",
+    "bundle_version": "0.1.1 (14dd024)",
+    "git": "14dd024c8f32e33a9191ca4d44439a8c0b62678f",
+    "engine_status": {
+      "units": [
+        {
+          "product": 16138,
+          "running": true,
+          "pumpPasses": 12474,
+          "halOversize": 0,
+          "framesPlayed": 299136,
+          "pumpRecords": 312,
+          "pumpInvalid": 0,
+          "queueDepthMax": 1,
+          "engineStreaming": 1,
+          "serial": "E-MU-C7-3F0A-07D8010E-0C39A-STATION 01",
+          "pumpResyncs": 0,
+          "location": 539041792,
+          "open": true,
+          "generation": 12,
+          "pumpIntervalUs": 500,
+          "wakeLateMaxNs": 109125,
+          "copyDelayBuckets": [
+            85,
+            61,
+            166,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "outputUnderruns": 26016,
+          "unfilledPlayback": 271,
+          "inputUnderruns": 0,
+          "bindRaces": 0,
+          "pumpFrames": 271760,
+          "copyDelayMaxNs": 492791,
+          "halDroppedFrames": 0,
+          "framesBound": 271760,
+          "halDropped": 0,
+          "writeLeadMax": 2336
+        },
+        {
+          "product": 16132,
+          "running": true,
+          "pumpPasses": 893,
+          "halOversize": 0,
+          "framesPlayed": 21049,
+          "pumpRecords": 20,
+          "pumpInvalid": 0,
+          "queueDepthMax": 1,
+          "engineStreaming": 1,
+          "serial": "E-MU-69-3F04-07D8031A-0F419-STATION 03",
+          "pumpResyncs": 0,
+          "location": 539038720,
+          "open": true,
+          "generation": 1,
+          "pumpIntervalUs": 500,
+          "wakeLateMaxNs": 34083,
+          "copyDelayBuckets": [
+            5,
+            5,
+            10,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "outputUnderruns": 0,
+          "unfilledPlayback": 0,
+          "inputUnderruns": 0,
+          "bindRaces": 0,
+          "pumpFrames": 20480,
+          "copyDelayMaxNs": 458833,
+          "halDroppedFrames": 0,
+          "framesBound": 20480,
+          "halDropped": 0,
+          "writeLeadMax": 2364
+        }
+      ],
+      "ok": true,
+      "halPid": 45628,
+      "pid": 45681,
+      "abi": 1,
+      "build": "0.1.1 (git 14dd024)"
+    },
+    "engine_sha256": "2aaf9e63cd4da0fde98564e4770f106227606798b6db53d798437c768b029d80"
+  },
+  "controls": {
+    "uid": "net.batarelo.EMUTrackerPre.E-MU-C7-3F0A-07D8010E-0C39A-STATION 01",
+    "input": "on",
+    "volume": "0.560",
+    "mute": "off",
+    "clock": "device",
+    "safety_us": "4000"
+  },
+  "rate_buffer_before": [
+    "48000",
+    "512"
+  ]
+}
