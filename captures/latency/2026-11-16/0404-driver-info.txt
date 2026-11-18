@@ -1,0 +1,71 @@
+device found: AudioObjectID 112
+
+  driver version    0.1.1 (git 9b96335-dirty)
+  name              E-MU 0404 USB
+  input channels    2
+  output channels   2
+  sample rate       48000 Hz
+  input mode        on -> capture on
+  IO running        no
+  alive             1
+  transport         usb 
+  safety offset in  240 frames
+  safety offset out 192 frames
+  latency in        154 frames
+  latency out       116 frames
+  output volume     1.000  (0.0 dB)
+  output mute       off
+
+  inputUnderruns     2912
+  framesBound        74240
+  frameDeficit       0
+  engineAlive        1
+  feedbackSilent     0
+  feedbackQ16        3145728
+  unfilledPlayback   0
+  clockSourceIsHost  0
+  scheduleClamped    0
+  framesPlayed       74688
+  anchorJitterNs     1208
+  feedbackRejected   0
+  inputDepth         448
+  feedbackErrors     0
+  feedbackStarved    164
+  faultInjected      0
+  scheduleRequests   81
+  usbErrors          0
+  counterResets      34
+  framesCaptured     74688
+  inputOverruns      0
+  feedbackChanges    0
+  inputEnabled       1
+  engineRunning      1
+  ioCycles           698
+  bindRaces          0
+  outputLead         1008
+  startIOCalls       35
+  tsResets           0
+  unmappedAhead      0
+  framesToOutput     178688
+  feedbackOverflows  0
+  unmappedFrames     0
+  shortPlayback      2
+  writeLeadMax       1680
+  feedbackMaxQ16     0
+  emptyCapture       0
+  feedbackPackets    0
+  anchorUpdates      22
+  recoveries         0
+  resyncs            0
+  feedbackMinQ16     0
+  feedbackNominalQ16 3145728
+  engineStreaming    1
+  outputUnderruns    0
+  ioClients          1
+  safetyOffsetUS     4000
+  anchorJitterMaxNs  5090125
+  deadFrames         0
+  recoveryFailures   0
+  tsFallbacks        1
+
+  available rates   44100 48000 88200 96000 176400 192000 

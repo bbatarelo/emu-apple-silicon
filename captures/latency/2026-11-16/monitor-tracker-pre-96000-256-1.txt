@@ -1,0 +1,26 @@
+E-MU Tracker Pre, AudioObjectID 124, 96000 Hz, IO buffer 256 frames
+loopback cable from the outputs to the inputs, both channels
+
+-- latency at 96000 Hz
+   8 chirps of 20.0 ms, 200 Hz to 8000 Hz
+
+  ok   the stream ran and delivered audio         400128 frames captured
+  ok   Core Audio's sample times are unbroken     0 input and 0 output discontinuities over the run
+  ok   every captured frame landed in the window  0 frames outside
+                                                  1563 IO cycles, 256..256 frames each, longest gap 3.52 ms
+                                                  output cycle leads input by 1376..1376 frames (14.33..14.33 ms)
+  ok   the driver reports no glitch of its own    14 fault counters all still zero
+  ok   every frame written was bound to a request framesToOutput 206848, framesBound 206848
+  ok   the timeline keeps up with the hardware    frameDeficit 320 frames, one IO buffer is 256
+  ok   stopping the stream tore down cleanly      no writer was left inside a freed buffer
+                                                  outputLead 736  inputDepth 640  writeLeadMax 1056  anchorJitterMaxNs 3041  feedbackStarved 98  
+  ok   left: the chirp came back                  8 of 8 found, worst correlation 0.9924
+  ok   left: the round trip is repeatable         0.00 frames spread over 8 chirps
+                                                  left round trip 2224.56 frames = 23.172 ms
+  ok   right: the chirp came back                 8 of 8 found, worst correlation 0.9970
+  ok   right: the round trip is repeatable        0.00 frames spread over 8 chirps
+                                                  right round trip 424.28 frames = 4.420 ms  (polarity inverted)
+                                                  SOFTWARE FORWARDING: recorded left minus right = 1800.28 frames = 18.753 ms
+                                                  input 2 -> same IO callback -> output 1; assumes matched ADC channel delays
+
+11 checks, 0 failed

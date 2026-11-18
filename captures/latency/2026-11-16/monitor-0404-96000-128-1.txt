@@ -1,0 +1,27 @@
+E-MU 0404 USB, AudioObjectID 112, 96000 Hz, IO buffer 128 frames
+loopback cable from the outputs to the inputs, both channels
+
+-- latency at 96000 Hz
+   8 chirps of 20.0 ms, 200 Hz to 8000 Hz
+
+  ok   the stream ran and delivered audio         399872 frames captured
+  FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities
+                                                  worst: input +512 frames, output +512 frames
+  ok   every captured frame landed in the window  0 frames outside
+                                                  3120 IO cycles, 128..128 frames each, longest gap 4.79 ms
+                                                  output cycle leads input by 1120..1120 frames (11.67..11.67 ms)
+  ok   the driver reports no glitch of its own    14 fault counters all still zero
+  ok   every frame written was bound to a request framesToOutput 206464, framesBound 206464
+  ok   the timeline keeps up with the hardware    frameDeficit 0 frames, one IO buffer is 128
+  ok   stopping the stream tore down cleanly      no writer was left inside a freed buffer
+                                                  outputLead 768  inputDepth 352  writeLeadMax 832  anchorJitterMaxNs 2416  feedbackStarved 98  
+  ok   left: the chirp came back                  8 of 8 found, worst correlation 0.9947
+  ok   left: the round trip is repeatable         0.00 frames spread over 8 chirps
+                                                  left round trip 1821.63 frames = 18.975 ms
+  ok   right: the chirp came back                 8 of 8 found, worst correlation 0.9989
+  ok   right: the round trip is repeatable        0.00 frames spread over 8 chirps
+                                                  right round trip 350.83 frames = 3.655 ms
+                                                  SOFTWARE FORWARDING: recorded left minus right = 1470.80 frames = 15.321 ms
+                                                  input 2 -> same IO callback -> output 1; assumes matched ADC channel delays
+
+11 checks, 1 failed

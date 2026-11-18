@@ -1,0 +1,33 @@
+E-MU 0404 USB, AudioObjectID 112, 96000 Hz, IO buffer 128 frames
+loopback cable from the outputs to the inputs, both channels
+
+-- latency at 96000 Hz
+   8 chirps of 20.0 ms, 200 Hz to 8000 Hz
+
+  ok   the stream ran and delivered audio         400156 frames captured
+  FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities
+                                                  worst: input +668 frames, output +668 frames
+  ok   every captured frame landed in the window  0 frames outside
+                                                  3121 IO cycles, 128..128 frames each, longest gap 5.48 ms
+                                                  output cycle leads input by 1120..1120 frames (11.67..11.67 ms)
+                                                  inputUnderruns +28 -- capture ring read past what had arrived
+  FAIL the driver reports no glitch of its own    1 fault counters moved (above)
+  ok   every frame written was bound to a request framesToOutput 205824, framesBound 205824
+  ok   the timeline keeps up with the hardware    frameDeficit 0 frames, one IO buffer is 128
+  ok   stopping the stream tore down cleanly      no writer was left inside a freed buffer
+                                                  outputLead 764  inputDepth 356  writeLeadMax 956  anchorJitterMaxNs 2541  feedbackStarved 100  
+  ok   left: the chirp came back                  8 of 8 found, worst correlation 1.0000
+  ok   left: the round trip is repeatable         0.00 frames spread over 8 chirps
+                                                  left round trip 346.98 frames = 3.614 ms
+  ok   right: the chirp came back                 8 of 8 found, worst correlation 1.0000
+  ok   right: the round trip is repeatable        0.00 frames spread over 8 chirps
+                                                  right round trip 347.01 frames = 3.615 ms
+
+                                                  declared: latency in 256 + out 218 = 474 frames (4.938 ms)
+                                                  measured: 347.00 frames (3.615 ms) -- error -1.323 ms
+                                                  safety offsets in 480 out 384 frames, IO buffer 128 frames
+  FAIL the declared latency matches the cable     -1.323 ms out, tolerance 1.0 ms
+  ok   both channels arrive together              left and right differ by 0.02 frames
+                                                  a client processing input to output waits about 13.95 ms end to end
+
+13 checks, 3 failed

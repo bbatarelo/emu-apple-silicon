@@ -1,0 +1,28 @@
+E-MU Tracker Pre, AudioObjectID 124, 96000 Hz, IO buffer 128 frames
+loopback cable from the outputs to the inputs, both channels
+
+-- latency at 96000 Hz
+   8 chirps of 20.0 ms, 200 Hz to 8000 Hz
+
+  ok   the stream ran and delivered audio         400000 frames captured
+  FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities
+                                                  worst: input +384 frames, output +384 frames
+  ok   every captured frame landed in the window  0 frames outside
+                                                  3122 IO cycles, 128..128 frames each, longest gap 4.05 ms
+                                                  output cycle leads input by 1120..1120 frames (11.67..11.67 ms)
+                                                  inputUnderruns +416 -- capture ring read past what had arrived
+  FAIL the driver reports no glitch of its own    1 fault counters moved (above)
+  ok   every frame written was bound to a request framesToOutput 206592, framesBound 206592
+  ok   the timeline keeps up with the hardware    frameDeficit 0 frames, one IO buffer is 128
+  ok   stopping the stream tore down cleanly      no writer was left inside a freed buffer
+                                                  outputLead 768  inputDepth 352  writeLeadMax 1344  anchorJitterMaxNs 1833  feedbackStarved 100  
+  ok   left: the chirp came back                  8 of 8 found, worst correlation 0.9924
+  ok   left: the round trip is repeatable         0.00 frames spread over 8 chirps
+                                                  left round trip 2000.56 frames = 20.839 ms
+  ok   right: the chirp came back                 8 of 8 found, worst correlation 0.9970
+  ok   right: the round trip is repeatable        0.00 frames spread over 8 chirps
+                                                  right round trip 440.28 frames = 4.586 ms  (polarity inverted)
+                                                  SOFTWARE FORWARDING: recorded left minus right = 1560.28 frames = 16.253 ms
+                                                  input 2 -> same IO callback -> output 1; assumes matched ADC channel delays
+
+11 checks, 2 failed

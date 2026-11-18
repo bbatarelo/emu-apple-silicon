@@ -693,6 +693,13 @@ not yet transmitted. What matters is whether it *grows*, not what it is.
 
 ### Round-trip latency, measured
 
+For the newer **0404 and Tracker Pre input → software → output measurements**, see the
+[2026-11-16 experiment](issue-investigations/LATENCY-2026-11-16.md). It includes
+buffer-dependent monitoring delay and failed-run caveats. The historical table
+below measures the converter/device path only and does not identify the unit.
+The stock tool's one-buffer monitoring estimate understates the forwarding delay
+observed in the newer experiment.
+
 The latency published past the safety offset is the stretch USB cannot see:
 bus to DAC on the way out, ADC to bus on the way back. A cable measures it
 directly. Write a chirp into the output buffer at sample time `So`,

@@ -1,0 +1,23 @@
+E-MU Tracker Pre, AudioObjectID 124, 48000 Hz, IO buffer 512 frames
+loopback cable from the outputs to the inputs, both channels
+
+-- smoke at 48000 Hz
+   left 996.1 Hz (bin 85), right 1605.5 Hz (bin 137), -18.0 dBFS, 2.0 s
+
+  ok   the stream ran and delivered audio         225792 frames captured over 441 IO cycles
+  ok   enough audio came back to analyse          96000 frames from 96768
+  ok   Core Audio's sample times are unbroken     0 input and 0 output discontinuities over the run
+  ok   every captured frame landed in the window  0 frames outside
+                                                  441 IO cycles, 512..512 frames each, longest gap 13.50 ms
+                                                  output cycle leads input by 1456..1456 frames (30.33..30.33 ms)
+  ok   the driver reports no glitch of its own    14 fault counters all still zero
+  ok   every frame written was bound to a request framesToOutput 129024, framesBound 129024
+  ok   the timeline keeps up with the hardware    frameDeficit 0 frames, one IO buffer is 512
+  ok   stopping the stream tore down cleanly      no writer was left inside a freed buffer
+                                                  outputLead 1098  inputDepth 358  writeLeadMax 1290  anchorJitterMaxNs 1625  feedbackStarved 164  
+  ok   left: the tone is there, unclipped         -19.74 dBFS, peak 0.1031
+  ok   left: it is this channel's tone            the other channel's tone is 91.4 dB down
+  ok   right: the tone is there, unclipped        -19.08 dBFS, peak 0.1112
+  ok   right: it is this channel's tone           the other channel's tone is 98.3 dB down
+
+12 checks, 0 failed

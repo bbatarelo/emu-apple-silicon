@@ -1,0 +1,335 @@
+[
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-128-1.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 128,
+    "delay_frames": 903.04,
+    "delay_ms": 18.813,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-128-2.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 128,
+    "delay_frames": 901.04,
+    "delay_ms": 18.772,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-256-1.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 256,
+    "delay_frames": 1157.04,
+    "delay_ms": 24.105,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-256-2.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 256,
+    "delay_frames": 1159.04,
+    "delay_ms": 24.147,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-512-1-restored.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 512,
+    "delay_frames": 1733.85,
+    "delay_ms": 36.122,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-512-1.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 512,
+    "delay_frames": 1673.04,
+    "delay_ms": 34.855,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-512-2-restored.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 512,
+    "delay_frames": 1668.85,
+    "delay_ms": 34.768,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-64-1.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 64,
+    "delay_frames": 777.04,
+    "delay_ms": 16.188,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-48000-64-2.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 64,
+    "delay_frames": 775.04,
+    "delay_ms": 16.147,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-96000-128-1.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 128,
+    "delay_frames": 1470.8,
+    "delay_ms": 15.321,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-96000-128-2.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 128,
+    "delay_frames": 1468.8,
+    "delay_ms": 15.3,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-96000-256-1.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 256,
+    "delay_frames": 1816.8,
+    "delay_ms": 18.925,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-96000-256-2.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 256,
+    "delay_frames": 1726.8,
+    "delay_ms": 17.988,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-96000-512-1.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 512,
+    "delay_frames": 2330.8,
+    "delay_ms": 24.279,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "0404 USB",
+    "file": "monitor-0404-96000-512-2.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 512,
+    "delay_frames": 2238.8,
+    "delay_ms": 23.321,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-128-1.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 128,
+    "delay_frames": 887.21,
+    "delay_ms": 18.484,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-128-2.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 128,
+    "delay_frames": 889.21,
+    "delay_ms": 18.525,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-256-1.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 256,
+    "delay_frames": 1191.21,
+    "delay_ms": 24.817,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-256-2.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 256,
+    "delay_frames": 1145.21,
+    "delay_ms": 23.859,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-512-1-restored.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 512,
+    "delay_frames": 1669.22,
+    "delay_ms": 34.775,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-512-2-restored.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 512,
+    "delay_frames": 1703.22,
+    "delay_ms": 35.484,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-512-baseline.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 512,
+    "delay_frames": 1657.21,
+    "delay_ms": 34.525,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-64-1.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 64,
+    "delay_frames": 761.21,
+    "delay_ms": 15.859,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-48000-64-2.txt",
+    "rate_hz": 48000,
+    "buffer_frames": 64,
+    "delay_frames": 759.21,
+    "delay_ms": 15.817,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-96000-128-1.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 128,
+    "delay_frames": 1560.28,
+    "delay_ms": 16.253,
+    "failed_checks": 2,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities",
+      "FAIL the driver reports no glitch of its own    1 fault counters moved (above)"
+    ]
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-96000-128-2.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 128,
+    "delay_frames": 1542.28,
+    "delay_ms": 16.065,
+    "failed_checks": 1,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-96000-256-1.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 256,
+    "delay_frames": 1800.28,
+    "delay_ms": 18.753,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-96000-256-2.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 256,
+    "delay_frames": 1796.28,
+    "delay_ms": 18.711,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-96000-512-1.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 512,
+    "delay_frames": 2312.28,
+    "delay_ms": 24.086,
+    "failed_checks": 0,
+    "failures": []
+  },
+  {
+    "device": "Tracker Pre",
+    "file": "monitor-tracker-pre-96000-512-2.txt",
+    "rate_hz": 96000,
+    "buffer_frames": 512,
+    "delay_frames": 2218.28,
+    "delay_ms": 23.107,
+    "failed_checks": 0,
+    "failures": []
+  }
+]
