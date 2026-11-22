@@ -1,0 +1,13 @@
+{
+  "build": "0.1.1 (73ad8f6)",
+  "device": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03",
+  "visible": [
+    "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03",
+    "net.batarelo.EMUTrackerPre.E-MU-C7-3F0A-07D8010E-0C39A-STATION 01"
+  ],
+  "defaults": {
+    "input": "BuiltInMicrophoneDevice",
+    "output": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03",
+    "system": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "before": {
+    "input": "BuiltInMicrophoneDevice",
+    "output": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03",
+    "system": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03"
+  },
+  "after": {
+    "input": "BuiltInMicrophoneDevice",
+    "output": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03",
+    "system": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03"
+  }
+}

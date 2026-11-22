@@ -1,5 +1,25 @@
 # Optional split driver verification
 
+## Development milestone passed on November 22, 2026
+
+The Mac ran the two-part driver built from `73ad8f6` throughout qualification. Bruno ran the UID-targeted checks in his macOS login session. Codex checked every restart row, recovery assertion, analog verdict and saved device setting against the raw output. launchd still reported engine PID 11652 under the developer account after the run. The standard README build and install commands continue to select the one-part driver. [Install record](../../captures/qualification/2026-11-22-split/installation-2026-11-18.json) · [Original logs and SHA-256 manifest](../../captures/qualification/2026-11-22-split)
+
+| Test at 48 kHz, 512 frames | Tracker Pre | 0404 USB |
+|---|---|---|
+| Ordinary restarts before replacing the installed engine | 20/20 | Tested on the replacement engine |
+| Ordinary restarts / injected startup faults on the replacement engine | 20/20 · 20/20 | 20/20 · 20/20 |
+| Transient fault, persistent fault, clear and reopen | 16/16 assertions | 16/16 assertions |
+| Ordinary restarts after recovery | 20/20 | 20/20 |
+| Physical audio or MIDI coverage | 45/45 stereo analog checks | MIDI source and destination online. Analog and physical DIN loopback were outside this run. |
+
+Both UIDs appeared together. All 140 restart cycles delivered callbacks, bound every frame counted as written in each observation interval, and reported zero unmapped frames. Every end-of-phase snapshot showed a live device, a stopped engine transport and zero active I/O clients. The default input stayed on the built-in microphone, and both regular output and sound effects stayed on the 0404. Both devices finished with their original sample rate, buffer, output volume and mute state. [Tracker Pre evidence](../../captures/qualification/2026-11-22-split/tracker-pre) · [0404 evidence](../../captures/qualification/2026-11-22-split/0404)
+
+`make reload` replaced engine PID **53066 → 11652**. The Core Audio daemon kept PID **53091** and the HAL host kept PID **53104**. Both engine processes reported the qualified revision. The replacement completed the remaining tests on both units. For engine-only edits, run `make reload` in the installed checkout, then `EMU_DEVICE=3F0A make test-device` for the Tracker Pre or `EMU_DEVICE=3F04 make test-device` for the 0404. These commands need no sudo or default-device selection. [Reload log](../../captures/qualification/2026-11-22-split/tracker-pre/reload.log)
+
+**0404 capture observation.** On the 0404, `inputUnderruns` read 0 immediately after fault recovery and 2,528 in the final snapshot after 20 more ordinary restarts. This counter counts frames requested ahead of the capture ring's write position. The silent restart suite checks output binding and teardown. Its snapshots cannot identify the affected callback or establish audibility. On the Tracker Pre every recorded phase boundary showed zero input underruns, and the analog test measured zero input and output timestamp discontinuities across all three parts. Separately, dropped playback frames appeared during deliberate recovery on both units and did not increase over the subsequent ordinary restart suites. [0404 immediately after recovery](../../captures/qualification/2026-11-22-split/0404/after-recovery.txt) · [0404 after the final restarts](../../captures/qualification/2026-11-22-split/0404/after-restart-after-recovery.txt)
+
+**Tracker Pre latency.** The stock analog test measured **278.21 frames (5.796 ms)** on both channels. All five chirps returned on each channel, with 0.00 frames of reported spread within that stream. The driver declared 270 frames (5.625 ms). For a historical comparison on the same physical path, the six November 18 one-part recordings at 48 kHz/512 measured 199.21–249.21 frames on their direct right channel. The November 22 reading is 29–79 frames (0.60–1.65 ms) higher. A single split-driver start and historical controls from an earlier revision leave the latency attributable to the split unresolved. The November 22 run did not measure live input-to-output software forwarding. [Analog test](../../captures/qualification/2026-11-22-split/tracker-pre/analog-loopback.log) · [One-part A1 recordings](../../captures/latency/2026-11-18-split/A1) · [One-part A2 recordings](../../captures/latency/2026-11-18-split/A2)
+
 ## Tracker Pre hardware run on `14dd024`, November 18, 2026
 
 **Engine-only reload worked on the Mac. Latency parity is still open.** The new launchd process claimed USB and streamed real stereo audio. During reload, the engine PID changed from 45593 to 45681. The Core Audio daemon and HAL host kept PIDs 45615 and 45628. The original audio and MIDI bundles matched the preflight file hashes after the run, and the engine service plist was removed. [Reload log](../../captures/latency/2026-11-18-split/reload.log)

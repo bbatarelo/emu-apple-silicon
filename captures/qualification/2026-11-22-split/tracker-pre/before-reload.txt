@@ -1,0 +1,91 @@
+device found: AudioObjectID 149
+
+  driver version    0.1.1 (git 73ad8f6)
+  name              E-MU Tracker Pre
+  input channels    2
+  output channels   2
+  sample rate       48000 Hz
+  input mode        on -> capture on
+  IO running        no
+  alive             1
+  transport         usb 
+  safety offset in  240 frames
+  safety offset out 192 frames
+  latency in        154 frames
+  latency out       116 frames
+  output volume     0.560  (-15.1 dB)
+  output mute       off
+
+  deadFrames         0
+  feedbackPackets    0
+  tsResets           0
+  framesDropped      0
+  scheduleRequests   0
+  framesUnpublished  0
+  anchorUpdates      0
+  outputUnderruns    0
+  framesPlayed       0
+  counterResets      0
+  foreignStops       0
+  framesRefused      0
+  recoveries         0
+  startersRemoved    0
+  unmappedAhead      0
+  usbErrors          0
+  faultInjected      0
+  engineStreaming    0
+  unfilledPlayback   0
+  framesToOutput     0
+  inputUnderruns     0
+  framesBound        0
+  feedbackQ16        0
+  tsFallbacks        0
+  clientAdds         218
+  recoveryFailures   0
+  scheduleClamped    0
+  engineRunning      0
+  lastStopClient     0
+  frameDeficit       0
+  framesCaptured     0
+  framesSubmitted    0
+  inputEnabled       0
+  inputOverruns      0
+  registeredClients  32
+  sessionsReaped     0
+  framesQueued       0
+  feedbackSilent     0
+  feedbackStarved    0
+  inputDepth         0
+  safetyOffsetUS     4000
+  writeLeadMax       0
+  ioCycles           0
+  feedbackErrors     0
+  engineAlive        1
+  lastStartClient    0
+  unmappedFrames     0
+  feedbackRejected   0
+  startIOCalls       0
+  stopIOCalls        0
+  anchorJitterNs     0
+  feedbackMinQ16     0
+  feedbackOverflows  0
+  feedbackMaxQ16     0
+  feedbackNominalQ16 0
+  ioClients          0
+  bindRaces          0
+  anchorJitterMaxNs  0
+  clientRemoves      186
+  clockSourceIsHost  0
+  feedbackChanges    0
+  framesUnreconciled 0
+  shortPlayback      0
+  resyncs            0
+  staleStops         0
+  outputLead         0
+  emptyCapture       0
+
+  capture did not run this session: framesCaptured,
+  emptyCapture, inputDepth, inputUnderruns and
+  inputOverruns are inert, not clean
+
+  available rates   44100 48000 88200 96000 176400 192000 

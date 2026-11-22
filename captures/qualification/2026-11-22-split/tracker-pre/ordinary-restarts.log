@@ -1,0 +1,24 @@
+unit: net.batarelo.EMUTrackerPre.E-MU-C7-3F0A-07D8010E-0C39A-STATION 01
+  driver version    0.1.1 (git 73ad8f6)
+Silent restart test: device 149, 20 cycles, startup fault off
+01 PASS callbacks=95 written=28672 bound=28672 unmapped=0 startIO=21
+02 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=22
+03 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=23
+04 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=24
+05 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=25
+06 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=26
+07 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=27
+08 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=28
+09 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=29
+10 PASS callbacks=95 written=29184 bound=29184 unmapped=0 startIO=30
+11 PASS callbacks=94 written=29184 bound=29184 unmapped=0 startIO=31
+12 PASS callbacks=94 written=29184 bound=29184 unmapped=0 startIO=32
+13 PASS callbacks=94 written=29184 bound=29184 unmapped=0 startIO=33
+14 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=34
+15 PASS callbacks=94 written=31232 bound=31232 unmapped=0 startIO=35
+16 PASS callbacks=95 written=31232 bound=31232 unmapped=0 startIO=36
+17 PASS callbacks=94 written=31232 bound=31232 unmapped=0 startIO=37
+18 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=38
+19 PASS callbacks=95 written=28672 bound=28672 unmapped=0 startIO=39
+20 PASS callbacks=94 written=28672 bound=28672 unmapped=0 startIO=40
+0 failures out of 20 silent restarts

@@ -1,6 +1,8 @@
 # Optional split E-MU audio driver
 
-## Current milestone — a persistent, hardware-qualified development driver
+## Completed milestone — a persistent, hardware-qualified development driver
+
+**Passed November 22, 2026 on `73ad8f6`.** The two-part driver remains installed on the development Mac. UID-targeted tests passed on the Tracker Pre and 0404, including 140 restart cycles across the two devices and the Tracker Pre's 45 analog checks. An unprivileged engine reload preserved the Core Audio and HAL host PIDs. The report includes a separate 0404 capture-underrun observation. [Hardware results and daily commands](issue-investigations/SPLIT-DRIVER-VERIFICATION.md#development-milestone-passed-on-november-22-2026)
 
 Install the optional split driver on the development Mac and leave it there for use. The README's plain `make` and `make install` remain the one-part release workflow. The first development install registers the service and loads the HAL. After that, an ordinary engine edit must build, reload and run against a named interface under the developer account while the Core Audio daemon and its HAL host keep their PIDs. A change to the installed HAL or shared ABI is a distinct deployment. Defer latency tuning and further A/B installs until this milestone passes.
 
@@ -18,7 +20,7 @@ For the first hardware diagnosis, use the loaded host's client lifecycle events 
 
 ### Milestone work by Claude Fable 5.2, 18 November 2026
 
-Working tree on `22e69ba`, uncommitted. `make`, `make MODE=two-part` and `make test` pass; ASan/UBSan pass on the regression and two-process suites. **Not yet done: the install and every hardware row of the table above** — see *Install request* below.
+At the November 18 handoff, the changes were in the working tree on `22e69ba` and subsequently committed as `73ad8f6`. Fable reported passing `make`, `make MODE=two-part`, `make test` and ASan/UBSan checks on the regression and two-process suites. The install and hardware qualification followed.
 
 **The stale client was my design, not a lost callback.** Measured on this Mac against the installed one-part `9b96335-dirty`, with two processes running silent IOProcs on the Tracker Pre: `startIOCalls` went 0 → 1 when the first started and stayed 1 through the second starting and the first stopping; the transport stopped when the last one stopped. coreaudiod sends one `StartIO` for the first client and one `StopIO` for the last, not a pair per client. The per-client ID set added in `3a17426` waited for the starter's own stop. When another client overlapped a restart cycle, the single `StopIO` carried a different ID, was ignored as "not a starter", and the session ran on with one counted client — the cycle-12 state. Which IDs coreaudiod puts on the two calls is not yet observed; the plug-in now logs every add, remove, start and stop with client ID and PID so the first hardware run shows it.
 
