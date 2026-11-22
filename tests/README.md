@@ -48,15 +48,18 @@ pretend -- host clock, playback looped into capture at the same sample index
 make test-regression test-split SANITIZE="-fsanitize=address,undefined -g" BUILD=build/asan
 ```
 
-The two-part driver itself is described in
-[docs/SPLIT-DRIVER-PLAN.md](../docs/SPLIT-DRIVER-PLAN.md).
+Use the [two-part development guide](../docs/SPLIT-DRIVER.md) for deployment and the [hardware verification report](../docs/issue-investigations/SPLIT-DRIVER-VERIFICATION.md) for recorded results.
 
 ## After installing a change: hardware integration
 
-These commands test the **installed** driver, not the driver bundle in `build/`.
-Build and install the intended revision first (`make all`, then `make install`).
-Check its version with `build/bin/hal-check`. Stop other playback and recording
-on the selected unit before running:
+These commands exercise the **installed** driver. Use the two-part driver for
+development. After an engine edit, run `make reload` from the registered
+checkout. For a first split install or a change to the installed HAL or shared
+ABI, run `make MODE=two-part` and `make MODE=two-part install`.
+Use the README's plain `make install` when qualifying the one-part release.
+Check the installed version with `EMU_DEVICE=3F0A build/bin/hal-check`
+for a Tracker Pre, or substitute the target unit's UID. Stop other playback
+and recording on that unit before starting the tests.
 
 ```sh
 EMU_DEVICE=3F04 make test-integration   # 0404 USB

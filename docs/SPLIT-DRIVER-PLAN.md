@@ -1,5 +1,7 @@
 # Optional split E-MU audio driver
 
+For current deployment and testing commands, use the [two-part development guide](SPLIT-DRIVER.md). This document records the design decisions, implementation history and proposed latency experiments.
+
 ## Completed milestone — a persistent, hardware-qualified development driver
 
 **Passed November 22, 2026 on `73ad8f6`.** The two-part driver remains installed on the development Mac. UID-targeted tests passed on the Tracker Pre and 0404, including 140 restart cycles across the two devices and the Tracker Pre's 45 analog checks. An unprivileged engine reload preserved the Core Audio and HAL host PIDs. The report includes a separate 0404 capture-underrun observation. [Hardware results and daily commands](issue-investigations/SPLIT-DRIVER-VERIFICATION.md#development-milestone-passed-on-november-22-2026)

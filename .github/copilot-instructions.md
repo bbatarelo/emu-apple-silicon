@@ -1,0 +1,1 @@
+Use the two-part audio driver by default for development deployments. Use `make reload` for engine-only changes. Plain `make install` selects the one-part release driver. Follow the [repository instructions](../AGENTS.md) for installation and UID-targeted testing.
