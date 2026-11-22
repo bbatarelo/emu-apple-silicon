@@ -1,6 +1,6 @@
 # E-MU Tracker Pre and 0404 USB drivers for Apple Silicon macOS
 
-[![version](https://img.shields.io/badge/version-0.1.1-blue)](VERSION)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](VERSION)
 
 A native **Apple Silicon macOS driver** for **E-MU Tracker Pre** and
 **E-MU 0404 USB** audio interfaces. This independent, open-source project brings
