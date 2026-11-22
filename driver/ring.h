@@ -43,7 +43,7 @@
 #define EMU_RING_MASK     (EMU_RING_FRAMES - 1u)
 #define EMU_RING_CHANNELS 2u
 
-typedef struct {
+typedef struct EmuRing {
     float data[EMU_RING_FRAMES * EMU_RING_CHANNELS];
     /* First frame index the producer has not yet written. */
     _Atomic uint64_t frontier;

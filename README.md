@@ -1,6 +1,6 @@
 # E-MU Tracker Pre and 0404 USB drivers for Apple Silicon macOS
 
-[![version](https://img.shields.io/badge/version-0.1.1-blue)](VERSION)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](VERSION)
 
 A native **Apple Silicon macOS driver** for **E-MU Tracker Pre** and
 **E-MU 0404 USB** audio interfaces. This independent, open-source project brings
@@ -65,7 +65,9 @@ Then open **System Settings → Sound** and choose the device — it appears und
 its own name, **E-MU Tracker Pre** or **E-MU 0404 USB** — for output, input, or
 both.
 
-That is all. It survives reboots.
+That installs the default one-part audio driver. It survives reboots.
+
+For driver development, use the [two-part development build](docs/SPLIT-DRIVER.md). It lets you rebuild and reload the USB engine as your own user while Core Audio keeps running.
 
 ### Removing it
 
@@ -234,15 +236,16 @@ EMU_DEVICE=3F0A build/bin/hal-check           # the Tracker Pre
 EMU_DEVICE=3F04 build/bin/hal-loopback -i M4 -r 192000 -N 3 glitches
 ```
 
-Without it, the first device found wins, which is the single-device case
-unchanged. `emu-probe` talks to the hardware rather than to Core Audio, so it
+The diagnostics above use the first matching device. The restart and
+recovery tests require a unique match when several units are attached.
+`emu-probe` talks to the hardware rather than to Core Audio, so it
 uses `EMU_PRODUCT=3f04` instead.
 
 ---
 
 ## How it works
 
-A Core Audio HAL plug-in, which is the supported way to add an audio device from
+The default build uses a Core Audio HAL plug-in to publish the device from
 userspace. It talks to the hardware over USB through IOKit, and does the
 isochronous streaming, clock recovery and format conversion itself. MIDI is a
 second, much smaller plug-in of the same shape loaded by MIDIServer, because
@@ -329,6 +332,8 @@ The project landing page is maintained in [`site/`](site/). See
 |---|---|
 | [docs/FINDINGS.md](docs/FINDINGS.md) | What the hardware does, and what macOS does. **Read this before changing anything.** |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the driver is put together |
+| [Two-part development guide](docs/SPLIT-DRIVER.md) | First install, engine-only reloads, per-device tests and rollback |
+| [Split-driver verification](docs/issue-investigations/SPLIT-DRIVER-VERIFICATION.md) | Hardware results, latency measurements, known limits and raw logs |
 | [docs/ADDING-A-DEVICE.md](docs/ADDING-A-DEVICE.md) | Bringing up an 0202 or another sibling |
 | [docs/DESIGN-GUIDELINES.md](docs/DESIGN-GUIDELINES.md) | The architectural reference the project was built against |
 | [docs/provenance.md](docs/provenance.md) | Reference material in `resources/`, and its licensing |
@@ -338,10 +343,11 @@ The project landing page is maintained in [`site/`](site/). See
 
 ## Developer tests
 
-Run `make test` before submitting driver changes. It builds and runs the Rust
-protocol tests, audio-analysis self-tests, and USB regression tests without
-hardware or an installed driver. `make test-build` builds all C test executables
-without running them.
+Run `make test` before submitting driver changes. It covers the Rust protocol
+tests, audio analysis, USB and HAL regressions, and the two-process split-driver
+fixture. It runs without hardware or an installed driver. The process fixture
+uses launchd in a Mac login session. `make test-build` builds the hardware
+test tools.
 
 After installing a changed driver, `EMU_DEVICE=3F04 make test-integration` runs
 silent start/stop and injected startup-retry checks on an idle 0404. Use `3F0A`

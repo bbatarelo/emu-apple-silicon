@@ -1,0 +1,71 @@
+device found: AudioObjectID 113
+
+  driver version    0.1.1 (git 14dd024)
+  name              E-MU Tracker Pre
+  input channels    2
+  output channels   2
+  sample rate       48000 Hz
+  input mode        on -> capture on
+  IO running        no
+  alive             1
+  transport         usb 
+  safety offset in  240 frames
+  safety offset out 192 frames
+  latency in        154 frames
+  latency out       116 frames
+  output volume     0.560  (-15.1 dB)
+  output mute       off
+
+  inputUnderruns     0
+  framesBound        103424
+  frameDeficit       6112
+  engineAlive        1
+  feedbackSilent     2211
+  feedbackQ16        3145728
+  unfilledPlayback   53
+  clockSourceIsHost  0
+  scheduleClamped    0
+  framesPlayed       749568
+  anchorJitterNs     41
+  feedbackRejected   0
+  inputDepth         6360
+  feedbackErrors     0
+  feedbackStarved    166
+  faultInjected      0
+  scheduleRequests   81
+  usbErrors          0
+  counterResets      2
+  framesCaptured     749568
+  inputOverruns      0
+  feedbackChanges    0
+  inputEnabled       1
+  engineRunning      1
+  ioCycles           404
+  bindRaces          0
+  outputLead         0
+  startIOCalls       14
+  tsResets           0
+  unmappedAhead      0
+  framesToOutput     103424
+  feedbackOverflows  0
+  unmappedFrames     0
+  shortPlayback      0
+  writeLeadMax       1272
+  feedbackMaxQ16     3145728
+  emptyCapture       0
+  feedbackPackets    71
+  anchorUpdates      12
+  recoveries         0
+  resyncs            0
+  feedbackMinQ16     3145728
+  feedbackNominalQ16 3145728
+  engineStreaming    1
+  outputUnderruns    5000
+  ioClients          1
+  safetyOffsetUS     4000
+  anchorJitterMaxNs  4250
+  deadFrames         0
+  recoveryFailures   0
+  tsFallbacks        0
+
+  available rates   44100 48000 88200 96000 176400 192000 

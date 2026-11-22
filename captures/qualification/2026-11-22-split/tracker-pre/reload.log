@@ -1,0 +1,7 @@
+engine     pid 53066 -> 11652
+           0.1.1 (git 73ad8f6) -> 0.1.1 (git 73ad8f6)
+coreaudiod pid 53091 -> 53091
+HAL host   pid 53104 -> 53104
+engine replaced; Core Audio and the HAL were not restarted.
+A device that was streaming is offline until its client reopens it;
+  EMU_DEVICE=<id> build/bin/hal-check fault none   brings it back at once.

@@ -1,0 +1,38 @@
+{
+  "observed": "2026-11-18T22:03:08+01:00",
+  "revision": "73ad8f636eb0b65df988d76d262154eb81ddb68b",
+  "hostArchitecture": "arm64",
+  "macOS": "26.7.1",
+  "installedBuild": "0.1.1 (73ad8f6)",
+  "installedMachServices": [
+    "net.batarelo.EMUTrackerPre.Engine"
+  ],
+  "launchd": {
+    "label": "net.batarelo.EMUTrackerPre.Engine",
+    "runningAs": "bruno",
+    "program": "/Users/bruno/development/projects/bruno/emu-tracker-pre/.claude/worktrees/emu-split-driver/build/two-part/emu-engine",
+    "state": "running",
+    "pid": 53066,
+    "runs": 1
+  },
+  "engineSHA256": "2e4e559a67a13e73e623724725f6337cf49da4120a437294cb8a2cd915dcb4e0",
+  "bundles": {
+    "HAL": {
+      "installedSHA256": "01d17b9ee27e45c5562673aa9fe54f8bc663ac16ed291fd03238f764f689d89f",
+      "buildSHA256": "01d17b9ee27e45c5562673aa9fe54f8bc663ac16ed291fd03238f764f689d89f"
+    },
+    "MIDI": {
+      "installedSHA256": "da8984badde780a2f09c7c33e839ee50615076f81c493757c81f4d3d15d99c3a",
+      "buildSHA256": "da8984badde780a2f09c7c33e839ee50615076f81c493757c81f4d3d15d99c3a"
+    }
+  },
+  "savedDefaultsAtInstall": {
+    "input": "BuiltInMicrophoneDevice",
+    "output": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03",
+    "effects": "net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03"
+  },
+  "USBRegistryDevices": [
+    "E-MU Tracker Pre",
+    "E-MU 0404"
+  ]
+}

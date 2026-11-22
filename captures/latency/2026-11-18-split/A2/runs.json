@@ -1,0 +1,62 @@
+[
+  {
+    "frames": 512,
+    "start": 1,
+    "exit": 0,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 35.484,
+    "failures": []
+  },
+  {
+    "frames": 512,
+    "start": 2,
+    "exit": 0,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 34.525,
+    "failures": []
+  },
+  {
+    "frames": 512,
+    "start": 3,
+    "exit": 0,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 35.525,
+    "failures": []
+  },
+  {
+    "frames": 128,
+    "start": 1,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 18.484,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "frames": 128,
+    "start": 2,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 18.484,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  },
+  {
+    "frames": 128,
+    "start": 3,
+    "exit": 1,
+    "geometry_verified": true,
+    "all_chirps": true,
+    "delay_ms": 18.484,
+    "failures": [
+      "FAIL Core Audio's sample times are unbroken     1 input and 1 output discontinuities"
+    ]
+  }
+]

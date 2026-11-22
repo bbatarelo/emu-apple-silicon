@@ -530,7 +530,10 @@ struct Engine {
 
     /* ---- was file-scope state; per device now, so a second engine is a
      * second instance rather than a second copy of the driver. ---- */
-    EmuRing input_ring;
+    /* Where capture is written. The engine's own ring unless the owner has
+     * supplied one (emu_engine_set_input_ring); only changed while stopped. */
+    EmuRing* in_ring;
+    EmuRing own_ring;
     pthread_t thread;
     _Atomic bool running;
     bool thread_joinable;
@@ -553,6 +556,20 @@ struct Engine {
     _Atomic uint32_t bind_gate;
     _Atomic uint32_t bind_bpf;
     _Atomic uint64_t bind_frontier;
+    /* The output path's books: every frame handed to emu_engine_write_output
+     * is in exactly one of bind_refused and bind_offered, and every offered
+     * frame in bind_frames, bind_unmapped or a counted race. Written only by
+     * the thread that writes output, inside bind_seq, so a reader can take
+     * them as of one moment between writes rather than part-way through one. */
+    /* Where the diagnostics' window starts: the books as they stood, read
+     * whole, at the last counter reset. A reset must not store into counters
+     * a write may be half way through adding to -- the write's other half
+     * would then land on the far side of the zero and the books would be out
+     * by it for good. stats_lock. */
+    struct { uint64_t offered, refused, bound, unmapped, unmapped_ahead, races; } bind_base;
+    _Atomic uint32_t bind_seq;
+    _Atomic uint64_t bind_offered;
+    _Atomic uint64_t bind_refused;
     _Atomic uint64_t bind_frames;
     _Atomic uint64_t bind_unmapped;
     _Atomic uint64_t bind_unmapped_ahead;
@@ -762,6 +779,7 @@ EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id)
     if (!e) return NULL;
     e->unit_product_id  = product_id;
     e->unit_location_id = location_id;
+    e->in_ring = &e->own_ring;
     pthread_mutex_init(&e->lifecycle_lock, NULL);
     pthread_mutex_init(&e->stats_lock, NULL);
     pthread_mutex_init(&e->start_lock, NULL);
@@ -777,6 +795,18 @@ EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id)
     e->safety_us = 10000;
     e->with_input = true;
     return e;
+}
+
+bool emu_engine_set_input_ring(EmuEngine* e, struct EmuRing* ring)
+{
+    if (!e) return false;
+    pthread_mutex_lock(&e->lifecycle_lock);
+    /* thread_joinable, not running: a session that ended on its own still has
+     * a thread to reap, and only a stop proves nothing is writing the ring. */
+    bool idle = !e->thread_joinable;
+    if (idle) e->in_ring = ring ? ring : &e->own_ring;
+    pthread_mutex_unlock(&e->lifecycle_lock);
+    return idle;
 }
 
 void emu_engine_destroy(EmuEngine* e)
@@ -802,6 +832,13 @@ static void bind_reset(Engine* e)
         atomic_store_explicit(&e->bind_map[i].frame_end, 0, memory_order_relaxed);
     }
     atomic_store_explicit(&e->bind_frontier, 0, memory_order_relaxed);
+    /* A new session's books start at zero, and so does the window on them.
+     * bind_refused is not a session's and keeps both its count and its base. */
+    pthread_mutex_lock(&e->stats_lock);
+    e->bind_base.offered = e->bind_base.bound = e->bind_base.unmapped = 0;
+    e->bind_base.unmapped_ahead = e->bind_base.races = 0;
+    pthread_mutex_unlock(&e->stats_lock);
+    atomic_store_explicit(&e->bind_offered, 0, memory_order_relaxed);
     atomic_store_explicit(&e->bind_frames, 0, memory_order_relaxed);
     atomic_store_explicit(&e->bind_unmapped, 0, memory_order_relaxed);
     atomic_store_explicit(&e->bind_unmapped_ahead, 0, memory_order_relaxed);
@@ -855,11 +892,11 @@ static void bind_publish(Engine* e, size_t idx, uint8_t* buffer, uint64_t start,
  * and dropped, and the walk skips to the next slot that does begin ahead of
  * here rather than probing frame by frame.
  */
-static void write_output_bind(Engine* e, const float* src, uint32_t count, uint64_t pos)
+static bool write_output_bind(Engine* e, const float* src, uint32_t count, uint64_t pos)
 {
     uint32_t bpf  = atomic_load_explicit(&e->bind_bpf, memory_order_relaxed);
     float    gain = atomic_load_explicit(&e->output_gain, memory_order_relaxed);
-    if (bpf == 0) return;
+    if (bpf == 0) return false;
 
     uint64_t played = atomic_load_explicit(&e->frames_played, memory_order_relaxed);
     if (pos + count > played) {
@@ -943,6 +980,8 @@ static void write_output_bind(Engine* e, const float* src, uint32_t count, uint6
         atomic_fetch_add_explicit(&e->bind_unmapped_ahead, unmapped_ahead,
                                   memory_order_relaxed);
     if (races) atomic_fetch_add_explicit(&e->bind_races, races, memory_order_relaxed);
+    atomic_fetch_add_explicit(&e->bind_offered, count, memory_order_relaxed);
+    return true;
 }
 
 /*
@@ -1010,15 +1049,64 @@ void emu_engine_write_output(EmuEngine* e, const float* frames, uint32_t count, 
     if (!e) return;
     /* Core Audio serializes this device's single WriteMix stream on one IO
      * thread, so the low bit is ownership, not a general writer count. */
+    /* Odd while this write's frames are being accounted, so emu_engine_stats
+     * never reports a write as handed over but not yet bound, or the reverse.
+     * The same single writer as the gate assumes. */
+    atomic_fetch_add_explicit(&e->bind_seq, 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+
+    bool admitted = false;
     uint32_t expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(
+    if (atomic_compare_exchange_strong_explicit(
             &e->bind_gate, &expected, BIND_GATE_WRITING,
             memory_order_acquire, memory_order_relaxed)) {
-        return;
+        admitted = write_output_bind(e, frames, count, sample_pos);
+        atomic_fetch_and_explicit(&e->bind_gate, ~BIND_GATE_WRITING, memory_order_release);
     }
+    /* No session to carry them: stopped, tearing down, or between a fault and
+     * its rebuild. They are lost, and say so. */
+    if (!admitted) atomic_fetch_add_explicit(&e->bind_refused, count, memory_order_relaxed);
 
-    write_output_bind(e, frames, count, sample_pos);
-    atomic_fetch_and_explicit(&e->bind_gate, ~BIND_GATE_WRITING, memory_order_release);
+    atomic_fetch_add_explicit(&e->bind_seq, 1, memory_order_release);
+}
+
+/* The output books as of one moment between writes. A write lasts
+ * microseconds and a reading nanoseconds, so retrying at once finds the gap
+ * after the write in progress; if the writer is somehow never seen at rest
+ * for 2 ms the last reading is used as it is. Not for the IO thread. */
+static void bind_books_raw(Engine* e, EmuEngineStats* stats)
+{
+    uint64_t deadline = 0;
+    for (unsigned attempt = 0;; attempt++) {
+        uint32_t before = atomic_load_explicit(&e->bind_seq, memory_order_acquire);
+        stats->frames_offered  = atomic_load_explicit(&e->bind_offered, memory_order_relaxed);
+        stats->frames_refused  = atomic_load_explicit(&e->bind_refused, memory_order_relaxed);
+        stats->frames_bound    = atomic_load_explicit(&e->bind_frames, memory_order_relaxed);
+        stats->unmapped_frames = atomic_load_explicit(&e->bind_unmapped, memory_order_relaxed);
+        stats->unmapped_ahead  = atomic_load_explicit(&e->bind_unmapped_ahead, memory_order_relaxed);
+        stats->bind_races      = atomic_load_explicit(&e->bind_races, memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        if (!(before & 1u) && atomic_load_explicit(&e->bind_seq, memory_order_relaxed) == before) return;
+        if ((attempt & 255u) == 255u) {
+            uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            if (deadline == 0) deadline = now + 2000000;
+            else if (now > deadline) return;
+        }
+    }
+}
+
+/* ...and since the last counter reset. stats_lock held. */
+static void bind_books(Engine* e, EmuEngineStats* stats)
+{
+    bind_books_raw(e, stats);
+#define SINCE(field, base) stats->field = stats->field > e->bind_base.base ? stats->field - e->bind_base.base : 0
+    SINCE(frames_offered, offered);
+    SINCE(frames_refused, refused);
+    SINCE(frames_bound, bound);
+    SINCE(unmapped_frames, unmapped);
+    SINCE(unmapped_ahead, unmapped_ahead);
+    SINCE(bind_races, races);
+#undef SINCE
 }
 
 void emu_engine_set_output_gain(EmuEngine* e, float gain)
@@ -1036,7 +1124,7 @@ void emu_engine_read_input(EmuEngine* e, float* frames, uint32_t count, uint64_t
      * engine pointers the engine thread owns. Nothing writes the ring in this
      * mode, so reading it would only count underruns. */
     if (atomic_load_explicit(&e->running, memory_order_relaxed) && e->with_input) {
-        emu_ring_read_f32(&e->input_ring, sample_pos, frames, count);
+        emu_ring_read_f32(e->in_ring, sample_pos, frames, count);
     } else {
         memset(frames, 0, (size_t)count * EMU_RING_CHANNELS * sizeof(float));
     }
@@ -1083,8 +1171,8 @@ void emu_engine_reset_counters(EmuEngine* e)
 {
     if (!e) return;
     pthread_mutex_lock(&e->stats_lock);
-    atomic_store_explicit(&e->input_ring.missing, 0, memory_order_relaxed);
-    atomic_store_explicit(&e->input_ring.discarded, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->in_ring->missing, 0, memory_order_relaxed);
+    atomic_store_explicit(&e->in_ring->discarded, 0, memory_order_relaxed);
     atomic_store_explicit(&e->usb_errors, 0, memory_order_relaxed);
     atomic_store_explicit(&e->ts_fallbacks, 0, memory_order_relaxed);
     /* Recovery history is diagnostics like the rest: without this a second
@@ -1107,15 +1195,21 @@ void emu_engine_reset_counters(EmuEngine* e)
     atomic_store_explicit(&e->fb_changes, 0, memory_order_relaxed);
     atomic_store_explicit(&e->fb_min_q16, 0, memory_order_relaxed);
     atomic_store_explicit(&e->fb_max_q16, 0, memory_order_relaxed);
-    atomic_store_explicit(&e->bind_frames, 0, memory_order_relaxed);
-    atomic_store_explicit(&e->bind_unmapped, 0, memory_order_relaxed);
-    /* Missing these two made `unmappedAhead` outlive its own superset, so a
-     * cleared window reported a strict subset larger than the whole -- and
-     * `unmappedAhead > 0` is exactly the "schedule too short" signal the
-     * diagnostics tell the reader to trust. */
-    atomic_store_explicit(&e->bind_unmapped_ahead, 0, memory_order_relaxed);
+    /* The output books are rebased, all six from one reading, rather than
+     * zeroed under a write in progress: see bind_base. That also keeps
+     * `unmappedAhead` from outliving its own superset, which once made a
+     * cleared window report a strict subset larger than the whole. */
+    {
+        EmuEngineStats raw;
+        bind_books_raw(e, &raw);
+        e->bind_base.offered        = raw.frames_offered;
+        e->bind_base.refused        = raw.frames_refused;
+        e->bind_base.bound          = raw.frames_bound;
+        e->bind_base.unmapped       = raw.unmapped_frames;
+        e->bind_base.unmapped_ahead = raw.unmapped_ahead;
+        e->bind_base.races          = raw.bind_races;
+    }
     atomic_store_explicit(&e->bind_write_lead, 0, memory_order_relaxed);
-    atomic_store_explicit(&e->bind_races, 0, memory_order_relaxed);
     atomic_store_explicit(&e->bind_missing, 0, memory_order_relaxed);
     /* The filter is engine-thread-owned. Reset the diagnostic window from its
      * atomically published mirror rather than reading the mutable Rust object
@@ -1142,6 +1236,10 @@ void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
             memset(stats, 0, sizeof *stats);
         }
         stats->fault_mode = atomic_load_explicit(&e->fault_mode, memory_order_relaxed);
+        /* Still counted while stopped: Core Audio can go on writing into an
+         * engine that gave up, and those frames must not vanish. */
+        uint64_t refused = atomic_load_explicit(&e->bind_refused, memory_order_relaxed);
+        stats->frames_refused = refused > e->bind_base.refused ? refused - e->bind_base.refused : 0;
         pthread_mutex_unlock(&e->stats_lock);
         return;
     }
@@ -1179,19 +1277,20 @@ void emu_engine_stats(EmuEngine* e, EmuEngineStats* stats)
     stats->output_lead     = frontier > stats->frames_played
                            ? (uint32_t)(frontier - stats->frames_played) : 0;
     stats->underruns       = atomic_load_explicit(&e->bind_missing, memory_order_relaxed);
-    stats->frames_bound    = atomic_load_explicit(&e->bind_frames, memory_order_relaxed);
-    stats->unmapped_frames = atomic_load_explicit(&e->bind_unmapped, memory_order_relaxed);
-    stats->unmapped_ahead  = atomic_load_explicit(&e->bind_unmapped_ahead, memory_order_relaxed);
+    bind_books(e, stats);
+    stats->frames_dropped  = 0;
+    stats->frames_queued   = 0;
+    stats->frames_unpublished = 0;
+    stats->frames_unreconciled = 0;
     stats->write_lead_max  = atomic_load_explicit(&e->bind_write_lead, memory_order_relaxed);
-    stats->bind_races      = atomic_load_explicit(&e->bind_races, memory_order_relaxed);
     stats->schedule_requests = e->num_requests;
     stats->schedule_clamped  = e->schedule_clamped;
 
     stats->input_enabled   = e->with_input;
     stats->frames_captured = atomic_load_explicit(&e->frames_captured, memory_order_relaxed);
-    stats->input_depth     = emu_ring_depth(&e->input_ring);
-    stats->input_underruns = atomic_load_explicit(&e->input_ring.missing, memory_order_relaxed);
-    stats->input_overruns  = atomic_load_explicit(&e->input_ring.discarded, memory_order_relaxed);
+    stats->input_depth     = emu_ring_depth(e->in_ring);
+    stats->input_underruns = atomic_load_explicit(&e->in_ring->missing, memory_order_relaxed);
+    stats->input_overruns  = atomic_load_explicit(&e->in_ring->discarded, memory_order_relaxed);
     stats->empty_capture   = atomic_load_explicit(&e->empty_capture, memory_order_relaxed);
     pthread_mutex_unlock(&e->stats_lock);
     stats->engine_streaming   = emu_engine_streaming(e) ? 1u : 0u;
@@ -1581,7 +1680,7 @@ static void reschedule(Engine* e)
      * stale immediately and would report a rebuild on every call. */
     if (e->in_intf && e->next_in_frame < start) {
         uint64_t gap = frames_in_ms(e, start - e->next_in_frame);
-        emu_ring_write_silence(&e->input_ring, e->in_cursor, (uint32_t)gap);
+        emu_ring_write_silence(e->in_ring, e->in_cursor, (uint32_t)gap);
         e->in_cursor += gap;
         atomic_fetch_add_explicit(&e->frames_captured, gap, memory_order_relaxed);
         e->next_in_frame = start;
@@ -1660,7 +1759,7 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
              * rate up to 96 kHz. The read stays inside the packet either way:
              * lead + frames x bytes_per_frame is frActCount exactly. */
             uint32_t lead = f->frActCount % e->bytes_per_frame;
-            emu_ring_write_s24(&e->input_ring, e->in_cursor,
+            emu_ring_write_s24(e->in_ring, e->in_cursor,
                                (const uint8_t*)req->buffer + offset + lead, frames);
         } else {
             /* Nothing usable for this interval: an error, or one of the empty
@@ -1673,7 +1772,7 @@ static void capture_complete(void* refcon, IOReturn result, void* arg0)
              * One pop draws the nominal instead, which is within a frame of
              * what the measurement would have said. */
             frames = e->nominal_frames;
-            emu_ring_write_silence(&e->input_ring, e->in_cursor, frames);
+            emu_ring_write_silence(e->in_ring, e->in_cursor, frames);
             if (!atomic_load_explicit(&e->stopping, memory_order_relaxed))
                 atomic_fetch_add_explicit(&e->empty_capture, 1, memory_order_relaxed);
         }
@@ -2223,7 +2322,7 @@ typedef enum { kSessionSetupFailed = -1, kSessionStopped = 0, kSessionFaulted = 
 static SessionEnd stream_session(Engine* e, bool announced)
 {
     e->draining = false;
-    emu_ring_reset(&e->input_ring);
+    emu_ring_reset(e->in_ring);
 
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);

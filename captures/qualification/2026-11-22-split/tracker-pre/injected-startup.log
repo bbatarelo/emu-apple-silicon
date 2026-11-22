@@ -1,0 +1,64 @@
+unit: net.batarelo.EMUTrackerPre.E-MU-C7-3F0A-07D8010E-0C39A-STATION 01
+  driver version    0.1.1 (git 73ad8f6)
+Silent restart test: device 149, 20 cycles, startup fault on
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+01 PASS callbacks=90 written=29184 bound=29184 unmapped=0 startIO=41
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+02 PASS callbacks=89 written=28672 bound=28672 unmapped=0 startIO=42
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+03 PASS callbacks=89 written=28672 bound=28672 unmapped=0 startIO=43
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+04 PASS callbacks=89 written=29184 bound=29184 unmapped=0 startIO=44
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+05 PASS callbacks=90 written=29184 bound=29184 unmapped=0 startIO=45
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+06 PASS callbacks=89 written=28672 bound=28672 unmapped=0 startIO=46
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+07 PASS callbacks=89 written=29184 bound=29184 unmapped=0 startIO=47
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+08 PASS callbacks=89 written=29184 bound=29184 unmapped=0 startIO=48
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+09 PASS callbacks=90 written=28672 bound=28672 unmapped=0 startIO=49
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+10 PASS callbacks=90 written=28672 bound=28672 unmapped=0 startIO=50
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+11 PASS callbacks=90 written=28672 bound=28672 unmapped=0 startIO=51
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+12 PASS callbacks=89 written=29184 bound=29184 unmapped=0 startIO=52
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+13 PASS callbacks=89 written=28672 bound=28672 unmapped=0 startIO=53
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+14 PASS callbacks=89 written=28672 bound=28672 unmapped=0 startIO=54
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+15 PASS callbacks=90 written=28672 bound=28672 unmapped=0 startIO=55
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+16 PASS callbacks=90 written=28672 bound=28672 unmapped=0 startIO=56
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+17 PASS callbacks=90 written=28672 bound=28672 unmapped=0 startIO=57
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+18 PASS callbacks=89 written=29184 bound=29184 unmapped=0 startIO=58
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+19 PASS callbacks=89 written=28672 bound=28672 unmapped=0 startIO=59
+fault injection: startup-stale
+  armed once for the next stream setup; stop playback before starting the test
+20 PASS callbacks=90 written=29184 bound=29184 unmapped=0 startIO=60
+0 failures out of 20 silent restarts

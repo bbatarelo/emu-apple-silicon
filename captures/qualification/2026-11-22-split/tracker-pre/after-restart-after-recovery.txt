@@ -1,0 +1,87 @@
+device found: AudioObjectID 149
+
+  driver version    0.1.1 (git 73ad8f6)
+  name              E-MU Tracker Pre
+  input channels    2
+  output channels   2
+  sample rate       48000 Hz
+  input mode        on -> capture on
+  IO running        no
+  alive             1
+  transport         usb 
+  safety offset in  240 frames
+  safety offset out 192 frames
+  latency in        154 frames
+  latency out       116 frames
+  output volume     0.560  (-15.1 dB)
+  output mute       off
+
+  deadFrames         0
+  feedbackPackets    32
+  tsResets           0
+  framesDropped      631808
+  scheduleRequests   81
+  framesUnpublished  0
+  anchorUpdates      173
+  outputUnderruns    0
+  framesPlayed       48768
+  counterResets      1
+  foreignStops       0
+  framesRefused      0
+  recoveries         0
+  startersRemoved    0
+  unmappedAhead      0
+  usbErrors          0
+  faultInjected      0
+  engineStreaming    0
+  unfilledPlayback   0
+  framesToOutput     679936
+  inputUnderruns     0
+  framesBound        48128
+  feedbackQ16        3145728
+  tsFallbacks        0
+  clientAdds         270
+  recoveryFailures   0
+  scheduleClamped    0
+  engineRunning      0
+  lastStopClient     4065
+  frameDeficit       0
+  framesCaptured     48768
+  framesSubmitted    5230592
+  inputEnabled       1
+  inputOverruns      0
+  registeredClients  32
+  sessionsReaped     0
+  framesQueued       0
+  feedbackSilent     984
+  feedbackStarved    164
+  inputDepth         640
+  safetyOffsetUS     4000
+  writeLeadMax       1392
+  ioCycles           9234
+  feedbackErrors     0
+  engineAlive        1
+  lastStartClient    4065
+  unmappedFrames     0
+  feedbackRejected   0
+  startIOCalls       82
+  stopIOCalls        82
+  anchorJitterNs     19500
+  feedbackMinQ16     3145728
+  feedbackOverflows  0
+  feedbackMaxQ16     3145728
+  feedbackNominalQ16 3145728
+  ioClients          0
+  bindRaces          0
+  anchorJitterMaxNs  230964916
+  clientRemoves      238
+  clockSourceIsHost  0
+  feedbackChanges    0
+  framesUnreconciled 0
+  shortPlayback      0
+  resyncs            0
+  staleStops         0
+  outputLead         816
+  emptyCapture       0
+
+  available rates   44100 48000 88200 96000 176400 192000 

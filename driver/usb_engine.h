@@ -81,6 +81,20 @@ typedef struct {
     /* The output path. Core Audio writes into the submitted USB buffers
      * itself (emu_engine_write_output), so what these measure is that
      * thread's progress against the bus, not a staging buffer's occupancy. */
+    /* The books. Every frame Core Audio handed over is in exactly one of
+     * frames_offered, frames_refused and frames_dropped -- or, in the
+     * two-part build only, still in frames_queued -- and every offered frame
+     * is bound, unmapped or a counted race. The first six are read as of one
+     * moment between writes, so differences between two readings compare. */
+    uint64_t frames_offered;     /* frames that reached the bind path of a session */
+    uint64_t frames_refused;     /* frames handed to an engine with no session to carry them */
+    uint64_t frames_dropped;     /* two-part: frames that never reached the engine at all --
+                                    no room, too large, discarded, or no engine */
+    uint64_t frames_queued;      /* two-part: written by Core Audio, not yet taken by the engine */
+    uint64_t frames_unpublished; /* two-part: taken by the engine since the figures above were
+                                    published; in them within one publication interval */
+    uint64_t frames_unreconciled;/* two-part: taken by an engine whose session ended before it
+                                    published figures covering them -- bound or not is unknown */
     uint64_t frames_bound;       /* frames converted straight into a USB buffer */
     uint64_t underruns;          /* frames that transmitted before Core Audio wrote them */
     uint64_t unfilled_playback;  /* requests that transmitted with any such frame */
@@ -163,10 +177,18 @@ bool emu_engine_set_identity_observer(void (*observer)(void));
  * setting 0, so no IN transaction reaches the bus, and playback is sized from
  * the explicit feedback endpoint instead of from capture (planner_next in
  * usb_engine.c). */
-/* One handle per attached device. Stage 1 permits exactly one; create returns
- * NULL if one is already outstanding. */
+/* One handle per attached unit; several may exist and run at once. */
 EmuEngine* emu_engine_create(uint16_t product_id, uint64_t location_id);
 void       emu_engine_destroy(EmuEngine* engine);
+
+/* Points capture at a ring the caller owns instead of the engine's own, or
+ * back at its own with NULL. For an owner in another process: the ring can
+ * then live in memory both sides map, and capture lands in it on the same
+ * thread at the same moment it otherwise would. Only while stopped -- false,
+ * and nothing changes, if a session exists. The ring must outlive the engine
+ * or be replaced first. */
+struct EmuRing;
+bool       emu_engine_set_input_ring(EmuEngine* engine, struct EmuRing* ring);
 
 bool     emu_engine_start(EmuEngine* engine, uint32_t sample_rate, uint32_t output_safety_us,
                           bool with_input);

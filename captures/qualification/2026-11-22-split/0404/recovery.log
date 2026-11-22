@@ -1,0 +1,30 @@
+unit: net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03
+  streaming net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03 48000 Hz 512 frames
+Preconditions
+  [32mPASS[0m  engine is streaming                engineStreaming = 1
+  [32mPASS[0m  device is alive                    engineAlive = 1
+  [32mPASS[0m  no recoveries yet                  recoveries = 0
+  [32mPASS[0m  audio is reaching the device       framesBound +83968, unmapped +0
+
+1. Transient fault: the stream should rebuild itself
+  [32mPASS[0m  rebuilt at least once              recoveries = 1
+  [32mPASS[0m  streaming again                    engineStreaming = 1
+  [32mPASS[0m  still alive                        engineAlive = 1
+  [32mPASS[0m  audio is flowing again             framesBound +83968, unmapped +0
+
+2. Persistent fault: the engine should give up and say so
+  [32mPASS[0m  not streaming                      engineStreaming = 0
+  [32mPASS[0m  marked NOT alive                   engineAlive = 0
+  [32mPASS[0m  rebuilds were attempted            recoveryFailures = 7
+
+3. Clearing the fault should bring the device back
+  [32mPASS[0m  alive again                        engineAlive = 1
+
+4. A stream opened again should play
+  streaming net.batarelo.EMUTrackerPre.E-MU-69-3F04-07D8031A-0F419-STATION 03 48000 Hz 512 frames
+  [32mPASS[0m  streaming                          engineStreaming = 1
+  [32mPASS[0m  audio is reaching the device       framesBound +86528, unmapped +0
+  [32mPASS[0m  transport idle afterwards          engineStreaming = 0
+  [32mPASS[0m  no client left behind              ioClients = 0
+
+all checks passed.

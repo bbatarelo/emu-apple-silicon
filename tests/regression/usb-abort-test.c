@@ -289,6 +289,120 @@ static void partial_setup_cleanup(void)
     emu_engine_destroy(e);
 }
 
+/* The written/bound comparison the hardware suites assert, against the real
+ * write path: a reading taken while Core Audio is in the middle of a write
+ * must not show that write as handed over but not bound, or bound but not
+ * handed over. Before the books were read as of one moment this failed about
+ * one reading in a few hundred, and one restart cycle in twenty on hardware. */
+static _Atomic bool books_stop;
+static void* books_writer(void* arg)
+{
+    Engine* e = arg;
+    static float frames[512 * 2];
+    uint64_t n = 0;
+    while (!atomic_load(&books_stop)) {
+        /* Mostly inside the one request the map covers; every eighth write
+         * lands past it, so unmapped frames are part of the sum too. */
+        emu_engine_write_output(e, frames, 512, (++n % 8) ? (n % 7) * 512 : 8192);
+    }
+    return NULL;
+}
+
+/* A probe resets its counter window while audio is running. A coherent read
+ * cannot recover a frame if the reset itself split the accounting of a write.
+ * Join the writer before reading so even the last publication has settled. */
+static void* reset_window_writer(void* arg)
+{
+    const float frame[2] = {0};
+    while (!atomic_load(&books_stop))
+        emu_engine_write_output(arg, frame, 1, 0);
+    return NULL;
+}
+
+static void check_reset_window(Engine* e)
+{
+    atomic_store(&e->bind_gate, 0);
+    for (unsigned trial = 0; trial < 300; trial++) {
+        atomic_store(&books_stop, false);
+        pthread_t writer;
+        if (pthread_create(&writer, NULL, reset_window_writer, e) != 0) {
+            check(false, "could create writer for counter reset");
+            return;
+        }
+        usleep(100);
+        for (unsigned i = 0; i < 3000; i++) emu_engine_reset_counters(e);
+        atomic_store(&books_stop, true);
+        pthread_join(writer, NULL);
+        EmuEngineStats st = {0};
+        emu_engine_stats(e, &st);
+        if (st.frames_offered != st.frames_bound + st.unmapped_frames) {
+            printf("    after writer joined: %llu offered, %llu bound, %llu unmapped\n",
+                   st.frames_offered, st.frames_bound, st.unmapped_frames);
+            check(false, "reset preserves the accounting of a concurrent write");
+            return;
+        }
+    }
+    check(true, "reset preserves the accounting of a concurrent write");
+}
+
+static void output_books(void)
+{
+    puts("Output books read during writes");
+    Engine* e = emu_engine_create(0x3f04, 0);
+    assert(e);
+    static float frames[512 * 2];
+    EmuEngineStats st;
+
+    emu_engine_write_output(e, frames, 512, 0);
+    emu_engine_stats(e, &st);
+    check(st.frames_refused == 512 && st.frames_offered == 0 && st.frames_bound == 0,
+          "a write with no session is counted as refused, not lost from the count");
+
+    uint8_t* buffer = calloc(4096, 6);
+    atomic_store(&e->bind_map[0].buffer, buffer);
+    atomic_store(&e->bind_map[0].frame_start, 0);
+    atomic_store(&e->bind_map[0].frame_end, 4096);
+    atomic_store(&e->bind_count, 1);
+    atomic_store(&e->bind_bpf, 6);
+    atomic_store(&e->bind_gate, 0);
+    atomic_store(&e->running, true);
+
+    pthread_t writer;
+    pthread_create(&writer, NULL, books_writer, e);
+    unsigned torn = 0, readings = 0;
+    uint64_t last = 0;
+    bool moved = false;
+    /* The writer may not have been scheduled yet; readings of a counter
+     * nobody is moving prove nothing. */
+    while (atomic_load(&e->bind_offered) < 64 * 512) usleep(100);
+    for (; readings < 20000; readings++) {
+        emu_engine_stats(e, &st);
+        if (st.frames_offered != st.frames_bound + st.unmapped_frames) torn++;
+        if (st.frames_offered != last) moved = true;
+        last = st.frames_offered;
+    }
+    atomic_store(&books_stop, true);
+    pthread_join(writer, NULL);
+    printf("    %u readings, %u torn, %llu frames offered\n", readings, torn,
+           (unsigned long long)last);
+    check(torn == 0 && moved, "every reading has offered == bound + unmapped");
+    emu_engine_stats(e, &st);
+    check(st.unmapped_frames > 0 && st.unmapped_ahead == st.unmapped_frames && st.frames_refused == 512,
+          "frames no request covered stay visible as unmapped");
+
+    atomic_store(&e->bind_gate, BIND_GATE_CLOSED);
+    emu_engine_write_output(e, frames, 512, 0);
+    EmuEngineStats after;
+    emu_engine_stats(e, &after);
+    check(after.frames_refused == st.frames_refused + 512 && after.frames_bound == st.frames_bound,
+          "a write turned away mid-session is refused and visible");
+    check_reset_window(e);
+    atomic_store(&e->running, false);
+    atomic_store(&e->bind_count, 0);
+    emu_engine_destroy(e);
+    free(buffer);
+}
+
 int main(void)
 {
     Engine* e = fixture(false);
@@ -309,6 +423,7 @@ int main(void)
     startup_retry(true);
     exhausted_retries();
     feedback_drain();
+    output_books();
     printf("\n%u invariant failures.\n", failed);
     return failed ? 1 : 0;
 }

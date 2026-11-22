@@ -12,13 +12,57 @@
 #   2. persistent fault -> the engine gives up and the device is marked dead
 #   3. fault cleared    -> the device comes back
 #
-# Needs the driver installed and something playing to it: a fault can only be
-# injected into a stream that exists.
+# Needs the driver installed. A fault can only be injected into a stream that
+# exists, so this opens one: a silent duplex IOProc on the unit itself, by UID
+# (build/bin/hal-stream). Nothing has to be playing, the system's default
+# devices are not touched, and other clients of the unit are left alone --
+# though they will hear the faults, which is the point of them.
+#
+#   EMU_DEVICE=<UID or part of it>      which unit; required when several are attached
+#   EMU_RATE=<Hz> EMU_BUFFER=<frames>   run at these settings; both are restored
 
 set -u
 BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/bin"
 CHECK="$BIN/hal-check"
-[[ -x "$CHECK" ]] || { echo "build the tools first: make" >&2; exit 1; }
+STREAM="$BIN/hal-stream"
+[[ -x "$CHECK" && -x "$STREAM" ]] || { echo "build the tools first: make test-build" >&2; exit 1; }
+
+# One unit, by its whole UID, for everything below.
+EMU_DEVICE="$("$STREAM" --uid)" || exit 2
+export EMU_DEVICE
+echo "unit: $EMU_DEVICE"
+
+stream_pid=""
+stream_out="$BIN/../recovery-stream.log"     # overwritten by each run
+stream_stop() {
+    if [[ -n "$stream_pid" ]]; then
+        kill -TERM "$stream_pid" 2>/dev/null
+        wait "$stream_pid" 2>/dev/null
+        stream_pid=""
+    fi
+}
+# Starts the test's own stream and waits until the engine is on the bus.
+stream_start() {
+    "$STREAM" ${EMU_RATE:+--rate "$EMU_RATE"} ${EMU_BUFFER:+--buffer "$EMU_BUFFER"} > "$stream_out" 2>&1 &
+    stream_pid=$!
+    for _ in $(seq 1 100); do
+        if ! kill -0 "$stream_pid" 2>/dev/null; then
+            cat "$stream_out" >&2; stream_pid=""; return 1
+        fi
+        if grep -q '^streaming' "$stream_out" && [[ "$(counter engineStreaming)" == 1 ]]; then
+            sed 's/^/  /' "$stream_out"; return 0
+        fi
+        settle 0.1
+    done
+    cat "$stream_out" >&2
+    return 1
+}
+finish() {
+    stream_stop
+    "$CHECK" fault none >/dev/null 2>&1      # never leave a fault armed behind a failed run
+}
+trap finish EXIT
+trap 'exit 130' INT TERM
 
 counter() { "$CHECK" 2>/dev/null | awk -v k="$1" '$1 == k { print $2 }'; }
 settle()  { python3 -c "import time,sys; time.sleep(float(sys.argv[1]))" "$1"; }
@@ -75,9 +119,8 @@ if [[ -z "$streaming" ]]; then
     echo "  make install" >&2
     exit 1
 fi
-if [[ "$streaming" != "1" ]]; then
-    echo "the engine is not streaming." >&2
-    echo "Select the device as output, play something, and run this again." >&2
+if ! stream_start; then
+    echo "could not start a stream on $EMU_DEVICE" >&2
     exit 1
 fi
 
@@ -109,9 +152,27 @@ echo "3. Clearing the fault should bring the device back"
 "$CHECK" fault none >/dev/null; settle 2
 expect "alive again"              engineAlive     eq 1
 
+# A stream that was running when the device died does not come back by
+# itself: its client has to open it again. Do that, rather than leave it as
+# an instruction.
+echo
+echo "4. A stream opened again should play"
+stream_stop
+if stream_start; then
+    expect "streaming"                engineStreaming eq 1
+    expect_audio "audio is reaching the device"
+else
+    printf "  \033[31mFAIL\033[0m  %-34s\n" "the stream did not start again"
+    FAILURES=$((FAILURES + 1))
+fi
+stream_stop
+for _ in $(seq 1 40); do [[ "$(counter engineStreaming)" == 0 ]] && break; settle 0.1; done
+expect "transport idle afterwards"  engineStreaming eq 0
+expect "no client left behind"      ioClients       eq 0
+
 echo
 if [[ $FAILURES -eq 0 ]]; then
-    echo "all checks passed. Play something again to confirm audio is back."
+    echo "all checks passed."
 else
     echo "$FAILURES check(s) failed" >&2
     exit 1

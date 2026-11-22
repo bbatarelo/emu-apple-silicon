@@ -11,7 +11,10 @@ Tests return a nonzero exit status on failure or unmet prerequisites.
 make test
 ```
 
-This never installs a driver, opens USB hardware, or starts audio. It runs:
+This never installs a driver, opens USB hardware, or starts audio. `make
+test-split` does start a process: a test engine, as a launchd service under a
+throwaway name in your own user domain, removed again when the test ends. It
+runs:
 
 | Command | Coverage | Source |
 | --- | --- | --- |
@@ -19,6 +22,8 @@ This never installs a driver, opens USB hardware, or starts audio. It runs:
 | `make test-analysis` | Synthetic signals exercising the loopback analyser | `tools/hal-loopback/` (`selftest`) |
 | `make test-regression` | Production USB callbacks and startup retries with a fake USB interface | `tests/regression/` |
 | `make test-usb-abort` | One regression: request ownership during cancellation, delayed completions, retries, and partial cleanup | `tests/regression/usb-abort-test.c` |
+| `make test-hal-surface` | Everything the HAL plug-in publishes and asks of the engine, compared with a recorded copy; whose session a start or stop belongs to; one unit starting while another plays | `tests/regression/hal-surface-test.c`, `hal-surface.expected` |
+| `make test-split` | The optional two-part driver across a real process boundary: sample placement, two units at once, engine crash, hang and reload, version mismatch, no engine | `tests/regression/split-engine-test.c`, `fake-transport.c`, `split-engine-test.sh` |
 
 The USB regression reproduces [issue #7](https://github.com/bbatarelo/emu-apple-silicon/issues/7)
 without relying on YouTube or timing luck. It includes the production engine
@@ -27,12 +32,34 @@ their logic. See the [investigation](../docs/issue-investigations/ISSUE-7-INVEST
 for the failure and fix. Passing this fake-interface test does not establish how
 the macOS USB stack behaves during unplug or sleep.
 
+`test-hal-surface` runs the production plug-in against a fake host, bus and
+engine and diffs what a client would see against `hal-surface.expected`. A
+change to a default, a property or a notification fails it; if the change is
+meant, `make hal-surface-accept` records the new surface and the diff goes in
+the same commit.
+
+`test-split` needs a login session, because launchd starts the test engine.
+From ssh or a CI runner without one it reports **NOT RUN** and fails;
+`EMU_ALLOW_SKIP=1` lets the rest of the suite pass without it. Its device is
+pretend -- host clock, playback looped into capture at the same sample index
+-- so it tests the boundary, not USB timing. For a sanitizer pass:
+
+```sh
+make test-regression test-split SANITIZE="-fsanitize=address,undefined -g" BUILD=build/asan
+```
+
+Use the [two-part development guide](../docs/SPLIT-DRIVER.md) for deployment and the [hardware verification report](../docs/issue-investigations/SPLIT-DRIVER-VERIFICATION.md) for recorded results.
+
 ## After installing a change: hardware integration
 
-These commands test the **installed** driver, not the driver bundle in `build/`.
-Build and install the intended revision first (`make all`, then `make install`).
-Check its version with `build/bin/hal-check`. Stop other playback and recording
-on the selected unit before running:
+These commands exercise the **installed** driver. Use the two-part driver for
+development. After an engine edit, run `make reload` from the registered
+checkout. For a first split install or a change to the installed HAL or shared
+ABI, run `make MODE=two-part` and `make MODE=two-part install`.
+Use the README's plain `make install` when qualifying the one-part release.
+Check the installed version with `EMU_DEVICE=3F0A build/bin/hal-check`
+for a Tracker Pre, or substitute the target unit's UID. Stop other playback
+and recording on that unit before starting the tests.
 
 ```sh
 EMU_DEVICE=3F04 make test-integration   # 0404 USB
@@ -40,7 +67,11 @@ EMU_DEVICE=3F0A make test-integration   # Tracker Pre
 ```
 
 Use a unique UID or serial substring instead when multiple units have the same
-product ID. Without `EMU_DEVICE`, the first matching E-MU is selected.
+product ID. `EMU_DEVICE` is resolved to one full UID before anything runs
+(`build/bin/hal-stream --uid`); with several units attached and no
+`EMU_DEVICE`, or one that matches more than one, the tests stop and list the
+UIDs rather than pick one. `EMU_DEVICE=<uid> make test-device` runs
+`test-integration` and then `test-recovery` on that unit.
 
 `test-integration` runs the following two tests **sequentially**, also under
 `make -j`. It takes roughly a minute per unit. No loopback cables are needed.
@@ -65,11 +96,14 @@ These are explicit commands, excluded from `test-integration` because they need
 different starting conditions. There is no unattended command for every physical
 and listening check.
 
-- **Recovery:** play audio to the selected unit, then run
-  `EMU_DEVICE=3F04 make test-recovery`. The existing
-  `scripts/test-recovery.sh` injects transient and persistent transport failures,
-  checks recovery/dead-device reporting and clears the fault. Playback is
-  interrupted; restart it afterward and confirm sound returns.
+- **Recovery:** `EMU_DEVICE=3F04 make test-recovery`. The existing
+  `scripts/test-recovery.sh` opens its own silent stream on that unit
+  (`tests/integration/hal-stream.c`), injects transient and persistent
+  transport failures, checks recovery/dead-device reporting, clears the fault,
+  then reopens the stream and checks audio flows and the transport goes idle
+  with no client left. Nothing needs to be playing and no default device is
+  changed; anything else playing on that unit is interrupted. `EMU_RATE` and
+  `EMU_BUFFER` run it at a given rate and buffer size and restore both.
 - **Analog loopback:** connect and set levels as described in the
   [README diagnostics](../README.md#optional-diagnostics-and-troubleshooting),
   then use `make loopback` or the documented `hal-loopback` commands. Unlike the

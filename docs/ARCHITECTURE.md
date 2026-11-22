@@ -1,5 +1,7 @@
 # Architecture
 
+## Default one-part driver
+
 ```
    application
         |
@@ -19,8 +21,16 @@
    E-MU Tracker Pre
 ```
 
-One process. The plug-in loads into `com.apple.audio.Core-Audio-Driver-Service.helper`
-and opens USB directly, so there is no helper daemon and no IPC.
+In the default build the plug-in loads into `com.apple.audio.Core-Audio-Driver-Service.helper`
+and opens the USB audio interfaces directly.
+
+## Optional two-part driver
+
+The development build uses the same HAL entry points in `driver/plugin.c`. It links the HAL against `driver/engine_remote.c` and links the USB transport into a separate `emu-engine` executable. launchd runs that engine under the developer's account. The two modes share the audio bundle identity and serial-based device UIDs. CoreMIDI owns the MIDI interface in both modes.
+
+The HAL and engine use XPC for discovery, stream lifecycle and controls. Each unit has a versioned shared-memory region for real-time audio. On playback the HAL queues timestamped writes. The engine drains them into the existing USB output binding path. On capture the USB completion writes directly to the shared ring, and the HAL reads it by sample position. The service also publishes clock observations and statistics. The qualified build uses ABI version 2. [Shared layout](../driver/engine_shared.h) · [Engine service](../driver/engine_service.c)
+
+Reloading the engine retires its sessions and lets the resident HAL reconnect to the replacement. Each device has its own session generation so a late stop from a previous client cannot tear down a newly published unit. Changes on the HAL side of the boundary or to the shared ABI need a matching split install. [Development guide](SPLIT-DRIVER.md) · [Implementation and regression evidence](issue-investigations/SPLIT-DRIVER-VERIFICATION.md)
 
 ## Layout
 
